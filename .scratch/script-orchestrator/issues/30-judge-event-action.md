@@ -4,7 +4,7 @@
 
 **Blocked by:** 26 — 自动执行 every 编排并查看脚本结果
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 判定 DSL 覆盖全部契约谓词、首匹配、fallback、`matchedRule` 零下标与 `usedFallback`；脚本正常退出无论退出码或超时都进入判定。
 - [ ] 创建/更新可配置 judge 与 event 动作，静态校验动作键引用、事件短名和保留名；非法配置不落库。
