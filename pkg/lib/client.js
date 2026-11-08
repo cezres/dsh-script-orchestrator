@@ -42,6 +42,15 @@ window.__ModuleLoader__.load({
 		};
 		const STATUS_COLOR = { active: "#16a34a", paused: "#d97706", ended: "#71717a" };
 		const STATUS_CN = { active: "运行中", paused: "已暂停", ended: "已结束" };
+		// run 终态集合与中文映射（契约 09 执行状态；轮询停止条件 = 无非终态 run）
+		const RUN_TERMINAL = { succeeded: 1, partial: 1, failed: 1, skipped: 1, canceled: 1, interrupted: 1 };
+		const RUN_STATUS_CN = {
+			queued: "排队中", running: "执行中", judging: "判定中", dispatching: "派发动作中",
+			succeeded: "成功", partial: "部分成功", failed: "失败", skipped: "已跳过", canceled: "已取消", interrupted: "已中断",
+		};
+		const SKIP_REASON_CN = { overlap: "重叠", disabled: "已停用", concurrency: "并发额度" };
+		// 活动 run 轮询周期（契约 11「刷新策略」3：面板可见且存在非终态 run 时每 5 秒 view(id)）
+		const POLL_MS = 5000;
 		const fmtTime = (iso) => (iso ? iso.replace("T", " ").replace(/(\.\d+|Z).*$/, "") : "—");
 		const fmtEvery = (seconds) =>
 			seconds % 60 === 0 ? Math.round(seconds / 60) + " 分钟" : seconds + " 秒";
@@ -151,8 +160,8 @@ window.__ModuleLoader__.load({
 		function DetailModal({ call, id, onClose }) {
 			const [state, setState] = useState({ phase: "loading" });
 
-			async function load() {
-				setState({ phase: "loading" });
+			async function load(opts) {
+				if (!opts || !opts.silent) setState({ phase: "loading" });
 				try {
 					const res = await call("view", { id });
 					if (res && res.ok) setState({ phase: "ready", data: res.value });
@@ -161,11 +170,24 @@ window.__ModuleLoader__.load({
 						setState({ phase: "error", code: error.code || "internal_error", message: error.message || "未知错误" });
 					}
 				} catch (e) {
+					if (opts && opts.silent) return; // 轮询静默失败：保留已呈现的权威数据
 					setState({ phase: "error", code: "transport", message: String((e && e.message) || e) });
 				}
 			}
 
 			useEffect(() => { void load(); }, [id]);
+
+			// 活动 run 轮询（契约 11）：可见 + 存在非终态 run 时每 5 秒 view(id)；
+			// 任一停止条件（无活动 run / 不可见 / 组件卸载）即停
+			const hasActiveRun = state.phase === "ready" && state.data.runs.some((r) => !RUN_TERMINAL[r.status]);
+			useEffect(() => {
+				if (!hasActiveRun) return;
+				const timer = setInterval(() => {
+					if (document.visibilityState !== "visible") return;
+					void load({ silent: true });
+				}, POLL_MS);
+				return () => clearInterval(timer);
+			}, [hasActiveRun, id]);
 
 			const section = (label, body) => h("div", { style: { marginTop: 12 } },
 				h("div", { style: { ...C.muted, fontSize: 11, marginBottom: 4 } }, label), body);
@@ -198,12 +220,37 @@ window.__ModuleLoader__.load({
 						section("执行记录（" + state.data.runs.length + "）",
 							state.data.runs.length === 0
 								? h("div", { style: { ...C.muted, fontSize: 12 } }, "还没有执行记录（创建不会立即执行脚本）")
-								: state.data.runs.map((r) => h("div", { key: r.runId, style: { ...C.row, ...C.mono, fontSize: 11, marginBottom: 3 } },
-									r.runId, h("span", { style: { color: "#71717a" } }, r.status), fmtTime(r.settledAt || r.startedAt || r.scheduledAt)))),
+								: state.data.runs.map((r) => h(RunCard, { key: r.runId, r }))),
 						section("可用注册动作（availableActions）",
 							state.data.availableActions.length === 0
 								? h("div", { style: { ...C.muted, fontSize: 12 } }, "暂无注册动作（其他插件可通过 ctx.scriptOrchestrator.registerAction 注册）")
 								: state.data.availableActions.map((a) => h("div", { key: a.name, style: { ...C.mono, fontSize: 11 } }, a.name, a.description ? " — " + a.description : ""))))));
+		}
+
+		// 单条 run 记录卡：三段结果中的脚本阶段（契约 01 run.script；动作阶段属票 30+）
+		function RunCard({ r }) {
+			const s = r.script || {};
+			const facts = [];
+			if (r.skipReason) facts.push("跳过（" + (SKIP_REASON_CN[r.skipReason] || r.skipReason) + "）");
+			if (s.exitCode !== null && s.exitCode !== undefined) facts.push("退出码 " + s.exitCode);
+			if (s.signal) facts.push("信号 " + s.signal);
+			if (s.timedOut) facts.push("已超时");
+			if (typeof s.durationMs === "number" && s.durationMs > 0) facts.push(s.durationMs + "ms");
+			if (s.truncated) facts.push("已截断");
+			const tail = (s.stdoutTail || "").replace(/\s+$/, "");
+			const tailPreview = tail.length > 200 ? tail.slice(-200) : tail;
+			return h("div", { style: { border: "1px solid #f0f0f2", borderRadius: 8, padding: "6px 8px", marginBottom: 6 } },
+				h("div", { style: { ...C.row, fontSize: 11 } },
+					h("span", { style: { fontWeight: 700 } }, RUN_STATUS_CN[r.status] || r.status),
+					h("span", { style: { ...C.muted, ...C.mono } }, r.runId),
+					h("span", { style: { ...C.muted } }, fmtTime(r.settledAt || r.startedAt || r.scheduledAt)),
+					facts.length > 0 ? h("span", { style: { color: "#52525b" } }, facts.join(" · ")) : null),
+				(s.stdoutSpillPath || s.stderrSpillPath) && h("div", { style: { ...C.muted, fontSize: 10, marginTop: 2 } },
+					"完整输出：", s.stdoutSpillPath ? "stdout " : "", s.stderrSpillPath ? "stderr" : "", "（溢写文件，排障可读）"),
+				tailPreview ? h("div", { style: { ...C.mono, fontSize: 10, marginTop: 3, whiteSpace: "pre-wrap", color: "#3f3f46", background: "#fafafa", borderRadius: 6, padding: "4px 6px", maxHeight: 120, overflowY: "auto" } },
+					s.truncated ? "…" : "", tailPreview) : null,
+				s.warnings && s.warnings.length > 0 ? h("div", { style: { color: "#d97706", fontSize: 10, marginTop: 3 } },
+					s.warnings.join("；")) : null);
 		}
 
 		function PanelIcon() {
