@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 单包 Host/client 声明、同步 Config、依赖边界和自插入条目可用，`--dump-config` 能看到插件条目，侧边栏与主面板能挂载。
 - [ ] Host 管理服务与 Connection 桥提供空 `list` 闭环，返回 `{ items: [], total: 0, nextOffset: null }`，面板覆盖空态、加载态和传输错误态。
