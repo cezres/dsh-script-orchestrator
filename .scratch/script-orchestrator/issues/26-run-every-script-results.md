@@ -4,7 +4,7 @@
 
 **Blocked by:** 25 — 通过对话创建并查看 every 编排
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] fixed-rate 按上一次 `scheduledAt` 推进，fixed-delay 在自动 run 未结算时保持 `nextOccurrence = null`、结算后从 `settledAt` 推进；手动 run 尚不影响自动序列。
 - [ ] runner 使用 argv 调用脚本，落实 cwd/allowedRoots 预检、env/stdin 适配、超时、`cancelReason` 分类和目录不存在时的 `spawn_failed`，不经过 shell。
