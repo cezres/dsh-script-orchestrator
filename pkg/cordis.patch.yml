@@ -1,0 +1,3 @@
+- insert:
+    - id: script-orchestrator
+      name: '@local/dsh-script-orchestrator'
