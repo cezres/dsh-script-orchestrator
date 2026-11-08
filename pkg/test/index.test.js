@@ -7,6 +7,7 @@ function makeCtx({ domain } = {}) {
     opened: [],
     provided: [],
     routes: [],
+    tools: [],
     closeOrder: [],
     logs: [],
   }
@@ -36,6 +37,12 @@ function makeCtx({ domain } = {}) {
         calls.routes.push(r)
         route = r
         return () => calls.closeOrder.push('bridge')
+      },
+    },
+    tools: {
+      register: (definition) => {
+        calls.tools.push(definition)
+        return () => calls.closeOrder.push(`tool:${definition.name}`)
       },
     },
     provide: (key, impl) => calls.provided.push([key, impl]),
@@ -70,14 +77,14 @@ async function callRoute(route, url, body) {
 }
 
 describe('插件入口（lib/index.js）', () => {
-  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer）+ name', () => {
+  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools）+ name', () => {
     expect(typeof plugin).toBe('function')
     expect(Config).toBe(RawConfig)
-    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer'])
+    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools'])
     expect(name).toBe('script-orchestrator')
   })
 
-  it('apply：打开存储域 → provide scriptOrchestrator（空 list 可用）→ 挂 /script-orchestrator 路由', async () => {
+  it('apply：打开存储域 → provide scriptOrchestrator（空 list 可用）→ 挂 /script-orchestrator 路由 → 注册三工具', async () => {
     const { ctx, calls, getRoute } = makeCtx()
     const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
     const first = await it.next()
@@ -87,6 +94,7 @@ describe('插件入口（lib/index.js）', () => {
     expect(calls.routes).toHaveLength(1)
     expect(calls.routes[0].kind).toBe('prefix')
     expect(calls.routes[0].path).toBe('/script-orchestrator')
+    expect(calls.tools.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view'])
     const service = calls.provided[0][1]
     await expect(service.list()).resolves.toEqual({ items: [], total: 0, nextOffset: null })
     const rpc = await callRoute(
@@ -102,12 +110,58 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
-  it('卸载顺序：先摘桥（停生产者）→ 排干服务层队列 → domain.close()', async () => {
+  it('注册的工具 execute 连通真服务：script_create 经校验创建并持久化', async () => {
+    const { ctx, calls } = makeCtx()
+    const table = new Map()
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: () => ({
+        entries: () => table.entries(),
+        get: (key) => table.get(key),
+        put: (key, value) => {
+          table.set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          table.delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
+    const first = await it.next()
+    const create = calls.tools.find((d) => d.name === 'script_create')
+    const view = await create.execute(
+      {
+        title: 'integration check',
+        trigger: { kind: 'every', everySeconds: 120 },
+        script: { command: 'pwsh' },
+        judge: { rules: [], fallback: [] },
+        actions: {},
+      },
+      {},
+    )
+    expect(view.id).toBe('integration-check')
+    expect(view.status).toBe('active')
+    expect(table.get('integration-check')).toEqual(view)
+    const bad = await create.execute({ title: 'x' }, {})
+    expect(bad).toMatchObject({ code: 'script_input_invalid', details: { field: 'trigger', reason: 'missing' } })
+    await first.value()
+  })
+
+  it('卸载顺序：先摘工具与桥（停生产者）→ 排干服务层队列 → domain.close()', async () => {
     const { ctx, calls } = makeCtx()
     const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
     const first = await it.next()
     await first.value()
-    expect(calls.closeOrder).toEqual(['bridge', 'domain'])
+    expect(calls.closeOrder).toEqual([
+      'tool:script_view',
+      'tool:script_list',
+      'tool:script_create',
+      'bridge',
+      'domain',
+    ])
   })
 
   it('存储域打开失败：apply reject，不 provide 服务、不挂桥（无半初始化服务）', async () => {
@@ -119,5 +173,6 @@ describe('插件入口（lib/index.js）', () => {
     await expect(it.next()).rejects.toThrow('storage backend gone')
     expect(calls.provided).toEqual([])
     expect(calls.routes).toEqual([])
+    expect(calls.tools).toEqual([])
   })
 })

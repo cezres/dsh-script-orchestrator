@@ -1,9 +1,35 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createBridgeHandler, mountBridge } from '../lib/bridge.js'
+import { OrchestratorError } from '../lib/errors.js'
+
+const SAMPLE_VIEW = {
+  id: 'log-rotate',
+  title: 'log rotate',
+  enabled: true,
+  overlap: 'skip',
+  trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-rate' },
+  script: { command: 'pwsh', args: [], env: {} },
+  judge: { rules: [], fallback: [] },
+  actions: {},
+  createdAt: '2026-11-09T00:00:00.000Z',
+  updatedAt: '2026-11-09T00:00:00.000Z',
+  status: 'active',
+  nextOccurrence: '2026-11-09T00:05:00.000Z',
+}
+
+const sampleCreateInput = () => ({
+  title: 'log rotate',
+  trigger: { kind: 'every', everySeconds: 300 },
+  script: { command: 'pwsh' },
+  judge: { rules: [], fallback: [] },
+  actions: {},
+})
 
 function fakeService(over = {}) {
   return {
     list: over.list ?? (async () => ({ items: [], total: 0, nextOffset: null })),
+    create: over.create ?? (async () => ({ ...SAMPLE_VIEW })),
+    view: over.view ?? (async () => ({ ...SAMPLE_VIEW, runs: [], availableActions: [] })),
     ...over,
   }
 }
@@ -53,7 +79,7 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
 
   it('未实现/未知 endpoint 返回 internal_error envelope（不抛给传输层）', async () => {
     const handler = createBridgeHandler({ service: fakeService() })
-    for (const endpoint of ['view', 'create', 'edit', 'run', 'listActions', 'bogus']) {
+    for (const endpoint of ['edit', 'run', 'listActions', 'bogus']) {
       const result = await handler(endpoint, {}, undefined, {})
       expect(result.ok).toBe(false)
       expect(result.error.code).toBe('internal_error')
@@ -69,6 +95,115 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
     expect(result.ok).toBe(false)
     expect(result.error.code).toBe('internal_error')
     expect(result.error.message).toContain('storage exploded')
+  })
+})
+
+describe('create 端点（最小形状校验 + 零翻译 DTO + 契约错误透传）', () => {
+  it('合法输入原样透传 service.create，返回 { ok: true, value: OrchestrationView }', async () => {
+    const seen = []
+    const handler = createBridgeHandler({
+      service: fakeService({ create: async (input) => { seen.push(input); return { ...SAMPLE_VIEW } } }),
+    })
+    const input = sampleCreateInput()
+    const result = await handler('create', input, undefined, {})
+    expect(seen).toEqual([input])
+    expect(result).toEqual({ ok: true, value: SAMPLE_VIEW })
+  })
+
+  it.each([
+    ['payload 非对象', 'nope', 'payload', 'format'],
+    ['缺 title', (() => { const i = sampleCreateInput(); delete i.title; return i })(), 'title', 'missing'],
+    ['顶层多余字段', { ...sampleCreateInput(), extra: 1 }, 'extra', 'unexpected'],
+    ['title 非字符串', { ...sampleCreateInput(), title: 42 }, 'title', 'format'],
+    ['trigger 非对象', { ...sampleCreateInput(), trigger: 'every' }, 'trigger', 'format'],
+    ['enabled 非布尔', { ...sampleCreateInput(), enabled: 'yes' }, 'enabled', 'format'],
+  ])('最小形状校验：%s → script_input_invalid（%s/%s）', async (_label, payload, field, reason) => {
+    const handler = createBridgeHandler({ service: fakeService() })
+    const result = await handler('create', payload, undefined, {})
+    expect(result.ok).toBe(false)
+    expect(result.error.code).toBe('script_input_invalid')
+    expect(result.error.details).toMatchObject({ field, reason })
+  })
+
+  it('深层语义由服务判定：服务契约错误原样透传（不升级 internal_error）', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({
+        create: async () => {
+          throw new OrchestratorError('script_input_invalid', '低于 60 秒硬性下限', {
+            field: 'trigger.everySeconds',
+            reason: 'too-frequent',
+          })
+        },
+      }),
+    })
+    const result = await handler('create', { ...sampleCreateInput(), trigger: { kind: 'every', everySeconds: 30 } }, undefined, {})
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'script_input_invalid',
+        message: '低于 60 秒硬性下限',
+        details: { field: 'trigger.everySeconds', reason: 'too-frequent' },
+      },
+    })
+  })
+
+  it('服务抛未分类异常 → internal_error envelope', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({ create: async () => { throw new Error('queue poisoned') } }),
+    })
+    const result = await handler('create', sampleCreateInput(), undefined, {})
+    expect(result.ok).toBe(false)
+    expect(result.error.code).toBe('internal_error')
+  })
+})
+
+describe('view 端点（契约 11 端点表：与服务同形）', () => {
+  it('{ id } → service.view(id, {})，返回 ok value', async () => {
+    const seen = []
+    const handler = createBridgeHandler({
+      service: fakeService({ view: async (id, options) => { seen.push([id, options]); return { ...SAMPLE_VIEW, runs: [], availableActions: [] } } }),
+    })
+    const result = await handler('view', { id: 'log-rotate' }, undefined, {})
+    expect(seen).toEqual([['log-rotate', {}]])
+    expect(result.ok).toBe(true)
+    expect(result.value).toEqual({ ...SAMPLE_VIEW, runs: [], availableActions: [] })
+  })
+
+  it('{ id, runs } 原样透传 runs 选项', async () => {
+    const seen = []
+    const handler = createBridgeHandler({
+      service: fakeService({ view: async (id, options) => { seen.push([id, options]); return { ...SAMPLE_VIEW, runs: [], availableActions: [] } } }),
+    })
+    await handler('view', { id: 'x', runs: 10 }, undefined, {})
+    expect(seen).toEqual([['x', { runs: 10 }]])
+  })
+
+  it.each([
+    ['缺 id', {}, 'id', 'missing'],
+    ['id 非字符串', { id: 42 }, 'id', 'format'],
+    ['多余字段', { id: 'x', deep: 1 }, 'deep', 'unexpected'],
+    ['runs 非整数', { id: 'x', runs: '5' }, 'runs', 'format'],
+    ['runs 越界', { id: 'x', runs: 51 }, 'runs', 'range'],
+    ['payload 非对象', null, 'payload', 'format'],
+  ])('形状校验：%s → script_input_invalid（%s/%s）', async (_label, payload, field, reason) => {
+    const handler = createBridgeHandler({ service: fakeService() })
+    const result = await handler('view', payload, undefined, {})
+    expect(result.ok).toBe(false)
+    expect(result.error.code).toBe('script_input_invalid')
+    expect(result.error.details).toMatchObject({ field, reason })
+  })
+
+  it('script_unknown 原样透传', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({
+        view: async () => { throw new OrchestratorError('script_unknown', "编排 'x' 不存在", { id: 'x' }) },
+      }),
+    })
+    const result = await handler('view', { id: 'x' }, undefined, {})
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'script_unknown', message: "编排 'x' 不存在", details: { id: 'x' } },
+    })
   })
 })
 

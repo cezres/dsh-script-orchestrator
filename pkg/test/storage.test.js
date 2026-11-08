@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { domainSpec, openStorage } from '../lib/storage.js'
+import { createManagementService } from '../lib/service.js'
+import { ServiceQueue } from '../lib/fifo.js'
 
 function fakeDomain({ orchestrations = [], runs = [] } = {}) {
   const tables = {
@@ -44,15 +46,62 @@ describe('domainSpec（存储域声明，契约 docs/temp/08-storage.md）', () 
     expect('global' in domainSpec).toBe(false)
   })
 
-  it('记录 schema 为 zod：主键必填，passthrough 保留现存未知字段（domain 层 parse 用）', () => {
+  it('编排记录 schema 按实际形状收紧（票 25 起）：完整记录通过，骨架/多余字段/坏形状被拒（→ 宿主 backup-and-skip）', () => {
     const orch = domainSpec.tables.orchestrations.valueSchema
     expect(typeof orch.parse).toBe('function')
-    const parsed = orch.parse({ id: 'x', title: '额外字段', status: 'active' })
-    expect(parsed).toEqual({ id: 'x', title: '额外字段', status: 'active' })
-    expect(() => orch.parse({ title: '缺 id' })).toThrow()
+    const good = {
+      id: 'nightly-check',
+      title: '夜间部署巡检',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-rate' },
+      script: { command: 'pwsh', args: ['-File', 'check.ps1'], env: {}, timeoutSeconds: 300 },
+      judge: {
+        rules: [{ when: { exitCode: 0 }, actions: ['emit-ok'] }],
+        fallback: [],
+      },
+      actions: { 'emit-ok': { kind: 'event', name: 'deploy-ok' } },
+      createdAt: '2026-11-09T00:00:00.000Z',
+      updatedAt: '2026-11-09T00:00:00.000Z',
+      status: 'active',
+      nextOccurrence: '2026-11-09T00:05:00.000Z',
+    }
+    expect(orch.parse(good)).toEqual(good)
+    // cron 形状在读侧同样接受（域版本 1 的存储契约；创建路径属票 27）
+    expect(() =>
+      orch.parse({ ...good, trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' }, nextOccurrence: null }),
+    ).not.toThrow()
+    // 票 24 时代的最小骨架记录（只有 id/title/status）按坏记录处置
+    expect(() => orch.parse({ id: 'x', title: '骨架', status: 'active' })).toThrow()
+    // 多余字段 / 坏形状
+    expect(() => orch.parse({ ...good, extra: 1 })).toThrow()
+    expect(() => orch.parse({ ...good, status: 'running' })).toThrow()
+    expect(() => orch.parse({ ...good, trigger: { kind: 'every', everySeconds: 30, mode: 'fixed-rate' } })).toThrow()
+    expect(() => orch.parse({ ...good, actions: { bad: { kind: 'event', name: 'x', extra: 1 } } })).toThrow()
+    // runs 表保持最小骨架（完整 run 形状属票 26 两写落地时收紧）
     const runs = domainSpec.tables.runs.valueSchema
     expect(() => runs.parse({ runId: 'run-1' })).not.toThrow()
     expect(() => runs.parse({ id: '键字段错' })).toThrow()
+  })
+
+  it('对齐：service.create 写入的记录恰好通过编排记录 schema（写入前 parse 的读侧等价）', async () => {
+    const storage = await openStorage({ openDomain: async () => fakeDomain(), logger: null })
+    const service = createManagementService({
+      storage,
+      queue: new ServiceQueue(),
+      config: { maxRunsPerOrchestration: 100 },
+      now: () => 1_790_000_000_000,
+      emit: () => {},
+    })
+    const view = await service.create({
+      title: 'log rotate',
+      trigger: { kind: 'every', everySeconds: 90, mode: 'fixed-delay' },
+      script: { command: 'pwsh', args: ['-File', 'r.ps1'], cwd: 'D:\\logs', env: { A: '1' }, timeoutSeconds: 120 },
+      judge: { rules: [{ when: { exitCode: { not: 0 } }, actions: ['emit-bad'] }] },
+      actions: { 'emit-bad': { kind: 'session', mode: 'ephemeral', prompt: 'p', idleDisposeSeconds: 0 } },
+      enabled: false,
+    })
+    expect(() => domainSpec.tables.orchestrations.valueSchema.parse(view)).not.toThrow()
   })
 })
 
