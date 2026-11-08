@@ -1,6 +1,9 @@
 // Connection 桥：独立 channel /script-orchestrator 的一元 RPC（契约 docs/temp/11-web-panel.md）。
 // 只做最小形状校验与 envelope 包装，业务语义全部由服务判定（零翻译 DTO）；
-// abort 只终止等待，不取消已受理操作（本桥不把 signal 传给只读的 list）。
+// 契约错误 { code, message, details? } 原样透传，不升级 internal_error。
+// abort 只终止等待，不取消已受理操作（本桥不把 signal 传给服务）。
+import { OrchestratorError } from './errors.js'
+
 const invalid = (field, reason, message) => ({
   ok: false,
   error: { code: 'script_input_invalid', message, details: { field, reason } },
@@ -9,6 +12,15 @@ const invalid = (field, reason, message) => ({
 const internal = (message) => ({
   ok: false,
   error: { code: 'internal_error', message, details: {} },
+})
+
+/** 契约错误 → envelope（details 缺省时省略字段）。 */
+const contractError = (error) => ({
+  ok: false,
+  error:
+    error.details === undefined
+      ? { code: error.code, message: error.message }
+      : { code: error.code, message: error.message, details: error.details },
 })
 
 /** ListQuery 的最小形状校验：active/limit/offset，多余或非法即 script_input_invalid。 */
@@ -46,6 +58,69 @@ function validateListPayload(payload) {
   return null
 }
 
+/** OrchestrationInput 的最小顶层形状校验（契约 11：深层语义由服务判定）。 */
+function validateCreatePayload(payload) {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return invalid('payload', 'format', 'create 的参数必须是对象（OrchestrationInput）')
+  }
+  const allowed = new Set(['id', 'title', 'enabled', 'overlap', 'trigger', 'script', 'judge', 'actions'])
+  for (const key of Object.keys(payload)) {
+    if (!allowed.has(key)) {
+      return invalid(key, 'unexpected', `create 不接受顶层字段 '${key}'`)
+    }
+  }
+  for (const key of ['title', 'trigger', 'script', 'judge', 'actions']) {
+    if (!(key in payload)) {
+      return invalid(key, 'missing', `create 缺少必填字段 '${key}'`)
+    }
+  }
+  if (typeof payload.title !== 'string') {
+    return invalid('title', 'format', 'title 必须是字符串')
+  }
+  for (const key of ['trigger', 'script', 'judge', 'actions']) {
+    if (typeof payload[key] !== 'object' || payload[key] === null || Array.isArray(payload[key])) {
+      return invalid(key, 'format', `字段 '${key}' 必须是对象`)
+    }
+  }
+  if ('enabled' in payload && typeof payload.enabled !== 'boolean') {
+    return invalid('enabled', 'format', 'enabled 必须是布尔值')
+  }
+  if ('overlap' in payload && payload.overlap !== 'skip' && payload.overlap !== 'queue') {
+    return invalid('overlap', 'format', "overlap 必须是 'skip' 或 'queue'")
+  }
+  if ('id' in payload && typeof payload.id !== 'string') {
+    return invalid('id', 'format', 'id 必须是字符串')
+  }
+  return null
+}
+
+/** view 端点的最小形状校验：{ id, runs? }。 */
+function validateViewPayload(payload) {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return invalid('payload', 'format', 'view 的参数必须是对象')
+  }
+  for (const key of Object.keys(payload)) {
+    if (key !== 'id' && key !== 'runs') {
+      return invalid(key, 'unexpected', `view 不接受字段 '${key}'`)
+    }
+  }
+  if (!('id' in payload)) {
+    return invalid('id', 'missing', 'view 缺少必填字段 id')
+  }
+  if (typeof payload.id !== 'string' || payload.id.length === 0) {
+    return invalid('id', 'format', 'id 必须是非空字符串')
+  }
+  if ('runs' in payload) {
+    if (typeof payload.runs !== 'number' || !Number.isInteger(payload.runs)) {
+      return invalid('runs', 'format', 'runs 必须是整数')
+    }
+    if (payload.runs < 0 || payload.runs > 50) {
+      return invalid('runs', 'range', 'runs 必须在 0–50 之间')
+    }
+  }
+  return null
+}
+
 /**
  * 建 /script-orchestrator 的 rpc.handle handler。
  * @param {object} deps
@@ -58,7 +133,17 @@ export function createBridgeHandler({ service }) {
       if (violation) return violation
       return { ok: true, value: await service.list(payload ?? {}) }
     },
-    // view/create/edit/run/listActions 属后续票（spec §3 步骤 6；票 25–33）
+    create: async (payload) => {
+      const violation = validateCreatePayload(payload)
+      if (violation) return violation
+      return { ok: true, value: await service.create(payload) }
+    },
+    view: async (payload) => {
+      const violation = validateViewPayload(payload)
+      if (violation) return violation
+      return { ok: true, value: await service.view(payload.id, 'runs' in payload ? { runs: payload.runs } : {}) }
+    },
+    // edit/run/listActions 属后续票（spec §3 步骤 6；票 28/26/31）
   }
   return async function bridgeHandler(endpoint, payload, _signal, _peer) {
     try {
@@ -68,6 +153,7 @@ export function createBridgeHandler({ service }) {
       }
       return await invoke(payload)
     } catch (error) {
+      if (error instanceof OrchestratorError) return contractError(error)
       return internal(`endpoint '${String(endpoint)}' 内部错误: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
