@@ -175,6 +175,57 @@ describe('view（契约 06：单条详情 + 最近 runs + availableActions）', 
       details: { field: 'deep', reason: 'unexpected' },
     })
   })
+
+  it('合并 runner 活动视图：内存态（running 等）实时出现在 runs（中途状态不落盘）', async () => {
+    // fake runner：liveView 对特定 runId 给出 running 覆盖
+    const storage = makeStorage()
+    const queue = new ServiceQueue()
+    await queue.enqueue(async () => {
+      storage.table('orchestrations').put('log-rotate', {
+        id: 'log-rotate',
+        title: 'log rotate',
+        enabled: true,
+        overlap: 'skip',
+        trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-rate' },
+        script: { command: 'pwsh', args: ['-File', 'rotate.ps1'], env: {} },
+        judge: { rules: [], fallback: [] },
+        actions: {},
+        createdAt: iso(NOW - 600_000),
+        updatedAt: iso(NOW - 600_000),
+        status: 'active',
+        nextOccurrence: iso(NOW),
+      })
+      storage.table('runs').put('run-00000001', {
+        runId: 'run-00000001',
+        orchestrationId: 'log-rotate',
+        trigger: 'every',
+        scheduledAt: iso(NOW),
+        startedAt: null,
+        settledAt: null,
+        status: 'queued',
+        skipReason: null,
+        script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+        matchedRule: null,
+        usedFallback: false,
+        actions: [],
+      })
+    })
+    const live = new Map([['run-00000001', { status: 'running', startedAt: iso(NOW + 5_000) }]])
+    const service = createManagementService({
+      storage,
+      queue,
+      config: { maxRunsPerOrchestration: 100 },
+      now: () => NOW,
+      runner: { liveView: (runId) => (live.has(runId) ? { ...live.get(runId) } : undefined) },
+    })
+    const detail = await service.view('log-rotate')
+    expect(detail.runs).toHaveLength(1)
+    expect(detail.runs[0]).toMatchObject({ runId: 'run-00000001', status: 'running', startedAt: iso(NOW + 5_000) })
+    // runner 视图消失后回落到持久记录（结算写完成后的形态）
+    live.delete('run-00000001')
+    const detail2 = await service.view('log-rotate')
+    expect(detail2.runs[0]).toMatchObject({ status: 'queued' })
+  })
 })
 
 describe('list 查询校验（服务为语义权威）', () => {

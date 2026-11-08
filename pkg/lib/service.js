@@ -25,8 +25,9 @@ function slugifyTitle(title) {
  * @param {() => number} [deps.now] 时钟注入（默认 Date.now；测试定锚）
  * @param {(name: string, payload?: unknown) => void} [deps.emit] 事件发布（默认 no-op）
  * @param {object} [deps.logger] 内部日志（发布端兜底等）
+ * @param {object} [deps.runner] 执行引擎（liveView 合并活动 run 的内存态到 view）
  */
-export function createManagementService({ storage, queue, config, now, emit, logger }) {
+export function createManagementService({ storage, queue, config, now, emit, logger, runner }) {
   void config
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
@@ -131,6 +132,12 @@ export function createManagementService({ storage, queue, config, now, emit, log
       const runs = [...storage.table('runs').entries()]
         .map(([, run]) => run)
         .filter((run) => run.orchestrationId === id)
+        .map((run) => {
+          // 合并执行引擎的活动视图：running/judging/dispatching 等内存态实时可见
+          //（中途状态不落盘，契约 08「只写两次」；结算后 live 视图移除、回落持久记录）
+          const overlay = runner?.liveView?.(run.runId)
+          return overlay === undefined ? run : { ...run, ...overlay }
+        })
         .sort((a, b) => String(b.scheduledAt).localeCompare(String(a.scheduledAt)) || String(b.runId).localeCompare(String(a.runId)))
         .slice(0, options.runs ?? 5)
       return { ...record, runs, availableActions: this.listActions() }
