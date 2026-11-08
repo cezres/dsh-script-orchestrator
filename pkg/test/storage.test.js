@@ -43,6 +43,17 @@ describe('domainSpec（存储域声明，契约 docs/temp/08-storage.md）', () 
     expect(Object.keys(domainSpec.tables).sort()).toEqual(['orchestrations', 'runs'])
     expect('global' in domainSpec).toBe(false)
   })
+
+  it('记录 schema 为 zod：主键必填，passthrough 保留现存未知字段（domain 层 parse 用）', () => {
+    const orch = domainSpec.tables.orchestrations.valueSchema
+    expect(typeof orch.parse).toBe('function')
+    const parsed = orch.parse({ id: 'x', title: '额外字段', status: 'active' })
+    expect(parsed).toEqual({ id: 'x', title: '额外字段', status: 'active' })
+    expect(() => orch.parse({ title: '缺 id' })).toThrow()
+    const runs = domainSpec.tables.runs.valueSchema
+    expect(() => runs.parse({ runId: 'run-1' })).not.toThrow()
+    expect(() => runs.parse({ id: '键字段错' })).toThrow()
+  })
 })
 
 describe('openStorage（打开与键校验）', () => {

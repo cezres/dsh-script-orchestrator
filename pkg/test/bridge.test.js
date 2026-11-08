@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { createBridgeHandler } from '../lib/bridge.js'
+import { describe, it, expect, vi } from 'vitest'
+import { createBridgeHandler, mountBridge } from '../lib/bridge.js'
 
 function fakeService(over = {}) {
   return {
@@ -69,5 +69,121 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
     expect(result.ok).toBe(false)
     expect(result.error.code).toBe('internal_error')
     expect(result.error.message).toContain('storage exploded')
+  })
+})
+
+/** 模拟 node:http 的 req/res，驱动 mountBridge 挂的路由 handler。 */
+async function callRoute(route, { method = 'POST', url, body, admission }) {
+  const chunks = method === 'POST' && body !== undefined ? [Buffer.from(body)] : []
+  const req = {
+    method,
+    url,
+    headers: { host: '127.0.0.1:9999' },
+    async *[Symbol.asyncIterator]() {
+      yield* chunks
+    },
+  }
+  const writes = []
+  let status = null
+  let headers = null
+  const res = {
+    writeHead(code, hdrs) {
+      status = code
+      headers = hdrs
+    },
+    end(payload) {
+      writes.push(String(payload ?? ''))
+    },
+  }
+  await route.handler(req, res)
+  return { status, headers, body: writes.join('') }
+}
+
+describe('mountBridge（HTTP 挂载：webServer 路由 + connection.admit + envelope）', () => {
+  const peer = { id: 'peer-1' }
+  function makeDeps(admission = { peer }) {
+    const routes = []
+    return {
+      connection: {
+        admit: () => admission,
+      },
+      webServer: {
+        register: (route) => {
+          routes.push(route)
+          return () => routes.splice(routes.indexOf(route), 1)
+        },
+      },
+      routes,
+    }
+  }
+  const handler = createBridgeHandler({ service: fakeService() })
+
+  it('注册 /script-orchestrator prefix 路由，返回 disposer', () => {
+    const deps = makeDeps()
+    const dispose = mountBridge({ ...deps, handler })
+    expect(deps.routes).toHaveLength(1)
+    expect(deps.routes[0].kind).toBe('prefix')
+    expect(deps.routes[0].path).toBe('/script-orchestrator')
+    dispose()
+    expect(deps.routes).toHaveLength(0)
+  })
+
+  it('认证拒绝：401/403 无 body 透传（复用 connection.admit）', async () => {
+    const deps = makeDeps({ rejection: 401 })
+    mountBridge({ ...deps, handler })
+    const r401 = await callRoute(deps.routes[0], { url: '/script-orchestrator/list', body: '{}' })
+    expect(r401.status).toBe(401)
+    expect(r401.body).toBe('unauthorized')
+    const deps403 = makeDeps({ rejection: 403 })
+    mountBridge({ ...deps403, handler })
+    const r403 = await callRoute(deps403.routes[0], { url: '/script-orchestrator/list', body: '{}' })
+    expect(r403.status).toBe(403)
+    expect(r403.body).toBe('forbidden')
+  })
+
+  it('合法请求：POST + JSON envelope → server-response envelope（client rpc.call 可解析形状）', async () => {
+    const deps = makeDeps()
+    mountBridge({ ...deps, handler })
+    const r = await callRoute(deps.routes[0], {
+      url: '/script-orchestrator/list',
+      body: JSON.stringify({ type: 'client-request', rpcId: 'r-1', method: 'list', payload: {} }),
+    })
+    expect(r.status).toBe(200)
+    const envelope = JSON.parse(r.body)
+    expect(envelope).toEqual({
+      type: 'server-response',
+      rpcId: 'r-1',
+      result: { ok: true, value: { items: [], total: 0, nextOffset: null } },
+    })
+  })
+
+  it('方法与端点不一致 / 非 JSON / GET：按传输层错误处理', async () => {
+    const deps = makeDeps()
+    mountBridge({ ...deps, handler })
+    const mismatch = await callRoute(deps.routes[0], {
+      url: '/script-orchestrator/list',
+      body: JSON.stringify({ type: 'client-request', rpcId: 'r-2', method: 'other', payload: {} }),
+    })
+    expect(mismatch.status).toBe(200)
+    expect(JSON.parse(mismatch.body).result.ok).toBe(false)
+    expect(JSON.parse(mismatch.body).result.error.code).toBe('gateway/bad-request')
+    const notJson = await callRoute(deps.routes[0], { url: '/script-orchestrator/list', body: 'not-json' })
+    expect(notJson.status).toBe(400)
+  })
+
+  it('handler 抛错 → HTTP 500 文本（与 rpc.handle 传输层一致）', async () => {
+    const deps = makeDeps()
+    mountBridge({
+      ...deps,
+      handler: () => {
+        throw new Error('boom')
+      },
+    })
+    const r = await callRoute(deps.routes[0], {
+      url: '/script-orchestrator/list',
+      body: JSON.stringify({ type: 'client-request', rpcId: 'r-3', method: 'list', payload: {} }),
+    })
+    expect(r.status).toBe(500)
+    expect(r.body).toContain('boom')
   })
 })

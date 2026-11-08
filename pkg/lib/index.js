@@ -7,7 +7,7 @@ import { Config } from './config.js'
 import { ServiceQueue } from './fifo.js'
 import { openStorage } from './storage.js'
 import { createManagementService } from './service.js'
-import { createBridgeHandler } from './bridge.js'
+import { createBridgeHandler, mountBridge } from './bridge.js'
 
 export const name = 'script-orchestrator'
 export { Config }
@@ -22,10 +22,13 @@ export async function* apply(ctx, config) {
     logger,
   })
   const service = createManagementService({ storage, queue, config })
-  const disposeBridge = ctx.connection.rpc.handle(
-    '/script-orchestrator',
-    createBridgeHandler({ service }),
-  )
+  // 桥挂载为独立 channel 的 prefix 路由（rpc.handle 在 0.2.2-rc.1 对第三方不可用，
+  // 见 lib/bridge.js mountBridge 注释；浏览器侧契约面不变）
+  const disposeBridge = mountBridge({
+    connection: ctx.connection,
+    webServer: ctx.webServer,
+    handler: createBridgeHandler({ service }),
+  })
   ctx.provide('scriptOrchestrator', service)
   yield async () => {
     disposeBridge()
