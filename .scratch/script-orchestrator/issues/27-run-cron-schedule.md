@@ -4,7 +4,7 @@
 
 **Blocked by:** 26 — 自动执行 every 编排并查看脚本结果
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 创建时只接受契约规定的五位 cron 子集和显式 IANA 时区，非法字段、宏、秒字段及过密规则返回准确的 `script_input_invalid`。
 - [ ] `nextOccurrence` 严格大于 `fromMs`，五年窗口内无解有界返回并在创建/更新时拒绝；运行期意外无解转为 `ended`。
