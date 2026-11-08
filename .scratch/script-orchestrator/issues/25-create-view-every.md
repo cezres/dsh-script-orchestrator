@@ -4,7 +4,7 @@
 
 **Blocked by:** 24 — 安装插件并查看空编排列表
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 面板新建入口经 `uiWorkspace.startSession` 开启新会话并注入引导 prompt，不引入独立配置表单。
 - [ ] `script_create` 以严格 JSON Schema 校验 every 输入，非法字段、间隔和多余字段统一映射为 `script_input_invalid`，失败不产生任何记录。
