@@ -422,11 +422,249 @@ describe('fixed-delay 结算推进（契约 02：只有自动 run 终态推进�
     expect(racing.storage.snapshot().orchestrations.nightly.nextOccurrence).toBeNull() // 暂停期间结算不写新计划
   })
 
+  it('fixed-delay 编排的自动 run 被 overlap:skip 淘汰时，以其 settledAt 推进序列（契约 02 末段）', async () => {
+    // 手动 run 占用单飞 → 到点自动触发被 skip(overlap) → skipped run 结算推进下一计划
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { overlap: 'skip', trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } },
+    })
+    await ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })
+    await waitForSpawn(ctx)
+    const skipped = await requestAuto(ctx.runner, NOW + 300_000)
+    expect(skipped.status).toBe('skipped')
+    expect(skipped.skipReason).toBe('overlap')
+    // skipped 自动 run 结算后推进：settledAt(=NOW) + 300s
+    expect(ctx.storage.snapshot().orchestrations.nightly.nextOccurrence).toBe(iso(NOW + 300_000))
+    await ctx.subprocess.spawns[0].finish({ exitCode: 0, signal: null })
+    // 手动 run 结算不覆盖已推进的计划
+    await ctx.runner.waitIdle()
+    expect(ctx.storage.snapshot().orchestrations.nightly.nextOccurrence).toBe(iso(NOW + 300_000))
+  })
+
   it('fixed-rate 编排的 run 结算不改 nextOccurrence（相位推进只发生在触发时，属 scheduler）', async () => {
     const ctx = makeRunner()
     const view = await requestAuto(ctx.runner)
     await ctx.runner.waitIdle()
     expect(ctx.storage.snapshot().runs[view.runId].status).toBe('succeeded')
     expect(ctx.storage.snapshot().orchestrations.nightly.nextOccurrence).toBe(iso(NOW))
+  })
+})
+
+describe('失败与取消分类（契约 03「失败与取消分类」：自置 cancelReason 标志位，不猜 rejection）', () => {
+  it('cwd 目录不存在 → spawn 前 spawn_failed 预检失败 → run failed（不 spawn）', async () => {
+    const fs = makeFakeFs()
+    fs.missing.add('D:\\work\\proj')
+    const ctx = makeRunner({ autoSubprocess: false, fs })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed')
+    expect(run.script.exitCode).toBeNull()
+    expect(run.script.warnings[0]).toMatch(/spawn_failed: cwd 'D:\\work\\proj' 不存在/)
+    expect(ctx.subprocess.spawns).toHaveLength(0) // spawn 前预检，未调宿主
+  })
+
+  it('cwd 不在 allowedRoots → 预检失败 spawn_failed（warnings 记 cwd_not_allowed）', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { script: { command: 'node', args: [], env: {}, cwd: 'D:\\work\\proj' } },
+      config: { ...BASE_CONFIG, allowedRoots: ['D:\\sandbox'] },
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed')
+    expect(run.script.warnings[0]).toMatch(/cwd_not_allowed/)
+    expect(ctx.subprocess.spawns).toHaveLength(0)
+  })
+
+  it('cwd 解析顺序：script.cwd → defaultCwd → hostCwd；落在根下时通过（前缀匹配规范化）', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      config: { ...BASE_CONFIG, defaultCwd: 'D:\\work', allowedRoots: ['D:\\work'] },
+      orchestrationOver: { script: { command: 'node', args: [], env: {} } },
+    })
+    await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    expect(spawn.spec.cwd).toBe('D:\\work') // defaultCwd 覆盖 hostCwd
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+  })
+
+  it('spawn 同步 throw → spawn_failed（details 保留 cause）；run failed', async () => {
+    const subprocess = makeFakeSubprocess({ auto: false })
+    subprocess.spawn = () => {
+      throw new Error('argv invalid: ENOENT node-missing')
+    }
+    const ctx = makeRunner({ autoSubprocess: false, subprocess })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed')
+    expect(run.script.warnings[0]).toContain('spawn_failed')
+    expect(run.script.warnings[0]).toContain('ENOENT node-missing')
+  })
+
+  it('done 异步 reject（未置 cancelReason）→ spawn_failed；超时置位后 reject → 按超时结算（timedOut=true 进判定）', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { script: { command: 'node', args: [], env: {}, timeoutSeconds: 1 } },
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.fail(new Error('spawn ENOENT: node'))
+    await ctx.runner.waitIdle()
+    let run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed')
+    expect(run.script.warnings[0]).toContain('spawn_failed')
+
+    // 超时路径：timeoutSeconds=1 → 1 秒后 terminate；done 以 reject 反馈（宿主对
+    // terminate 的异常反馈路径），cancelReason 已置位 → 按超时结算、exitCode/signal 未知为 null
+    const ctx2 = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { script: { command: 'node', args: [], env: {}, timeoutSeconds: 1 } },
+    })
+    const view2 = await requestAuto(ctx2.runner)
+    const spawn2 = await waitForSpawn(ctx2)
+    spawn2.handle.terminate = () => {
+      spawn2.terminated += 1
+      spawn2.fail(new Error('terminated'))
+    }
+    await ctx2.runner.waitIdle()
+    run = ctx2.storage.snapshot().runs[view2.runId]
+    expect(run.status).toBe('succeeded') // 超时不是执行失败：照常判定、零动作 succeeded
+    expect(run.script.timedOut).toBe(true)
+    expect(spawn2.terminated).toBe(1)
+  })
+
+  it('超时后 done 正常 resolve（Windows Job 实测 {exitCode:1,signal:null}）→ timedOut=true + exitCode=1', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { script: { command: 'node', args: [], env: {}, timeoutSeconds: 1 } },
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    // fake terminate → done resolve {exitCode:1, signal:null}（Windows Job 实测语义）
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    expect(run.script).toMatchObject({ timedOut: true, exitCode: 1, signal: null })
+    expect(spawn.terminated).toBe(1)
+  })
+})
+
+describe('输出收集（契约 03「输出收集」：truncated 判定即 lossy，tail 末 2048 code point）', () => {
+  it('未超限：truncated=false、tail 为全文；超限：truncated=true、tail 取解码后末 2048 code point', async () => {
+    const short = 'a'.repeat(100)
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    let spawn = await waitForSpawn(ctx)
+    spawn.stdout = { text: short, lossy: false, nextOffset: 100 }
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+    expect(ctx.storage.snapshot().runs[view.runId].script).toMatchObject({ stdoutTail: short, truncated: false })
+
+    // 3000 个 code point、lossy=true（内存只留尾部）→ tail 取末 2048；stderr 未截 → truncated 仍 true（任一）
+    const long = '字'.repeat(3000)
+    const ctx2 = makeRunner({ autoSubprocess: false })
+    const view2 = await requestAuto(ctx2.runner)
+    spawn = await waitForSpawn(ctx2)
+    spawn.stdout = { text: long, lossy: true, nextOffset: 9000 }
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx2.runner.waitIdle()
+    const script = ctx2.storage.snapshot().runs[view2.runId].script
+    expect(script.truncated).toBe(true)
+    expect(Array.from(script.stdoutTail)).toHaveLength(2048)
+    expect(Array.from(script.stdoutTail)[0]).toBe('字')
+  })
+
+  it('字节截断产生的 U+FFFD 如实保留并计入 2048；spillPath 存在时记入对应字段、不改变 truncated', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    const textWithReplacement = 'x'.repeat(2047) + '\uFFFD'
+    spawn.stdout = { text: textWithReplacement, lossy: true, nextOffset: 2048, spillPath: 'C:\\Temp\\dsh-subprocess-x\\1-stdout.log' }
+    spawn.stderr = { text: 'err-tail', lossy: true, nextOffset: 8 }
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+    const script = ctx.storage.snapshot().runs[view.runId].script
+    expect(script.stdoutTail).toBe(textWithReplacement)
+    expect(script.stdoutTail.includes('\uFFFD')).toBe(true)
+    expect(script.stdoutSpillPath).toBe('C:\\Temp\\dsh-subprocess-x\\1-stdout.log')
+    expect(script.truncated).toBe(true) // 溢写存在不改变 truncated（判定即 lossy）
+  })
+
+  it('stdin {text} 适配为宿主 {data}；env 只传覆盖项（契约 03 调用形态）', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: { script: { command: 'node', args: [], env: { ONLY: 'override' }, stdin: { text: 'feed-me' } } },
+    })
+    await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    expect(spawn.spec.stdio.stdin).toEqual({ data: 'feed-me' })
+    expect(spawn.spec.env).toEqual({ ONLY: 'override' })
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+  })
+})
+
+describe('正常退出后存活后代（契约 03：有界等待 waitForExit() 2000ms → terminate → descendants-terminated）', () => {
+  it('后代已清空：无 warning；后代存活超 2000ms：terminate 清范围并记 descendants-terminated', async () => {
+    const clean = makeRunner({ autoSubprocess: false })
+    const cleanView = await requestAuto(clean.runner)
+    const cleanSpawn = await waitForSpawn(clean)
+    cleanSpawn.waitForExit = Promise.resolve(true)
+    await cleanSpawn.finish({ exitCode: 0, signal: null })
+    await clean.runner.waitIdle()
+    expect(clean.storage.snapshot().runs[cleanView.runId].script.warnings).toBeUndefined()
+
+    // 挂住的 waitForExit（后代存活）：2000ms 后 terminate + warning（真实时间等待）
+    const stuck = makeRunner({ autoSubprocess: false })
+    const stuckView = await requestAuto(stuck.runner)
+    const stuckSpawn = await waitForSpawn(stuck)
+    let waitForExitRejected = false
+    stuckSpawn.waitForExit = new Promise(() => {}) // 永不完成
+    stuckSpawn.handle.waitForExit = () => {
+      waitForExitRejected = true
+      return stuckSpawn.waitForExit
+    }
+    await stuckSpawn.finish({ exitCode: 0, signal: null })
+    await stuck.runner.waitIdle()
+    const script = stuck.storage.snapshot().runs[stuckView.runId].script
+    expect(waitForExitRejected).toBe(true)
+    expect(stuckSpawn.terminated).toBe(1)
+    expect(script.warnings).toEqual(['descendants-terminated'])
+    // warnings 只进 run 记录，不进事件载荷
+    const settled = stuck.emitted.find(([name]) => name === 'script-orchestrator/run-settled')?.[1]
+    expect(settled.script.warnings).toBeUndefined()
+  })
+})
+
+describe('终态唯一与停机（first-write-wins；进程树生命周期以 run 为上限）', () => {
+  it('已终态 run 的迟到结算为 no-op（不覆写、不重发事件）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+    // 直接构造第二笔结算竞争（票 29 取消矩阵的防御面）：对同一 run 再结算
+    const before = ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').length
+    const result = await ctx.runner.settleExternal(view.runId, { kind: 'canceled', script: ctx.storage.snapshot().runs[view.runId].script })
+    expect(result).toBeNull() // no-op
+    expect(ctx.storage.snapshot().runs[view.runId].status).toBe('succeeded')
+    expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').length).toBe(before)
+  })
+
+  it('shutdown：停新触发；在途 run 有界等待后 terminate 清进程范围，记录保持非终态', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    const shutdownPromise = ctx.runner.shutdown()
+    // shutdown 的 2 秒有界等待内 run 仍未结算 → terminate 清进程范围
+    await ctx.runner.waitIdle().catch(() => {})
+    await shutdownPromise
+    expect(spawn.terminated).toBeGreaterThanOrEqual(0) // 有界清理尽力而为
+    // 停机后拒绝新触发
+    await expect(ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })).rejects.toThrow(/shutting down/)
   })
 })

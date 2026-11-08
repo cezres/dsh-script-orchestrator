@@ -232,6 +232,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     }
     await storage.table('runs').put(runId, settled)
     live.delete(runId)
+    // fixed-delay：自动 run 进入任何终态都推进序列（含 skipped；契约 02「fixed-delay」）
+    await advanceFixedDelayIfDue(settled, settledMs)
     wakeIdleWaiters()
     safeEmit('script-orchestrator/run-settled', buildSettledPayload(settled))
     pump()
@@ -450,7 +452,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     return queue.enqueue(async () => {
       const persisted = storage.table('runs').get(runId)
       if (persisted === undefined || TERMINAL_STATUSES.has(persisted.status)) {
-        return persisted ?? null // first-write-wins（契约 03「取消与等待」）
+        return null // first-write-wins（契约 03「取消与等待」）：迟到结算 no-op
       }
       const run = { ...persisted, ...(live.get(runId) ?? {}) }
       const settledMs = currentTime()
@@ -481,25 +483,33 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       await storage.table('runs').put(runId, structuredCloneSafe(run))
       live.delete(runId)
       wakeIdleWaiters()
-      // fixed-delay 序列推进：仅自动 run 终态、编排仍 active、当前触发配置仍为
-      // fixed-delay（用当前持久 trigger 而非触发时快照＝编辑代际防线，契约 02 编辑表）
-      const current = orchestrationOf(run)
-      if (
-        run.trigger !== 'manual' &&
-        current?.status === 'active' &&
-        current.trigger.kind === 'every' &&
-        current.trigger.mode === 'fixed-delay'
-      ) {
-        await storage.table('orchestrations').put(current.id, {
-          ...current,
-          nextOccurrence: iso(settledMs + current.trigger.everySeconds * 1000),
-        })
-        mutating()
-        safeEmit('script-orchestrator/changed')
-      }
+      await advanceFixedDelayIfDue(run, settledMs)
       safeEmit('script-orchestrator/run-settled', buildSettledPayload(run))
       return run
     })
+  }
+
+  /**
+   * fixed-delay 序列推进（契约 02）：仅自动 run 终态、编排仍 active、当前持久触发
+   * 配置仍为 every/fixed-delay（用当前 trigger 而非触发时快照＝编辑代际防线）。
+   * settledAt + everySeconds 写回 nextOccurrence 并发布 changed（nextOccurrence 属
+   * 持久可见变更；不改 updatedAt——调度推进不是内容编辑，避免无谓的乐观并发冲突）。
+   */
+  async function advanceFixedDelayIfDue(run, settledMs) {
+    const current = storage.table('orchestrations').get(run.orchestrationId)
+    if (
+      run.trigger !== 'manual' &&
+      current?.status === 'active' &&
+      current.trigger.kind === 'every' &&
+      current.trigger.mode === 'fixed-delay'
+    ) {
+      await storage.table('orchestrations').put(current.id, {
+        ...current,
+        nextOccurrence: iso(settledMs + current.trigger.everySeconds * 1000),
+      })
+      mutating()
+      safeEmit('script-orchestrator/changed')
+    }
   }
 
   /**
@@ -534,6 +544,12 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     requestRun,
     /** 等 active 与 pending 清空（测试/停机用）。 */
     waitIdle: waitForIdle,
+    /**
+     * 外部结算入口（取消矩阵的防御面，票 29 的 cancel/delete 接线点）：
+     * 与自然结算同一 FIFO 槽位竞争，first-write-wins——已终态的 run 迟到结算为
+     * no-op（返回 null），不覆写、不重发 run-settled。
+     */
+    settleExternal: (runId, outcome) => settle(runId, outcome),
     /** 活动视图合并入口（service.view 用）：返回内存态视图或 undefined。 */
     liveView: (runId) => {
       const overlay = live.get(runId)
