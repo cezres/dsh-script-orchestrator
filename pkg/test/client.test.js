@@ -342,3 +342,190 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     view.unmount()
   })
 })
+
+describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「刷新策略」3：可见且有活动 run 时每 5 秒 view）', () => {
+  const runView = (over = {}) => ({
+    runId: 'run-7f3c1a9e',
+    orchestrationId: 'log-rotate',
+    trigger: 'every',
+    scheduledAt: '2026-11-09T00:05:00.000Z',
+    startedAt: '2026-11-09T00:05:00.100Z',
+    settledAt: '2026-11-09T00:05:02.300Z',
+    status: 'succeeded',
+    skipReason: null,
+    script: {
+      command: 'pwsh',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      durationMs: 2200,
+      stdoutTail: 'deploy ok\nall checks passed',
+      stderrTail: '',
+      truncated: false,
+    },
+    matchedRule: 0,
+    usedFallback: false,
+    actions: [],
+    ...over,
+  })
+
+  async function mountPanel(call) {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    return renderPanel({ call, subscribeReset: () => () => {} })
+  }
+
+  it('run 记录展示脚本阶段结果：状态/退出码/超时/耗时/截断/输出尾部/warnings/skipReason', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView(),
+            runView({
+              runId: 'run-00000002',
+              status: 'skipped',
+              skipReason: 'overlap',
+              startedAt: null,
+              settledAt: '2026-11-09T00:10:00.000Z',
+              script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+              matchedRule: null,
+              usedFallback: false,
+            }),
+            runView({
+              runId: 'run-00000003',
+              status: 'succeeded',
+              script: {
+                command: 'pwsh',
+                exitCode: 1,
+                signal: null,
+                timedOut: true,
+                durationMs: 3000,
+                stdoutTail: 'partial output…',
+                stderrTail: 'boom',
+                truncated: true,
+                warnings: ['descendants-terminated'],
+              },
+            }),
+          ],
+          availableActions: [],
+        },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    expect(modalText).toContain('run-7f3c1a9e')
+    expect(modalText).toContain('退出码 0')
+    expect(modalText).toContain('2200ms')
+    expect(modalText).toContain('deploy ok')
+    expect(modalText).toContain('跳过（重叠）')
+    expect(modalText).toContain('已超时')
+    expect(modalText).toContain('已截断')
+    expect(modalText).toContain('descendants-terminated')
+    expect(modalText).toContain('partial output…')
+    view.unmount()
+  })
+
+  it('活动 run 轮询：模态打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
+    vi.useFakeTimers()
+    try {
+      const calls = []
+      let phase = 'running'
+      const call = (endpoint, payload) => {
+        calls.push([endpoint, payload, phase])
+        if (endpoint === 'list') return Promise.resolve(listResult())
+        const status = phase === 'running' ? 'running' : 'succeeded'
+        return Promise.resolve({
+          ok: true,
+          value: {
+            ...ORCH,
+            runs: [
+              runView({ status, startedAt: status === 'running' ? '2026-11-09T00:05:00.100Z' : '2026-11-09T00:05:00.100Z', settledAt: status === 'running' ? null : '2026-11-09T00:05:09.000Z' }),
+            ],
+            availableActions: [],
+          },
+        })
+      }
+      const view = await mountPanel(call)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await view.clickRow('log rotate')
+      expect(calls.filter(([e]) => e === 'view')).toHaveLength(1)
+      // 5 秒后轮询一次（活动 run 存在）
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000)
+      })
+      expect(calls.filter(([e]) => e === 'view')).toHaveLength(2)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000)
+      })
+      expect(calls.filter(([e]) => e === 'view')).toHaveLength(3)
+      // run 结算为终态 → 本轮完成后停止
+      phase = 'settled'
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000)
+      })
+      expect(calls.filter(([e]) => e === 'view')).toHaveLength(4)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+      })
+      expect(calls.filter(([e]) => e === 'view')).toHaveLength(4) // 停止轮询
+      view.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('停止条件：面板不可见不轮询；模态关闭后停止', async () => {
+    vi.useFakeTimers()
+    try {
+      const calls = []
+      const call = (endpoint) => {
+        calls.push(endpoint)
+        if (endpoint === 'list') return Promise.resolve(listResult())
+        return Promise.resolve({
+          ok: true,
+          value: { ...ORCH, runs: [runView({ status: 'running', settledAt: null })], availableActions: [] },
+        })
+      }
+      const view = await mountPanel(call)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await view.clickRow('log rotate')
+      expect(calls.filter((e) => e === 'view')).toHaveLength(1)
+      // 面板隐藏 → 不轮询
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' })
+      await act(async () => {
+        document.dispatchEvent(new window.Event('visibilitychange'))
+        await vi.advanceTimersByTimeAsync(12000)
+      })
+      expect(calls.filter((e) => e === 'view')).toHaveLength(1)
+      // 回到可见 → 恢复轮询
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
+      await act(async () => {
+        document.dispatchEvent(new window.Event('visibilitychange'))
+        await vi.advanceTimersByTimeAsync(5000)
+      })
+      expect(calls.filter((e) => e === 'view')).toHaveLength(2)
+      // 关闭模态 → 停止（先 flush 卸载，再推进时间）
+      await act(async () => {
+        const close = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '关闭')
+        close.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+      })
+      expect(calls.filter((e) => e === 'view')).toHaveLength(2)
+      view.unmount()
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
+      vi.useRealTimers()
+    }
+  })
+})

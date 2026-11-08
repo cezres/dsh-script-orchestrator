@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { apply as plugin, Config, inject, name } from '../lib/index.js'
 import { Config as RawConfig } from '../lib/config.js'
 
@@ -10,6 +10,8 @@ function makeCtx({ domain } = {}) {
     tools: [],
     closeOrder: [],
     logs: [],
+    emitted: [],
+    spawns: [],
   }
   const fakeDomain =
     domain ??
@@ -29,6 +31,29 @@ function makeCtx({ domain } = {}) {
         return fakeDomain
       },
     },
+    subprocess: {
+      spawn: (spec) => {
+        const entry = { spec, terminated: 0 }
+        calls.spawns.push(entry)
+        let resolveDone
+        entry.finish = (result) => resolveDone(result ?? { exitCode: 0, signal: null })
+        entry.handle = {
+          done: new Promise((resolve) => {
+            resolveDone = resolve
+          }),
+          terminate: () => {
+            entry.terminated += 1
+            resolveDone({ exitCode: 1, signal: null })
+          },
+          waitForExit: () => Promise.resolve(true),
+          collected: {
+            stdout: { readFrom: () => ({ text: '', lossy: false, nextOffset: 0 }) },
+            stderr: { readFrom: () => ({ text: '', lossy: false, nextOffset: 0 }) },
+          },
+        }
+        return entry.handle
+      },
+    },
     connection: {
       admit: () => ({ peer: { id: 'p' } }),
     },
@@ -46,6 +71,7 @@ function makeCtx({ domain } = {}) {
       },
     },
     provide: (key, impl) => calls.provided.push([key, impl]),
+    emit: (name, payload) => calls.emitted.push([name, payload]),
     logger: () => ({ error: (m) => calls.logs.push(m), warn: (m) => calls.logs.push(m) }),
   }
   return { ctx, calls, getRoute: () => route }
@@ -77,16 +103,16 @@ async function callRoute(route, url, body) {
 }
 
 describe('插件入口（lib/index.js）', () => {
-  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools）+ name', () => {
+  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools/subprocess）+ name', () => {
     expect(typeof plugin).toBe('function')
     expect(Config).toBe(RawConfig)
-    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools'])
+    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools', 'subprocess'])
     expect(name).toBe('script-orchestrator')
   })
 
   it('apply：打开存储域 → provide scriptOrchestrator（空 list 可用）→ 挂 /script-orchestrator 路由 → 注册三工具', async () => {
     const { ctx, calls, getRoute } = makeCtx()
-    const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
+    const it = plugin(ctx, {})
     const first = await it.next()
     expect(first.done).toBe(false)
     expect(calls.opened).toEqual(['script_orchestrator'])
@@ -129,7 +155,7 @@ describe('插件入口（lib/index.js）', () => {
       }),
       close: () => Promise.resolve(),
     })
-    const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
+    const it = plugin(ctx, {})
     const first = await it.next()
     const create = calls.tools.find((d) => d.name === 'script_create')
     const view = await create.execute(
@@ -150,9 +176,56 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
-  it('卸载顺序：先摘工具与桥（停生产者）→ 排干服务层队列 → domain.close()', async () => {
+  it('调度接线：重启恢复的过期 nextOccurrence 在启动后立即触发 → runner spawn（经注入的 subprocess）', async () => {
     const { ctx, calls } = makeCtx()
-    const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    // 预置「上次停机前留下的已过期计划」（契约 02：已有未来 nextOccurrence 保留该时刻；
+    // 过期时刻由启动后的调度器按错过合并立即补一次）
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('due-now', {
+      id: 'due-now',
+      title: '到点即触发',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [], fallback: [] },
+      actions: {},
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    expect(calls.spawns[0].spec.argv[0]).toBe('node')
+    // run 两写 + run-started 已发生（写 1 在 spawn 前）
+    expect(tables.runs.size).toBe(1)
+    expect(calls.emitted.some(([n]) => n === 'script-orchestrator/run-started')).toBe(true)
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await first.value()
+  })
+
+  it('卸载顺序：先停调度与工具/桥（停生产者）→ runner 停机（在途清进程）→ 排干队列 → domain.close()', async () => {
+    const { ctx, calls } = makeCtx()
+    const it = plugin(ctx, {})
     const first = await it.next()
     await first.value()
     expect(calls.closeOrder).toEqual([
@@ -169,7 +242,7 @@ describe('插件入口（lib/index.js）', () => {
     ctx.storageDomain.open = async () => {
       throw new Error('storage backend gone')
     }
-    const it = plugin(ctx, { maxRunsPerOrchestration: 100 })
+    const it = plugin(ctx, {})
     await expect(it.next()).rejects.toThrow('storage backend gone')
     expect(calls.provided).toEqual([])
     expect(calls.routes).toEqual([])

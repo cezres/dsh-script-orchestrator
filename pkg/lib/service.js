@@ -25,8 +25,10 @@ function slugifyTitle(title) {
  * @param {() => number} [deps.now] 时钟注入（默认 Date.now；测试定锚）
  * @param {(name: string, payload?: unknown) => void} [deps.emit] 事件发布（默认 no-op）
  * @param {object} [deps.logger] 内部日志（发布端兜底等）
+ * @param {object} [deps.runner] 执行引擎（liveView 合并活动 run 的内存态到 view）
+ * @param {() => void} [deps.onMutation] 编排集合持久变更后的回调（调度器重算 timer）
  */
-export function createManagementService({ storage, queue, config, now, emit, logger }) {
+export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation }) {
   void config
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
@@ -45,6 +47,7 @@ export function createManagementService({ storage, queue, config, now, emit, log
 
   // 注册动作表（票 31 才开放 registerAction；listActions 已按契约返回排序快照）
   const actionRegistry = new Map()
+  const notifyMutation = onMutation ?? (() => {})
 
   return {
     /** 新建编排：校验 → 生成 id → 落库 → 计算 nextOccurrence → 发 changed（全部在 FIFO 单槽内）。 */
@@ -92,8 +95,10 @@ export function createManagementService({ storage, queue, config, now, emit, log
           nextOccurrence: nextMs === null ? null : new Date(nextMs).toISOString(),
         }
         await orchestrations.put(id, record)
-        // 持久写入完成（内存视图已更新）后才发布（契约 06 回读一致性）
+        // 持久写入完成（内存视图已更新）后才发布（契约 06 回读一致性）；
+        // 编排集合变更 → 调度器重算单 timer
         safeEmit('script-orchestrator/changed')
+        notifyMutation()
         return record
       })
     },
@@ -131,6 +136,12 @@ export function createManagementService({ storage, queue, config, now, emit, log
       const runs = [...storage.table('runs').entries()]
         .map(([, run]) => run)
         .filter((run) => run.orchestrationId === id)
+        .map((run) => {
+          // 合并执行引擎的活动视图：running/judging/dispatching 等内存态实时可见
+          //（中途状态不落盘，契约 08「只写两次」；结算后 live 视图移除、回落持久记录）
+          const overlay = runner?.liveView?.(run.runId)
+          return overlay === undefined ? run : { ...run, ...overlay }
+        })
         .sort((a, b) => String(b.scheduledAt).localeCompare(String(a.scheduledAt)) || String(b.runId).localeCompare(String(a.runId)))
         .slice(0, options.runs ?? 5)
       return { ...record, runs, availableActions: this.listActions() }
