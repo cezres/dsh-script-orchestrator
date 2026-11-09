@@ -4,7 +4,7 @@
 
 **Blocked by:** 30 — 按判定结果发出 event 动作
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] `registerAction` 落实注册名格式、保留前缀和重名同步拒绝；`listActions()` 按名称排序返回 description，`script_view` 的 `availableActions` 与服务一致。
 - [ ] 创建/更新只校验注册动作名格式，不静态检查存在性；每次动作执行前实时查表，未注册或已摘除返回可见 `unknown_action`，不静默跳过。
