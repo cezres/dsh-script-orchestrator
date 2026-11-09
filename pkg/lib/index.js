@@ -45,6 +45,11 @@ export async function* apply(ctx, config) {
     logger,
     emit,
     now: () => Date.now(),
+    config,
+    fs: nodeFs, // 票 35：启动保留对账时被裁 run 的溢写文件 best-effort 清理
+    // I/O 结果未知恢复：域重开并重建内存视图后重算调度器单 timer（闭包在 scheduler
+    // 创建前为 no-op，恢复只可能发生在运行期→此时已指向真实 reschedule）
+    onRecovered: () => rescheduleAfterMutation(),
   })
   // 执行引擎（runner）拥有 run 生命周期；服务 run / script_run 只经其触发（spec §2）。
   // 结算推进 fixed-delay 计划后由 onOrchestrationMutated 通知调度器重算（scheduler 在

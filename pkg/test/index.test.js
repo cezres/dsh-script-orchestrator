@@ -702,4 +702,21 @@ describe('插件入口（lib/index.js）', () => {
     expect(calls.routes).toEqual([])
     expect(calls.tools).toEqual([])
   })
+
+  it('票 35 关闭顺序：先停生产者（桥 + 五工具注销）→ runner 停机 → 排干队列 → 最后关闭存储域', async () => {
+    const { ctx, calls } = makeCtx()
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    expect(first.done).toBe(false)
+    await first.value() // 执行 yield 的卸载器（宿主 Fiber 关闭时同路径）
+    // 存储域关闭是最后一步（排干队列与 runner 停机在它之前；域名 close 由 fake 记录）
+    expect(calls.closeOrder[calls.closeOrder.length - 1]).toBe('domain')
+    expect(calls.closeOrder.filter((entry) => entry === 'bridge')).toHaveLength(1)
+    expect(calls.closeOrder.filter((entry) => entry.startsWith('tool:'))).toHaveLength(5)
+    const domainIndex = calls.closeOrder.indexOf('domain')
+    expect(calls.closeOrder.indexOf('bridge')).toBeLessThan(domainIndex)
+    for (const entry of calls.closeOrder.filter((item) => item.startsWith('tool:'))) {
+      expect(calls.closeOrder.indexOf(entry)).toBeLessThan(domainIndex)
+    }
+  })
 })

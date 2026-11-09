@@ -9,6 +9,8 @@
 import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { ID_PATTERN } from './validation.js'
+import { OrchestratorError } from './errors.js'
+import { createRetentionPolicy } from './retention.js'
 
 // 全库 run 上限（契约 08「保留与裁剪」表：固定值，不是配置）
 export const MAX_TOTAL_RUNS = 1000
@@ -166,41 +168,192 @@ const KEY_FIELD = { orchestrations: 'id', runs: 'runId' }
  * 打开存储域：openDomain(domainSpec) → 逐表逐条校验表键 = 记录内 id/runId。
  * 键不一致的记录按坏记录处置（视为不存在）：经 domain 写链删除并记 error 日志。
  * （.bak 备份是宿主 domain 层 schema 校验的实现细节，插件层无 backupRecord 面，
- * 等价行为 = 持久移除；见票 24 Comments。）
+ * 等价行为 = 持久移除；见票 24 Comments。畸形 JSON / 不可读 / 版本不接受文档由宿主
+ * 语义静默缺席——它们不会出现在 entries() 中，插件打开照常进行。）
  *
- * 打开后执行启动维护（契约 03「重启与崩溃」+ 08「启动维护」①）：
- * 非终态 run 统一标 interrupted（维护写不计入「只写两次」）、各发一条
+ * 打开后执行启动维护（契约 08「启动维护」三步）：
+ * ① 非终态 run 统一标 interrupted（维护写不计入「只写两次」）、各发一条
  * run-settled(interrupted)、不自动重放；fixed-delay 编排的自动 run 以恢复结算时刻
- * 推进序列（不额外立即补跑，契约 02「重启与错过的触发」）。孤儿清理与保留对账属票 35。
+ * 推进序列（不额外立即补跑，契约 02「重启与错过的触发」）；
+ * ② 孤儿清理：删除 orchestrationId 无父记录的全部 run（级联删除的崩溃残留，幂等）；
+ * ③ 保留对账：按保留规则重算并补裁（票 34 的同一策略；未结算 run 不淘汰）。
+ *
+ * I/O 结果未知的恢复（契约 08「I/O 结果未知」）：写入 Promise 被拒**不证明磁盘未变**。
+ * 处置固定：映射 script_storage_unavailable → 关闭域 → 重新打开读实际状态 →
+ * 重建内存视图与调度器（onRecovered 回调触发重算）→ 继续服务；不做盲目重试。
+ * 恢复期间到达的管理操作以 script_storage_unavailable 失败。
  *
  * @param {object} deps
  * @param {(spec: object) => Promise<object>} deps.openDomain ctx.storageDomain.open
  * @param {object} [deps.logger]
  * @param {(name: string, payload?: unknown) => void} [deps.emit] 事件发布（run-settled/changed）
  * @param {() => number} [deps.now] 时钟注入（interrupted 的 settledAt 用恢复时刻）
+ * @param {object} [deps.config] 已验证配置（启动保留对账用 maxRunsPerOrchestration）
+ * @param {object} [deps.fs] { unlink }（保留对账时被裁 run 的溢写文件 best-effort 清理）
+ * @param {() => void} [deps.onRecovered] 域重开并重建后回调（调度器重算 timer）
  */
-export async function openStorage({ openDomain, logger, emit, now }) {
-  const domain = await openDomain(domainSpec)
+export async function openStorage({ openDomain, logger, emit, now, config, fs, onRecovered }) {
   const publish = emit ?? (() => {})
   const currentTime = now ?? (() => Date.now())
-  for (const [tableName, keyField] of Object.entries(KEY_FIELD)) {
-    const table = domain.table(tableName)
-    for (const [key, record] of table.entries()) {
-      if (record?.[keyField] !== key) {
+  let domain = await openDomain(domainSpec)
+  let recovering = false
+  let broken = false
+
+  /** 启动维护三步（首次打开与 I/O 恢复重开共用；幂等）。 */
+  async function runStartupMaintenance(target) {
+    for (const [tableName, keyField] of Object.entries(KEY_FIELD)) {
+      const table = target.table(tableName)
+      for (const [key, record] of table.entries()) {
+        if (record?.[keyField] !== key) {
+          logger?.error?.(
+            `script-orchestrator: 表 ${tableName} 记录键 '${key}' 与其 ${keyField} '${String(
+              record?.[keyField],
+            )}' 不一致，按坏记录处置（移除）`,
+          )
+          await table.delete(key)
+        }
+      }
+    }
+    await reconcileStartupRuns({ domain: target, logger, emit: publish, now: currentTime })
+    await cleanupOrphanRuns({ domain: target, logger })
+    await reconcileRetention({ domain: target, config, fs, logger })
+  }
+
+  /** 恢复期/坏域：读写一律以 script_storage_unavailable 明确失败（不静默返回空视图）。 */
+  function ensureAvailable() {
+    if (recovering || broken) {
+      throw new OrchestratorError(
+        'script_storage_unavailable',
+        recovering ? '存储域正在恢复（关闭-重开-对账），请稍后重试' : '存储域不可用（重开失败），请检查宿主存储',
+        { cause: recovering ? 'recovering' : 'unavailable' },
+      )
+    }
+  }
+
+  function storageUnavailable(error) {
+    const cause = error?.code !== undefined ? String(error.code) : error instanceof Error ? error.message : String(error)
+    return new OrchestratorError('script_storage_unavailable', `存储写入被拒（${cause}）`, { cause })
+  }
+
+  /** 写失败 → 关闭-重开-对账（不盲目重试当前写；当前调用以 script_storage_unavailable 失败）。 */
+  function handleWriteFailure(error) {
+    logger?.error?.(
+      `script-orchestrator: 存储写入被拒（${
+        error instanceof Error ? error.message : String(error)
+      }），执行关闭-重开-对账恢复（当前写不重试）`,
+    )
+    if (recovering || broken) return
+    recovering = true
+    void recover()
+  }
+
+  async function recover() {
+    try {
+      try {
+        await domain.close()
+      } catch (closeError) {
         logger?.error?.(
-          `script-orchestrator: 表 ${tableName} 记录键 '${key}' 与其 ${keyField} '${String(
-            record?.[keyField],
-          )}' 不一致，按坏记录处置（移除）`,
+          `script-orchestrator: 恢复期间关闭存储域失败（继续重开）: ${
+            closeError instanceof Error ? closeError.message : String(closeError)
+          }`,
         )
-        await table.delete(key)
+      }
+      domain = await openDomain(domainSpec)
+      await runStartupMaintenance(domain)
+      recovering = false
+      logger?.warn?.('script-orchestrator: 存储域已重新打开并完成启动对账，继续服务')
+      try {
+        onRecovered?.()
+      } catch (callbackError) {
+        logger?.error?.(
+          `script-orchestrator: 恢复后回调失败: ${callbackError instanceof Error ? callbackError.message : String(callbackError)}`,
+        )
+      }
+    } catch (reopenError) {
+      broken = true
+      recovering = false
+      logger?.error?.(
+        `script-orchestrator: 存储域重开失败，保持不可用（管理操作将以 script_storage_unavailable 失败）: ${
+          reopenError instanceof Error ? reopenError.message : String(reopenError)
+        }`,
+      )
+    }
+  }
+
+  function wrapWrite(operation) {
+    return async (...args) => {
+      ensureAvailable()
+      try {
+        return await operation(...args)
+      } catch (error) {
+        handleWriteFailure(error)
+        throw storageUnavailable(error)
       }
     }
   }
-  await reconcileStartupRuns({ domain, logger, emit: publish, now: currentTime })
+
+  /** 表门面：读写都作用于「当前 domain」（恢复重开后自动指向新域）。 */
+  function table(name) {
+    const facade = {
+      entries: () => {
+        ensureAvailable()
+        return domain.table(name).entries()
+      },
+      get: (key) => {
+        ensureAvailable()
+        return domain.table(name).get(key)
+      },
+      put: (key, value) => wrapWrite(() => domain.table(name).put(key, value))(key, value),
+      delete: (key) => wrapWrite(() => domain.table(name).delete(key))(key),
+    }
+    // deleteMany 可选面：域表有则透传，无则逐键删除
+    facade.deleteMany = (ids) =>
+      wrapWrite(async () => {
+        const target = domain.table(name)
+        if (typeof target.deleteMany === 'function') return target.deleteMany(ids)
+        for (const id of ids) await target.delete(id)
+      })()
+    return facade
+  }
+
+  await runStartupMaintenance(domain)
+
   return {
     domain,
-    table: (name) => domain.table(name),
+    table,
+    /** 恢复状态（诊断/测试）：recovering（重开中）或 broken（重开失败）。 */
+    isRecovering: () => recovering || broken,
+    /** 显式触发恢复（仅供测试；生产路径由写失败自动触发）。 */
+    recover,
     close: () => domain.close(),
+  }
+}
+
+/** 启动维护②：孤儿清理——删除 orchestrationId 无父记录的全部 run（幂等）。 */
+async function cleanupOrphanRuns({ domain, logger }) {
+  const orchestrations = domain.table('orchestrations')
+  const runs = domain.table('runs')
+  const parentIds = new Set([...orchestrations.entries()].map(([id]) => id))
+  for (const [runId, run] of [...runs.entries()]) {
+    if (parentIds.has(run?.orchestrationId)) continue
+    logger?.warn?.(
+      `script-orchestrator: 启动维护孤儿清理：删除无父 run '${runId}'（orchestrationId '${String(run?.orchestrationId)}'）`,
+    )
+    await runs.delete(runId)
+  }
+}
+
+/** 启动维护③：保留对账——按票 34 策略重算并补裁（未结算 run 不淘汰）。 */
+async function reconcileRetention({ domain, config, fs, logger }) {
+  const policy = createRetentionPolicy({
+    storage: { table: (name) => domain.table(name) },
+    config,
+    fs,
+    logger,
+  })
+  const result = await policy.enforce()
+  if (result.removed.length > 0) {
+    logger?.warn?.(`script-orchestrator: 启动保留对账补裁 ${result.removed.length} 条 run`)
   }
 }
 

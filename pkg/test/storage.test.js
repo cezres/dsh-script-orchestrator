@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { domainSpec, openStorage } from '../lib/storage.js'
 import { createManagementService } from '../lib/service.js'
 import { ServiceQueue } from '../lib/fifo.js'
@@ -401,5 +401,307 @@ describe('启动维护（契约 03「重启与崩溃」+ 08「启动维护」①
     expect(runs['run-dddddddd']).toMatchObject({ status: 'interrupted' })
     expect(runs['run-eeeeeeee']).toMatchObject({ status: 'interrupted' })
     expect(runs['run-ffffffff']).toMatchObject({ status: 'succeeded', settledAt: iso(NOW - 1000) }) // 终态原样
+  })
+})
+
+// ---------------- 票 35：启动维护②③、坏记录、I/O 结果未知的恢复 ----------------
+
+const NOW35 = 1_790_000_000_000
+const iso35 = (ms = NOW35) => new Date(ms).toISOString()
+
+function makeOrchestration35(id) {
+  return {
+    id,
+    title: id,
+    enabled: true,
+    overlap: 'skip',
+    trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-rate' },
+    script: { command: 'pwsh', args: [], env: {} },
+    judge: { rules: [], fallback: [] },
+    actions: {},
+    createdAt: iso35(),
+    updatedAt: iso35(),
+    status: 'active',
+    nextOccurrence: null,
+  }
+}
+
+function makeSettledRun35(runId, orchestrationId, settledMs, extra = {}) {
+  return {
+    runId,
+    orchestrationId,
+    trigger: 'every',
+    scheduledAt: iso35(settledMs - 1000),
+    startedAt: iso35(settledMs - 1000),
+    settledAt: iso35(settledMs),
+    status: 'succeeded',
+    skipReason: null,
+    script: {
+      command: 'pwsh',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      durationMs: 1000,
+      stdoutTail: '',
+      stderrTail: '',
+      truncated: false,
+    },
+    matchedRule: null,
+    usedFallback: false,
+    actions: [],
+    ...extra,
+  }
+}
+
+function makeRecoverableDomain({ orchestrations = [], runs = [], rejectRunsPut = 0 } = {}) {
+  const tables = { orchestrations: new Map(orchestrations), runs: new Map(runs) }
+  const log = { closed: 0, puts: 0, deletes: [] }
+  let remainingFailures = rejectRunsPut
+  const domain = {
+    name: 'script_orchestrator',
+    table: (name) => ({
+      entries: () => tables[name].entries(),
+      get: (key) => tables[name].get(key),
+      put: (key, value) => {
+        log.puts += 1
+        if (name === 'runs' && remainingFailures > 0) {
+          remainingFailures -= 1
+          return Promise.reject(new Error('EACCES: write rejected'))
+        }
+        tables[name].set(key, value)
+        return Promise.resolve()
+      },
+      delete: (key) => {
+        log.deletes.push([name, key])
+        tables[name].delete(key)
+        return Promise.resolve()
+      },
+    }),
+    close: () => {
+      log.closed += 1
+      return Promise.resolve()
+    },
+    snapshot: () => ({ orchestrations: Object.fromEntries(tables.orchestrations), runs: Object.fromEntries(tables.runs) }),
+    log,
+  }
+  return { domain, log, setRunsPutFailures: (count) => { remainingFailures = count } }
+}
+
+describe('启动维护②孤儿清理与③保留对账（票 35；契约 08「启动维护」）', () => {
+  it('孤儿清理：删除 orchestrationId 无父记录的全部 run（含未结算）；有父保留；重开幂等', async () => {
+    const parent = makeOrchestration35('o1')
+    const runWithParent = makeSettledRun35('run-aaaaaaaa', 'o1', NOW35)
+    const orphanSettled = makeSettledRun35('run-bbbbbbbb', 'ghost', NOW35)
+    const orphanUnsettled = {
+      ...makeSettledRun35('run-cccccccc', 'ghost', NOW35),
+      status: 'running',
+      settledAt: null,
+      startedAt: iso35(),
+    }
+    const repo = makeRecoverableDomain({
+      orchestrations: [['o1', parent]],
+      runs: [
+        ['run-aaaaaaaa', runWithParent],
+        ['run-bbbbbbbb', orphanSettled],
+        ['run-cccccccc', orphanUnsettled],
+      ],
+    })
+    const logs = []
+    const opened = []
+    const storage = await openStorage({
+      openDomain: async () => {
+        opened.push(1)
+        return repo.domain
+      },
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+    })
+    const snapshot = repo.domain.snapshot()
+    expect(Object.keys(snapshot.runs)).toEqual(['run-aaaaaaaa']) // 两个孤儿被清理
+    expect(snapshot.orchestrations.o1).toBeTruthy()
+    expect(logs.some((m) => m.includes('孤儿清理') && m.includes('run-bbbbbbbb'))).toBe(true)
+    expect(logs.some((m) => m.includes('孤儿清理') && m.includes('run-cccccccc'))).toBe(true)
+
+    // 重开（同一域数据）→ 幂等：无孤儿可删、有父记录不受影响
+    await storage.close()
+    const again = await openStorage({
+      openDomain: async () => repo.domain,
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+    })
+    expect(Object.keys(repo.domain.snapshot().runs)).toEqual(['run-aaaaaaaa'])
+    await again.close()
+  })
+
+  it('保留对账：超每编排上限补裁（settledAt 定序），未结算 run 保护；启动后即收敛', async () => {
+    const parent = makeOrchestration35('o1')
+    const runs = [
+      ['run-11111111', makeSettledRun35('run-11111111', 'o1', NOW35 - 4000)],
+      ['run-22222222', makeSettledRun35('run-22222222', 'o1', NOW35 - 3000)],
+      ['run-33333333', makeSettledRun35('run-33333333', 'o1', NOW35 - 2000)],
+      ['run-44444444', makeSettledRun35('run-44444444', 'o1', NOW35 - 1000)],
+      [
+        'run-55555555',
+        {
+          ...makeSettledRun35('run-55555555', 'o1', NOW35),
+          status: 'running',
+          settledAt: null,
+          startedAt: iso35(),
+        },
+      ],
+    ]
+    const repo = makeRecoverableDomain({ orchestrations: [['o1', parent]], runs })
+    const logs = []
+    const storage = await openStorage({
+      openDomain: async () => repo.domain,
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 2 },
+    })
+    const remaining = Object.keys(repo.domain.snapshot().runs).sort()
+    // 启动维护①：原 running run-55555555 先被标 interrupted（settledAt=恢复时刻），
+    // 随后②保留对账按 settledAt 定序补裁到每编排 2 条 → 保留最新的
+    // run-44444444 与 run-55555555（interrupted）；更早的三条被裁。
+    //（「未结算 run 不淘汰」的纯规则由 retention.test 覆盖——启动维护会把非终态先收敛）
+    expect(remaining).toEqual(['run-44444444', 'run-55555555'])
+    expect(logs.some((m) => m.includes('保留对账补裁'))).toBe(true)
+    await storage.close()
+  })
+
+  it('坏记录（两类）：键≠id 由插件写链移除并记日志；宿主 schema 坏记录（畸形 JSON/不可读/版本不接受）在 entries 缺席即视为不存在——打开不崩、只服务有效记录', async () => {
+    const good = makeOrchestration35('good-orch')
+    const keyMismatch = makeOrchestration35('real-id')
+    // 宿主语义：schema 坏记录由 domain 层 backup-and-skip，entries 中不出现（fake 只给有效记录）
+    const repo = makeRecoverableDomain({ orchestrations: [['good-orch', good], ['wrong-key', keyMismatch]], runs: [] })
+    const logs = []
+    const storage = await openStorage({
+      openDomain: async () => repo.domain,
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+    })
+    // 键≠id：坏记录移除 + 日志
+    expect(repo.domain.snapshot().orchestrations['wrong-key']).toBeUndefined()
+    expect(logs.some((m) => m.includes("记录键 'wrong-key'"))).toBe(true)
+    // 服务只看到有效记录（坏记录缺席）
+    const service = createManagementService({
+      storage,
+      queue: new ServiceQueue(),
+      config: { maxRunsPerOrchestration: 100 },
+      NOW35: () => NOW35,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const listed = await service.list({})
+    expect(listed.items.map((o) => o.id)).toEqual(['good-orch'])
+    // 未知（缺席）记录：view 明确 script_unknown，而不是崩溃
+    await expect(service.view('bad-json-record')).rejects.toMatchObject({ code: 'script_unknown' })
+    await storage.close()
+  })
+})
+
+describe('I/O 结果未知的恢复（票 35；契约 08「I/O 结果未知的恢复」）', () => {
+  it('写入被拒 → script_storage_unavailable（当前写不重试）→ 关闭旧域 → 重开 → 启动对账重跑 → onRecovered → 继续服务', async () => {
+    const first = makeRecoverableDomain({
+      orchestrations: [['o1', makeOrchestration35('o1')]],
+      rejectRunsPut: 1,
+    })
+    const second = makeRecoverableDomain({ orchestrations: [['o1', makeOrchestration35('o1')]] })
+    const opened = []
+    const recovered = []
+    const logs = []
+    const storage = await openStorage({
+      openDomain: async () => {
+        opened.push(1)
+        return opened.length === 1 ? first.domain : second.domain
+      },
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+      onRecovered: () => recovered.push('onRecovered'),
+    })
+
+    const failedWrite = storage.table('runs').put('run-aaaaaaaa', makeSettledRun35('run-aaaaaaaa', 'o1', NOW35))
+    await expect(failedWrite).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+      details: { cause: 'EACCES: write rejected' },
+    })
+    // 恢复流程：关闭旧域 → 重开 → 启动对账 → onRecovered（不盲目重试当前写）
+    await vi.waitFor(() => {
+      expect(storage.isRecovering()).toBe(false)
+      expect(recovered).toHaveLength(1)
+    })
+    expect(first.log.closed).toBe(1)
+    expect(first.log.puts).toBe(1) // 被拒的写只发生一次（不重试）
+    expect(opened).toHaveLength(2) // 第二次 open = 重开
+    // 恢复后服务照常（新域写入与读取）
+    await storage.table('orchestrations').put('o2', makeOrchestration35('o2'))
+    expect(storage.table('orchestrations').get('o2')).toBeTruthy()
+    await storage.close()
+  })
+
+  it('恢复期间到达的管理操作以 script_storage_unavailable 失败；恢复完成后恢复', async () => {
+    const first = makeRecoverableDomain({ rejectRunsPut: 1 })
+    const second = makeRecoverableDomain()
+    const gate = Promise.withResolvers()
+    const logs = []
+    let openCount = 0
+    const storage = await openStorage({
+      openDomain: async () => {
+        openCount += 1
+        if (openCount === 1) return first.domain
+        await gate.promise // 恢复中：重开挂起，暴露 recovering 窗口
+        return second.domain
+      },
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+    })
+    await expect(storage.table('runs').put('run-aaaaaaaa', makeSettledRun35('run-aaaaaaaa', 'o1', NOW35))).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+    })
+    await vi.waitFor(() => expect(storage.isRecovering()).toBe(true))
+    // 恢复期间：读与写都明确失败（不静默返回空视图）
+    expect(() => storage.table('orchestrations').entries()).toThrow(
+      expect.objectContaining({ code: 'script_storage_unavailable', details: { cause: 'recovering' } }),
+    )
+    await expect(storage.table('runs').put('run-bbbbbbbb', makeSettledRun35('run-bbbbbbbb', 'o1', NOW35))).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+      details: { cause: 'recovering' },
+    })
+    gate.resolve()
+    await vi.waitFor(() => expect(storage.isRecovering()).toBe(false))
+    // 恢复完成：读写恢复（新域为空，恢复后写入可见）
+    await storage.table('runs').put('run-cccccccc', makeSettledRun35('run-cccccccc', 'o1', NOW35))
+    expect(storage.table('runs').get('run-cccccccc')).toBeTruthy()
+    await storage.close()
+  })
+
+  it('重开失败 → 保持不可用（broken）：后续操作持续以 script_storage_unavailable 失败并记日志', async () => {
+    const first = makeRecoverableDomain({ rejectRunsPut: 1 })
+    const logs = []
+    let openCount = 0
+    const storage = await openStorage({
+      openDomain: async () => {
+        openCount += 1
+        if (openCount === 1) return first.domain
+        throw new Error('EIO: reopen failed')
+      },
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      NOW35: () => NOW35,
+      config: { maxRunsPerOrchestration: 100 },
+    })
+    await expect(storage.table('runs').put('run-aaaaaaaa', makeSettledRun35('run-aaaaaaaa', 'o1', NOW35))).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+    })
+    await vi.waitFor(() => {
+      expect(logs.some((m) => m.includes('重开失败'))).toBe(true)
+      expect(storage.isRecovering()).toBe(true) // broken 态保持不可用
+    })
+    await expect(storage.table('runs').put('run-bbbbbbbb', makeSettledRun35('run-bbbbbbbb', 'o1', NOW35))).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+      details: { cause: 'unavailable' },
+    })
   })
 })
