@@ -30,6 +30,8 @@ function fakeService(over = {}) {
     list: over.list ?? (async () => ({ items: [], total: 0, nextOffset: null })),
     create: over.create ?? (async () => ({ ...SAMPLE_VIEW })),
     view: over.view ?? (async () => ({ ...SAMPLE_VIEW, runs: [], availableActions: [] })),
+    edit: over.edit ?? (async () => ({ ...SAMPLE_VIEW })),
+    run: over.run ?? (async () => ({ runId: 'run-7f3c1a9e', orchestrationId: 'log-rotate', trigger: 'manual', scheduledAt: '2026-11-09T00:00:00.000Z', startedAt: null, settledAt: null, status: 'queued', skipReason: null, script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false }, matchedRule: null, usedFallback: false, actions: [] })),
     ...over,
   }
 }
@@ -77,9 +79,9 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
     expect(result.error.details).toMatchObject({ field, reason })
   })
 
-  it('未实现/未知 endpoint 返回 internal_error envelope（不抛给传输层）', async () => {
+  it('未知 endpoint 返回 internal_error envelope（不抛给传输层）；edit/run/listActions 均已实现（票 28/31）', async () => {
     const handler = createBridgeHandler({ service: fakeService() })
-    for (const endpoint of ['edit', 'run', 'bogus']) {
+    for (const endpoint of ['bogus']) {
       const result = await handler(endpoint, {}, undefined, {})
       expect(result.ok).toBe(false)
       expect(result.error.code).toBe('internal_error')
@@ -243,6 +245,108 @@ describe('view 端点（契约 11 端点表：与服务同形）', () => {
       }),
     })
     const result = await handler('view', { id: 'x' }, undefined, {})
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'script_unknown', message: "编排 'x' 不存在", details: { id: 'x' } },
+    })
+  })
+})
+
+describe('edit 端点（契约 11 端点表 + 06 EditInput；票 28）', () => {
+  it('合法 update/pause/resume 原样透传 service.edit，返回 { ok: true, value: OrchestrationView }', async () => {
+    const seen = []
+    const handler = createBridgeHandler({
+      service: fakeService({ edit: async (input) => { seen.push(input); return { ...SAMPLE_VIEW, status: 'paused', nextOccurrence: null } } }),
+    })
+    const payload = { id: 'log-rotate', action: 'update', patch: { title: 'new' }, expectedUpdatedAt: SAMPLE_VIEW.updatedAt }
+    const result = await handler('edit', payload, undefined, {})
+    expect(seen).toEqual([payload])
+    expect(result).toEqual({ ok: true, value: { ...SAMPLE_VIEW, status: 'paused', nextOccurrence: null } })
+    await handler('edit', { id: 'log-rotate', action: 'resume' }, undefined, {})
+    expect(seen[1]).toEqual({ id: 'log-rotate', action: 'resume' })
+  })
+
+  it.each([
+    ['缺 id', { action: 'pause' }, 'id', 'missing'],
+    ['缺 action', { id: 'x' }, 'action', 'missing'],
+    ['action 非法', { id: 'x', action: 'bogus' }, 'action', 'format'],
+    ['多余字段', { id: 'x', action: 'pause', deep: 1 }, 'deep', 'unexpected'],
+    ['patch 非 update', { id: 'x', action: 'pause', patch: {} }, 'patch', 'unexpected'],
+    ['patch 非对象', { id: 'x', action: 'update', patch: 5 }, 'patch', 'format'],
+    ['expectedUpdatedAt 非字符串', { id: 'x', action: 'pause', expectedUpdatedAt: 42 }, 'expectedUpdatedAt', 'format'],
+    ['payload 非对象', 'nope', 'payload', 'format'],
+  ])('形状校验：%s → script_input_invalid（%s/%s）', async (_label, payload, field, reason) => {
+    const handler = createBridgeHandler({ service: fakeService() })
+    const result = await handler('edit', payload, undefined, {})
+    expect(result.ok).toBe(false)
+    expect(result.error.code).toBe('script_input_invalid')
+    expect(result.error.details).toMatchObject({ field, reason })
+  })
+
+  it('契约错误原样透传：script_conflict / script_unknown；delete 的暂不支持同样透传', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({
+        edit: async (input) => {
+          if (input.action === 'delete') {
+            throw new OrchestratorError('script_input_invalid', 'delete 动作尚未实现（票 29 交付）', { field: 'action', reason: 'unsupported-part' })
+          }
+          if (input.id === 'gone') throw new OrchestratorError('script_unknown', "编排 'gone' 不存在", { id: 'gone' })
+          throw new OrchestratorError('script_conflict', '已被其他修改', { expected: 'a', actual: 'b' })
+        },
+      }),
+    })
+    const conflict = await handler('edit', { id: 'x', action: 'pause' }, undefined, {})
+    expect(conflict).toEqual({ ok: false, error: { code: 'script_conflict', message: '已被其他修改', details: { expected: 'a', actual: 'b' } } })
+    const unknown = await handler('edit', { id: 'gone', action: 'resume' }, undefined, {})
+    expect(unknown.error.code).toBe('script_unknown')
+    const del = await handler('edit', { id: 'x', action: 'delete' }, undefined, {})
+    expect(del.error.code).toBe('script_input_invalid')
+    expect(del.error.details).toMatchObject({ field: 'action', reason: 'unsupported-part' })
+  })
+})
+
+describe('run 端点（契约 11：受理即返回；abort 只终止等待不取消 run）', () => {
+  it('合法 { id } 透传 service.run，返回简形 { runId, status }（status 可为非终态）', async () => {
+    const seen = []
+    const handler = createBridgeHandler({
+      service: fakeService({ run: async (id, signal) => { seen.push([id, signal]); return { runId: 'run-7f3c1a9e', status: 'queued' } } }),
+    })
+    const result = await handler('run', { id: 'log-rotate' }, undefined, {})
+    expect(result).toEqual({ ok: true, value: { runId: 'run-7f3c1a9e', status: 'queued' } })
+    expect(seen).toEqual([['log-rotate', undefined]])
+  })
+
+  it.each([
+    ['缺 id', {}, 'id', 'missing'],
+    ['id 非字符串', { id: 42 }, 'id', 'format'],
+    ['多余字段', { id: 'x', wait: true }, 'wait', 'unexpected'],
+    ['payload 非对象', null, 'payload', 'format'],
+  ])('形状校验：%s → script_input_invalid（%s/%s）；run 不接受 wait（等待由面板回读承担）', async (_label, payload, field, reason) => {
+    const handler = createBridgeHandler({ service: fakeService() })
+    const result = await handler('run', payload, undefined, {})
+    expect(result.ok).toBe(false)
+    expect(result.error.code).toBe('script_input_invalid')
+    expect(result.error.details).toMatchObject({ field, reason })
+  })
+
+  it('UI abort 只终止等待：signal 不透传给服务（受理照常完成）', async () => {
+    const seen = []
+    const controller = new AbortController()
+    controller.abort()
+    const handler = createBridgeHandler({
+      service: fakeService({ run: async (id, signal) => { seen.push([id, signal]); return { runId: 'run-1', status: 'running' } } }),
+    })
+    // 传输层 abort 表现为 handler 调用被丢弃/连接断开——此处锚定：桥从不把 signal 传给服务
+    const result = await handler('run', { id: 'x' }, controller.signal, {})
+    expect(result.ok).toBe(true)
+    expect(seen[0][1]).toBeUndefined()
+  })
+
+  it('script_unknown 原样透传', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({ run: async () => { throw new OrchestratorError('script_unknown', "编排 'x' 不存在", { id: 'x' }) } }),
+    })
+    const result = await handler('run', { id: 'x' }, undefined, {})
     expect(result).toEqual({
       ok: false,
       error: { code: 'script_unknown', message: "编排 'x' 不存在", details: { id: 'x' } },

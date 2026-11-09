@@ -84,6 +84,15 @@ async function renderPanel(props) {
         row.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
       })
     },
+    clickInRow: async (needle, label) => {
+      const row = [...container.querySelectorAll('tr')].find((tr) => tr.textContent.includes(needle))
+      expect(row, `row containing '${needle}'`).toBeTruthy()
+      const button = [...row.querySelectorAll('button')].find((b) => b.textContent === label)
+      expect(button, `button '${label}' in row '${needle}'`).toBeTruthy()
+      await act(async () => {
+        button.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+      })
+    },
     modal: () => container.querySelector('div[style*="position: fixed"]'),
     unmount: () => {
       act(() => root.unmount())
@@ -716,5 +725,87 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
       Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
       vi.useRealTimers()
     }
+  })
+})
+
+describe('行内管理操作（契约 11「面板自身承载管理与排障：行内操作」；票 28）', () => {
+  const pausedOrch = { ...ORCH, id: 'paused-o', title: 'paused orchestration', status: 'paused', nextOccurrence: null }
+  const endedOrch = { ...ORCH, id: 'ended-o', title: 'ended orchestration', status: 'ended', nextOccurrence: null }
+
+  function actionsCall(calls, listItems = [ORCH]) {
+    return async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') {
+        return { ok: true, value: { items: listItems, total: listItems.length, nextOffset: null } }
+      }
+      if (endpoint === 'edit') return { ok: true, value: { ...ORCH } }
+      if (endpoint === 'run') return { ok: true, value: { runId: 'run-abcd1234', status: 'queued' } }
+      throw new Error(`unexpected endpoint ${endpoint}`)
+    }
+  }
+
+  it('按状态渲染行内操作：active → 暂停+执行；paused → 恢复+执行；ended → 执行', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const items = [ORCH, pausedOrch, endedOrch]
+    const view = await renderPanel({ call: actionsCall([], items), subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '暂停')
+    const activeRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('log rotate'))
+    expect([...activeRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['暂停', '执行'])
+    const pausedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('paused orchestration'))
+    expect([...pausedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['恢复', '执行'])
+    const endedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('ended orchestration'))
+    expect([...endedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['执行'])
+    view.unmount()
+  })
+
+  it('点击暂停 → call edit {id, action} → 立即回读 list（写后权威回读）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const view = await renderPanel({ call: actionsCall(calls), subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '暂停')
+    expect(calls).toEqual([
+      ['list', {}],
+      ['edit', { id: 'log-rotate', action: 'pause' }],
+      ['list', {}],
+    ])
+    expect(view.modal()).toBeFalsy() // 行内操作不打开模态
+    view.unmount()
+  })
+
+  it('点击恢复 → edit resume；点击执行 → run {id}（受理即返回）→ 回读', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const view = await renderPanel({ call: actionsCall(calls, [pausedOrch]), subscribeReset: () => () => {} })
+    await view.clickInRow('paused orchestration', '恢复')
+    expect(calls[1]).toEqual(['edit', { id: 'paused-o', action: 'resume' }])
+    await view.clickInRow('paused orchestration', '执行')
+    expect(calls[3]).toEqual(['run', { id: 'paused-o' }])
+    expect(calls[4]).toEqual(['list', {}])
+    view.unmount()
+  })
+
+  it('操作失败显示契约错误（如 script_conflict），可继续重试其他操作', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const call = async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'edit') {
+        return { ok: false, error: { code: 'script_conflict', message: '已被其他修改', details: { expected: 'a', actual: 'b' } } }
+      }
+      return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '暂停')
+    expect(view.text()).toContain('script_conflict')
+    expect(view.text()).toContain('已被其他修改')
+    view.unmount()
   })
 })

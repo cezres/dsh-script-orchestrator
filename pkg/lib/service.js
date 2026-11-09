@@ -1,13 +1,26 @@
 // 管理服务（ctx.scriptOrchestrator 的实现面，契约 docs/temp/06-events-service.md）。
 // 语义唯一权威：校验规则、错误码、分页过滤都在此定义一次；工具（07）与桥（11）是薄适配层。
-// 票 25 范围：create（every）/list/view/listActions；edit/run 属票 28/26。
+// 票 25：create/list/view/listActions；票 28：edit（update/pause/resume）与 run/waitRun。
 // 一切持久写入经服务层 FIFO 整槽（契约 08「写入」）；changed 在持久写入完成后发布（契约 06）。
-// 票 31：registerAction 开放注册面（registry.register，同步校验 + disposer 四不变量）；
-// 与 runner 共享同一注册表实例（index.js 装配）——listActions 快照与执行期查表同源。
-import { OrchestratorError, inputInvalid } from './errors.js'
+// 票 30：动作注册表可与 runner 共享同一实例（index.js 装配）；票 31：registerAction 开放
+// 注册面（registry.register，同步校验 + disposer 四不变量）——listActions 取快照、
+// runner 逐动作实时查表用同一张表。
+import { OrchestratorError, inputInvalid, isPlainObject } from './errors.js'
 import { validateOrchestrationInput } from './validation.js'
 import { nextOccurrence } from './triggers.js'
 import { createActionRegistry } from './actions.js'
+
+/** 键排序的稳定 JSON（调度字段变化的深比较；配置对象均为可序列化 JSON 值）。 */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+const iso = (ms) => new Date(ms).toISOString()
 
 /** 由标题生成 id 基名（01：创建时可省略 id，由标题生成并保证唯一）。 */
 function slugifyTitle(title) {
@@ -34,11 +47,12 @@ function slugifyTitle(title) {
  *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction）
  */
 export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry }) {
-  void config
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
   const registry = actionRegistry ?? createActionRegistry()
+  const defaultTimeoutSeconds = config?.defaultTimeoutSeconds ?? 300
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
   // 发布端兜底（契约 06：listener 同步抛错只记内部日志，绝不影响主流程）
   function safeEmit(name, payload) {
@@ -167,6 +181,122 @@ export function createManagementService({ storage, queue, config, now, emit, log
     },
 
     /**
+     * 管理动作（契约 06/07 EditInput）：update / pause / resume（delete 属票 29）。
+     * 一切在 FIFO 单槽内：CAS → 动作分派 → 持久写入 → changed（持久写入完成后）。
+     */
+    async edit(input, _actorSessionId, signal) {
+      return queue.enqueue(async () => {
+        signal?.throwIfAborted()
+        const { id, action, patch } = validateEditInput(input)
+        const orchestrations = storage.table('orchestrations')
+        const current = orchestrations.get(id)
+        if (current === undefined) {
+          throw new OrchestratorError('script_unknown', `编排 '${id}' 不存在`, { id })
+        }
+        // 乐观并发（契约 06/09）：expectedUpdatedAt 对各 action 均可选；null = 此前没有
+        // 更新时间（本域记录恒有 updatedAt，故 null 恒冲突——防御面等价）；不匹配 → script_conflict
+        if ('expectedUpdatedAt' in input && input.expectedUpdatedAt !== undefined) {
+          const expected = input.expectedUpdatedAt
+          if (expected !== current.updatedAt) {
+            throw new OrchestratorError('script_conflict', `编排 '${id}' 已被其他修改（乐观并发冲突）`, {
+              expected: expected ?? null,
+              actual: current.updatedAt ?? null,
+            })
+          }
+        }
+        if (action === 'delete') {
+          // 契约定义了 delete（取消级联删除），实现按票序属票 29：给出准确的暂不支持错误
+          throw inputInvalid('action', 'unsupported-part', 'delete 动作尚未实现（票 29 交付）')
+        }
+        if (action === 'pause') {
+          // 状态设置语义（契约 09）：仅从 active 生效；其余状态幂等 no-op（不改任何计时、不写库）
+          if (current.status !== 'active') return current
+          const updated = {
+            ...current,
+            status: 'paused',
+            nextOccurrence: null,
+            updatedAt: iso(currentTime()),
+          }
+          await orchestrations.put(id, updated)
+          safeEmit('script-orchestrator/changed')
+          notifyMutation()
+          return updated
+        }
+        if (action === 'resume') {
+          // 状态设置语义（契约 09）：仅从 paused 生效；active/ended 幂等 no-op（不重锚、不写库）
+          if (current.status !== 'paused') return current
+          // 契约 02「恢复」表：不补暂停期——cron 取严格晚于 resumedAt 的下一匹配，
+          // fixed-rate 从 resumedAt 加间隔，fixed-delay 视未结算旧自动 run 决定锚定或等待。
+          // 运行期意外无解（含 5 年窗口外）→ ended 防御终态。
+          const resumedMs = currentTime()
+          const hasUnsettledAutoRun = hasUnsettledAutomaticRun(storage.table('runs'), id)
+          const waitingForOldRun =
+            hasUnsettledAutoRun && current.trigger.kind === 'every' && current.trigger.mode === 'fixed-delay'
+          const nextMs = waitingForOldRun ? null : nextOccurrence(current.trigger, resumedMs)
+          const updated = {
+            ...current,
+            status: nextMs === null && !waitingForOldRun ? 'ended' : 'active',
+            nextOccurrence: nextMs === null ? null : iso(nextMs),
+            updatedAt: iso(resumedMs),
+          }
+          await orchestrations.put(id, updated)
+          safeEmit('script-orchestrator/changed')
+          notifyMutation()
+          return updated
+        }
+        // action === 'update'
+        return applyUpdate({
+          storage,
+          current,
+          patch,
+          nowMs: currentTime(),
+          safeEmit,
+          notifyMutation,
+        })
+      })
+    },
+
+    /**
+     * 手动执行一次（契约 06/07 script_run）：trigger='manual'，不改变下次自动触发；
+     * paused/ended 均允许，拒绝仅 id 不存在；共用排队体系但不被 overlap:skip 淘汰
+     *（单飞/并发/溢出判定全在 runner，见 lib/runner.js requestRun）。受理即返回 RunView。
+     * signal 的取消贯穿（abort → 结算 canceled 后工具才静止）属票 29。
+     */
+    async run(id, signal) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw inputInvalid('id', 'format', 'id 必须是非空字符串')
+      }
+      signal?.throwIfAborted()
+      if (storage.table('orchestrations').get(id) === undefined) {
+        throw new OrchestratorError('script_unknown', `编排 '${id}' 不存在`, { id })
+      }
+      const view = await runner.requestRun({ orchestrationId: id, trigger: 'manual', scheduledAtMs: currentTime() })
+      return view ?? null
+    },
+
+    /** 尽力等待的预算（契约 07：最长 script.timeoutSeconds + 30 秒；工具 wait:true 用）。 */
+    computeWaitBudgetMs(id) {
+      const record = storage.table('orchestrations').get(id)
+      const timeoutSeconds = record?.script?.timeoutSeconds ?? defaultTimeoutSeconds
+      return timeoutSeconds * 1000 + 30_000
+    },
+
+    /**
+     * 等待单个 run 结算（工具 script_run 的 wait:true 尽力等待）：
+     * 上限内结算 → 终态 RunView；超限不报错，返回当前（可能非终态的）视图（契约 07）。
+     * maxWaitMs 可注入（测试用）；缺省 = computeWaitBudgetMs(id)。
+     */
+    async waitRun(runId, id, options = {}) {
+      const maxWaitMs = options.maxWaitMs ?? this.computeWaitBudgetMs(id)
+      const outcome = await Promise.race([
+        runner.waitForRun(runId),
+        delay(maxWaitMs).then(() => TIMEOUT_SENTINEL),
+      ])
+      if (outcome !== TIMEOUT_SENTINEL) return outcome
+      return runner.liveView?.(runId) ?? storage.table('runs').get(runId) ?? null
+    },
+
+    /**
      * 注册一个可被 plugin 动作调用的具名动作（契约 06）；同步返回 disposer。
      * 所有权只属调用方：本服务不自动叠加 effect/清理——调用方插件用 ctx.effect
      * 持有 disposer（契约明文「registerAction 自身不绑定清理」）。
@@ -176,6 +306,145 @@ export function createManagementService({ storage, queue, config, now, emit, log
       return registry.register(definition)
     },
   }
+}
+
+const TIMEOUT_SENTINEL = Symbol('wait-timeout')
+
+/**
+ * update 的合并校验与持久化（契约 02「编辑」+ 07）。非调度编辑不重锚；调度字段变化按
+ * 编辑表重建；enabled 走暂停/恢复规则；ended 可经重算触发复活为 active。
+ * @param {object} deps.storage openStorage() 的返回值（读写 orchestrations/runs 表）
+ */
+async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMutation }) {
+  if ('id' in patch && patch.id !== undefined && patch.id !== current.id) {
+    throw inputInvalid('patch.id', 'unexpected', `id 不可修改（当前 '${current.id}'）`)
+  }
+  // patch 与当前值合并成完整 OrchestrationInput 再走 create 同源校验（enabled/overlap
+  // 必须显式携带当前值：校验器的默认值会覆盖未给出的字段）
+  const merged = {
+    title: patch.title ?? current.title,
+    trigger: patch.trigger ?? current.trigger,
+    script: patch.script ?? current.script,
+    judge: patch.judge ?? current.judge,
+    actions: patch.actions ?? current.actions,
+    overlap: patch.overlap ?? current.overlap,
+    enabled: patch.enabled ?? current.enabled,
+  }
+  const normalized = validateOrchestrationInput(merged)
+  const schedulingChanged = stableStringify(normalized.trigger) !== stableStringify(current.trigger)
+  const enabledChanged = 'enabled' in patch && patch.enabled !== undefined && patch.enabled !== current.enabled
+
+  const updatedAt = iso(nowMs)
+  let status = current.status
+  let nextIso = current.nextOccurrence
+
+  if (enabledChanged && patch.enabled === false) {
+    // 修改 enabled 走暂停/恢复规则（契约 02「编辑」）：false = 暂停（任何原状态）
+    status = 'paused'
+    nextIso = null
+  } else if (current.status === 'paused' && !(enabledChanged && patch.enabled === true)) {
+    // 显式暂停不被字段编辑意外解除（契约空白，语义连贯性解读）：调度编辑不预写计划
+    //（paused 的 nextOccurrence 恒 null，契约 09）；恢复时按 resume 表用新配置重算
+    status = 'paused'
+    nextIso = null
+  } else if (schedulingChanged || (enabledChanged && patch.enabled === true)) {
+    // 重算计划：active 因调度变化重锚（编辑表）；paused 经 enabled:true = 恢复语义（恢复表，
+    // 与编辑表在无未结算旧自动 run 时同锚点 now）；ended 经重算触发复活为 active（契约 07）
+    const hasUnsettledAutoRun = hasUnsettledAutomaticRun(storage.table('runs'), current.id)
+    if (hasUnsettledAutoRun && normalized.trigger.kind === 'every' && normalized.trigger.mode === 'fixed-delay') {
+      // fixed-delay 旧自动 run 未结算：保持 null，旧 run 结算后按新 everySeconds 推进（编辑代际）
+      status = 'active'
+      nextIso = null
+    } else {
+      const nextMs = nextOccurrence(normalized.trigger, nowMs)
+      if (nextMs === null) {
+        if (schedulingChanged) {
+          // 更新路径的五年无解拒绝（契约 02「cron 子集」；与 create 同一规则：新配置永不有效）
+          throw inputInvalid(
+            'trigger.expression',
+            'no-occurrence',
+            'cron 表达式在编辑时刻起的 5 年内没有任何有效计划时刻',
+          )
+        }
+        // 配置未变而运行期意外无解（ended 编排 enable 尝试复活）：保持 ended 防御终态
+        status = 'ended'
+        nextIso = null
+      } else {
+        status = 'active'
+        nextIso = iso(nextMs)
+      }
+    }
+  }
+  // 其余情形（非调度编辑且 enabled 未变/enabled:true 且原已 active）：状态与计划原样保留
+
+  const updated = {
+    ...current,
+    title: normalized.title,
+    overlap: normalized.overlap,
+    trigger: normalized.trigger,
+    script: normalized.script,
+    judge: normalized.judge,
+    actions: normalized.actions,
+    enabled: normalized.enabled,
+    updatedAt,
+    status,
+    nextOccurrence: nextIso,
+  }
+  await storage.table('orchestrations').put(current.id, updated)
+  safeEmit('script-orchestrator/changed')
+  notifyMutation()
+  return updated
+}
+
+/** 是否存在未结算的旧自动 run（fixed-delay 等待判定；手动 run 不推进序列故不计）。 */
+function hasUnsettledAutomaticRun(runs, id) {
+  for (const [, run] of runs.entries()) {
+    if (run?.orchestrationId === id && run.trigger !== 'manual' && !TERMINAL_RUN_STATUSES.has(run?.status)) {
+      return true
+    }
+  }
+  return false
+}
+
+/** run 终态集合（与 runner/储层同口径）。 */
+const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'])
+
+/** EditInput 形状校验（契约 06）。 */
+function validateEditInput(input) {
+  if (!isPlainObject(input)) throw inputInvalid('input', 'format', 'edit 输入必须是对象')
+  const allowed = new Set(['id', 'action', 'patch', 'expectedUpdatedAt'])
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw inputInvalid(key, 'unexpected', `edit 不接受字段 '${key}'`)
+  }
+  if (!('id' in input)) throw inputInvalid('id', 'missing', 'edit 缺少必填字段 id')
+  if (typeof input.id !== 'string' || input.id.length === 0) {
+    throw inputInvalid('id', 'format', 'id 必须是非空字符串')
+  }
+  if (!('action' in input)) throw inputInvalid('action', 'missing', 'edit 缺少必填字段 action')
+  const action = input.action
+  if (!['update', 'pause', 'resume', 'delete'].includes(action)) {
+    throw inputInvalid('action', 'format', "action 必须是 'update' | 'pause' | 'resume' | 'delete'")
+  }
+  if ('patch' in input && input.patch !== undefined) {
+    if (action !== 'update') {
+      throw inputInvalid('patch', 'unexpected', `patch 仅 action:'update' 接受（当前 '${action}'）`)
+    }
+    if (!isPlainObject(input.patch)) throw inputInvalid('patch', 'format', 'patch 必须是对象')
+    if (Object.keys(input.patch).length === 0) {
+      throw inputInvalid('patch', 'format', 'patch 至少包含一个字段')
+    }
+  } else if (action === 'update') {
+    throw inputInvalid('patch', 'missing', "action:'update' 必须给出 patch")
+  }
+  if (
+    'expectedUpdatedAt' in input &&
+    input.expectedUpdatedAt !== undefined &&
+    input.expectedUpdatedAt !== null &&
+    typeof input.expectedUpdatedAt !== 'string'
+  ) {
+    throw inputInvalid('expectedUpdatedAt', 'format', 'expectedUpdatedAt 必须是 ISO 时间字符串或 null')
+  }
+  return { id: input.id, action, patch: input.patch }
 }
 
 function validateListQuery(query) {

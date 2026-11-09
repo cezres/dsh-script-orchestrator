@@ -121,6 +121,60 @@ function validateViewPayload(payload) {
   return null
 }
 
+/** EditInput 的最小形状校验（契约 11：深层语义由服务判定）。 */
+function validateEditPayload(payload) {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return invalid('payload', 'format', 'edit 的参数必须是对象')
+  }
+  for (const key of Object.keys(payload)) {
+    if (key !== 'id' && key !== 'action' && key !== 'patch' && key !== 'expectedUpdatedAt') {
+      return invalid(key, 'unexpected', `edit 不接受字段 '${key}'`)
+    }
+  }
+  if (!('id' in payload)) return invalid('id', 'missing', 'edit 缺少必填字段 id')
+  if (typeof payload.id !== 'string' || payload.id.length === 0) {
+    return invalid('id', 'format', 'id 必须是非空字符串')
+  }
+  if (!('action' in payload)) return invalid('action', 'missing', 'edit 缺少必填字段 action')
+  if (!['update', 'pause', 'resume', 'delete'].includes(payload.action)) {
+    return invalid('action', 'format', "action 必须是 'update' | 'pause' | 'resume' | 'delete'")
+  }
+  if ('patch' in payload && payload.patch !== undefined) {
+    if (payload.action !== 'update') {
+      return invalid('patch', 'unexpected', `patch 仅 action:'update' 接受（当前 '${payload.action}'）`)
+    }
+    if (typeof payload.patch !== 'object' || payload.patch === null || Array.isArray(payload.patch)) {
+      return invalid('patch', 'format', 'patch 必须是对象')
+    }
+  }
+  if (
+    'expectedUpdatedAt' in payload &&
+    payload.expectedUpdatedAt !== undefined &&
+    payload.expectedUpdatedAt !== null &&
+    typeof payload.expectedUpdatedAt !== 'string'
+  ) {
+    return invalid('expectedUpdatedAt', 'format', 'expectedUpdatedAt 必须是 ISO 时间字符串或 null')
+  }
+  return null
+}
+
+/** run 端点的最小形状校验：{ id }（等待由面板回读承担，不接受 wait）。 */
+function validateRunPayload(payload) {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return invalid('payload', 'format', 'run 的参数必须是对象')
+  }
+  for (const key of Object.keys(payload)) {
+    if (key !== 'id') {
+      return invalid(key, 'unexpected', `run 不接受字段 '${key}'（进度与结果经 view 回读）`)
+    }
+  }
+  if (!('id' in payload)) return invalid('id', 'missing', 'run 缺少必填字段 id')
+  if (typeof payload.id !== 'string' || payload.id.length === 0) {
+    return invalid('id', 'format', 'id 必须是非空字符串')
+  }
+  return null
+}
+
 /**
  * 建 /script-orchestrator 的 rpc.handle handler。
  * @param {object} deps
@@ -143,6 +197,18 @@ export function createBridgeHandler({ service }) {
       if (violation) return violation
       return { ok: true, value: await service.view(payload.id, 'runs' in payload ? { runs: payload.runs } : {}) }
     },
+    edit: async (payload) => {
+      const violation = validateEditPayload(payload)
+      if (violation) return violation
+      return { ok: true, value: await service.edit(payload) }
+    },
+    run: async (payload) => {
+      const violation = validateRunPayload(payload)
+      if (violation) return violation
+      // 受理即返回简形（契约 11 端点表）；UI signal 不透传（abort 只终止等待，不取消 run）
+      const accepted = await service.run(payload.id)
+      return { ok: true, value: { runId: accepted?.runId, status: accepted?.status } }
+    },
     // listActions（契约 11 端点表：编辑器的注册动作提示；票 31 开放注册后上线）
     listActions: async (payload) => {
       if (payload !== undefined) {
@@ -155,7 +221,6 @@ export function createBridgeHandler({ service }) {
       }
       return { ok: true, value: service.listActions() }
     },
-    // edit/run 属后续票（spec §3 步骤 6；票 28/26）
   }
   return async function bridgeHandler(endpoint, payload, _signal, _peer) {
     try {
