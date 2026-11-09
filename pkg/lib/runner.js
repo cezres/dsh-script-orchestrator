@@ -2,9 +2,13 @@
 // 单飞屏障 + 全局并发/排队、两写结算、argv 直传 spawn（不经 shell）、cwd/allowedRoots
 // 预检、超时（cancelReason 自置标志位分类）、输出按流解码尾部、正常退出后存活后代
 // 的有界等待与清理、run-started/run-settled 事件（持久写入与内存更新后发布）。
+// 票 30：脚本退出后进判定（judging 内存态）→ 非零动作串行派发（dispatching 内存态，
+// 不占 FIFO 槽、不落盘）→ 按契约 09 汇总定终态；action-settled 按动作执行序在写 2
+// 之后、run-settled 之前发布；dispatching 取消经 requestCancel 停止剩余派发（完整
+// 取消矩阵的 queued/running 面与 exec.signal/delete 接线属票 29）。
 // 服务 run / script_run 只经 requestRun 触发，不另造排队或结算逻辑（spec §2）。
-// 取消矩阵（abort/delete/卸载 → canceled）属票 29；本票仅预留信号面与终态唯一防线。
 import { evaluateJudge } from './judge.js'
+import { dispatchActions, aggregateRunStatus } from './actions.js'
 import { isWithin, tailText } from './execution-utils.js'
 
 export const TERMINAL_STATUSES = new Set(['succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'])
@@ -94,8 +98,9 @@ export function buildSettledPayload(run) {
  * @param {object} [deps.fs] { stat }（cwd 预检；默认 node:fs/promises 的 stat）
  * @param {string} [deps.hostCwd] Host 进程工作目录（cwd 解析兜底；默认 process.cwd()）
  * @param {() => void} [deps.onOrchestrationMutated] 编排持久变更（fixed-delay 推进等）后的回调（scheduler 重算 timer 用）
+ * @param {object} [deps.registry] 动作注册表 { resolve(name) }（plugin 动作逐动作实时查表；createActionRegistry 或结构等同物）
  */
-export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated }) {
+export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry }) {
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
@@ -103,6 +108,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   const maxConcurrentRuns = config.maxConcurrentRuns ?? 2
   const queueCapacity = maxConcurrentRuns * 4
   const mutating = onOrchestrationMutated ?? (() => {})
+  // dispatching 取消面：runId → { requested, controller }（requestCancel 置位并中止在途动作）
+  const dispatchCancellations = new Map()
 
   // 活动视图：runId → live 记录（内存态 running/judging/dispatching；queued 的覆盖字段）。
   // 中途状态不落盘（契约 08「只写两次」）；service.view 合并此视图对外呈现。
@@ -280,11 +287,72 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     })
 
     const outcome = await execute(runId, run, startedMs)
-    await settle(runId, outcome)
+    // 判定与动作派发（票 30）：judging/dispatching 为内存态（不落盘、不占 FIFO 槽），
+    // 结算槽（写 2）在派发完成后竞争入队——first-write-wins 语义不变
+    const enriched = await judgeAndDispatch(runId, run, outcome)
+    await settle(runId, enriched)
     active.delete(runId)
     activeHandles.delete(runId)
     wakeIdleWaiters()
     pump()
+  }
+
+  /**
+   * 脚本完成后：判定求值（内存态 judging）→ 非零动作串行派发（内存态 dispatching）。
+   * spawn_failed/canceled 原样返回（跳过判定，契约 09 结算规则 3）。
+   * @returns 带 verdict/actionResults/dispatchCanceled 的结算输入
+   */
+  async function judgeAndDispatch(runId, runAtStart, outcome) {
+    if (outcome.kind !== 'script') return outcome
+    const orchestration = orchestrationOf(runAtStart)
+    const verdict = orchestration
+      ? evaluateJudge(orchestration.judge, outcome.facts)
+      : { matchedRule: null, usedFallback: false, actionKeys: [] }
+    const overlay = live.get(runId) ?? {}
+    live.set(runId, {
+      ...overlay,
+      status: 'judging',
+      matchedRule: verdict.matchedRule,
+      usedFallback: verdict.usedFallback,
+    })
+
+    let actionResults = []
+    let dispatchCanceled = false
+    if (verdict.actionKeys.length > 0 && orchestration !== undefined) {
+      live.set(runId, { ...live.get(runId), status: 'dispatching', actions: [] })
+      const cancellation = { requested: false, controller: null }
+      dispatchCancellations.set(runId, cancellation)
+      try {
+        const dispatched = await dispatchActions({
+          actionKeys: verdict.actionKeys,
+          actions: orchestration.actions,
+          orchestration: { id: orchestration.id, title: orchestration.title },
+          run: {
+            runId,
+            trigger: runAtStart.trigger,
+            scheduledAt: runAtStart.scheduledAt,
+            startedAt: overlay.startedAt ?? runAtStart.startedAt ?? null,
+            script: outcome.script,
+          },
+          verdict,
+          stdoutText: outcome.facts.stdoutText,
+          registry,
+          emit: publish,
+          logger: log,
+          cancellation,
+          // 逐动作结算进度并入内存视图（面板轮询可见；结算后 live 移除、回落持久记录）
+          onActionResult: (result) => {
+            const current = live.get(runId)
+            if (current !== undefined) live.set(runId, { ...current, actions: [...(current.actions ?? []), result] })
+          },
+        })
+        actionResults = dispatched.results
+        dispatchCanceled = dispatched.canceled
+      } finally {
+        dispatchCancellations.delete(runId)
+      }
+    }
+    return { ...outcome, verdict, actionResults, dispatchCanceled }
   }
 
   /** cwd 解析（script.cwd → 配置 defaultCwd → Host 工作目录）与 allowedRoots/存在性预检。 */
@@ -445,8 +513,10 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   }
 
   /**
-   * 结算（写 2）：spawn_failed → failed（跳过判定）；脚本完成 → judging →（动作派发
-   * 属票 30+，当前空派发）→ 汇总。终态唯一：已终态的 run 迟到结算为 no-op。
+   * 结算（写 2）：spawn_failed → failed（跳过判定）；脚本完成 → 按判定结果与动作汇总
+   * 定终态（契约 09：取消终态优先于动作汇总）。终态唯一：已终态的 run 迟到结算为 no-op。
+   * action-settled 按动作执行序发布（契约 06：在对应持久写入与内存视图更新之后、
+   * run-settled 之前；listener 收到立即 view() 必见已更新状态）。
    */
   async function settle(runId, outcome) {
     return queue.enqueue(async () => {
@@ -465,24 +535,25 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
         // 契约 09 结算规则 3：spawn_failed 直接 failed，跳过判定
         run.status = 'failed'
       } else {
-        // 脚本启动成功即进判定：exitCode/signal/timedOut 是判定输入，不是失败判据
-        const orchestration = orchestrationOf(run)
-        const verdict = orchestration
-          ? evaluateJudge(orchestration.judge, outcome.facts)
-          : { matchedRule: null, usedFallback: false, actionKeys: [] }
-        run.matchedRule = verdict.matchedRule
-        run.usedFallback = verdict.usedFallback
-        if (verdict.actionKeys.length > 0) {
-          // 动作执行器属票 30+：当前空派发（不产生动作结果记录），按契约 09 汇总表
-          // 0 成功/0 失败 → succeeded；票 30 接入真实派发后按汇总结算。票序边界声明。
-          run.actions = []
-        }
-        run.status = 'succeeded'
+        run.matchedRule = outcome.verdict.matchedRule
+        run.usedFallback = outcome.verdict.usedFallback
+        run.actions = outcome.actionResults
+        run.status = outcome.dispatchCanceled ? 'canceled' : aggregateRunStatus(outcome.actionResults)
       }
 
       await storage.table('runs').put(runId, structuredCloneSafe(run))
       live.delete(runId)
       wakeIdleWaiters()
+      for (const action of run.actions ?? []) {
+        safeEmit('script-orchestrator/action-settled', {
+          runId: run.runId,
+          orchestrationId: run.orchestrationId,
+          name: action.name,
+          kind: action.kind,
+          status: action.status,
+          ...(action.error !== undefined ? { error: { code: action.error.code, message: action.error.message } } : {}),
+        })
+      }
       await advanceFixedDelayIfDue(run, settledMs)
       safeEmit('script-orchestrator/run-settled', buildSettledPayload(run))
       return run
@@ -550,6 +621,23 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
      * no-op（返回 null），不覆写、不重发 run-settled。
      */
     settleExternal: (runId, outcome) => settle(runId, outcome),
+    /**
+     * dispatching 取消入口（契约 03/09 取消矩阵的 dispatching 面；票 29 接线工具/删除）：
+     * 置取消请求 + 中止在途动作的 signal → 派发器停止剩余动作（记 skipped）、已执行
+     * 结果保留，run 由自然结算写 canceled（终态优先于动作汇总）。
+     * 非派发中的 run（queued/running/未知）返回 false——完整矩阵属票 29。
+     */
+    requestCancel: (runId) => {
+      const cancellation = dispatchCancellations.get(runId)
+      if (cancellation === undefined) return false
+      cancellation.requested = true
+      try {
+        cancellation.controller?.abort()
+      } catch {
+        /* abort 不应抛；防御 */
+      }
+      return true
+    },
     /** 活动视图合并入口（service.view 用）：返回内存态视图或 undefined。 */
     liveView: (runId) => {
       const overlay = live.get(runId)

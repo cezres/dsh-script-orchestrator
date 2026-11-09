@@ -136,6 +136,7 @@ function makeRunner(over = {}) {
     logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
     fs: over.fs ?? makeFakeFs(),
     hostCwd: over.hostCwd ?? 'D:\\work\\proj',
+    registry: over.registry,
   })
   return { runner, storage, subprocess, emitted, logs, advance: (ms) => { clock += ms } }
 }
@@ -666,5 +667,268 @@ describe('终态唯一与停机（first-write-wins；进程树生命周期以 ru
     expect(spawn.terminated).toBeGreaterThanOrEqual(0) // 有界清理尽力而为
     // 停机后拒绝新触发
     await expect(ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })).rejects.toThrow(/shutting down/)
+  })
+})
+
+// ---------------- 判定与动作派发（契约 04/05/09；票 30） ----------------
+
+const judgeWithActions = (judge, actions) => ({ judge, actions })
+
+describe('判定 → 派发 → 汇总（契约 04/05/09：脚本启动成功即进判定，动作按汇总定终态）', () => {
+  it('event 动作端到端：发出全名与四键载荷（payload 已渲染）；run.actions[] 落盘；汇总 succeeded', async () => {
+    const ctx = makeRunner({
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['emit-ok'] }], fallback: [] },
+        { 'emit-ok': { kind: 'event', name: 'deploy-ok', payload: { summary: '{{orchestrationTitle}} 退出码 {{exitCode}}' } } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    expect(run.matchedRule).toBe(0)
+    expect(run.usedFallback).toBe(false)
+    expect(run.actions).toEqual([{ name: 'emit-ok', kind: 'event', status: 'succeeded' }])
+    const custom = ctx.emitted.find(([name]) => name === 'script-orchestrator/deploy-ok')
+    expect(custom).toBeTruthy()
+    expect(custom[1]).toEqual({
+      name: 'deploy-ok',
+      payload: { summary: '夜间巡检 退出码 0' },
+      orchestration: { id: 'nightly', title: '夜间巡检' },
+      run: { runId: view.runId, status: 'succeeded', exitCode: 0 },
+    })
+  })
+
+  it('动作汇总矩阵：一成一败 → partial；全败 → failed（零动作 succeeded 已由上文覆盖）', async () => {
+    const partial = makeRunner({
+      orchestrationOver: judgeWithActions(
+        { rules: [], fallback: ['page', 'emit-ok'] },
+        { page: { kind: 'plugin', action: 'ops.oncall' }, 'emit-ok': { kind: 'event', name: 'deploy-ok' } },
+      ),
+    })
+    const partialView = await requestAuto(partial.runner)
+    await partial.runner.waitIdle()
+    const partialRun = partial.storage.snapshot().runs[partialView.runId]
+    expect(partialRun.status).toBe('partial')
+    expect(partialRun.usedFallback).toBe(true)
+    expect(partialRun.matchedRule).toBeNull()
+    expect(partialRun.actions).toEqual([
+      { name: 'page', kind: 'plugin', status: 'failed', error: { code: 'unknown_action', message: expect.stringContaining('ops.oncall') } },
+      { name: 'emit-ok', kind: 'event', status: 'succeeded' },
+    ])
+
+    const failed = makeRunner({
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['p1', 'p2'] }], fallback: [] },
+        { p1: { kind: 'plugin', action: 'a.one' }, p2: { kind: 'plugin', action: 'b.two' } },
+      ),
+    })
+    const failedView = await requestAuto(failed.runner)
+    await failed.runner.waitIdle()
+    expect(failed.storage.snapshot().runs[failedView.runId].status).toBe('failed')
+  })
+
+  it('action-settled 按动作执行序发布：在 run 持久写之后、run-settled 之前；listener 立即回读已见终态', async () => {
+    const storage = makeStorage()
+    const emitted = []
+    const readBack = []
+    const ctx = makeRunner({
+      storage,
+      autoSubprocess: false,
+      orchestration: makeOrchestration(
+        judgeWithActions(
+          { rules: [], fallback: ['e1', 'e2'] },
+          { e1: { kind: 'event', name: 'first' }, e2: { kind: 'event', name: 'second' } },
+        ),
+      ),
+      emit: (name, payload) => {
+        emitted.push([name, payload])
+        if (name === 'script-orchestrator/action-settled') {
+          readBack.push(storage.table('runs').get(payload.runId)?.status)
+        }
+      },
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+    // 事件时序：自定义事件（动作效果，派发期间发出）→ action-settled×2（写 2 后、按执行序）→ run-settled
+    expect(emitted.map(([name]) => name)).toEqual([
+      'script-orchestrator/run-started',
+      'script-orchestrator/first',
+      'script-orchestrator/second',
+      'script-orchestrator/action-settled',
+      'script-orchestrator/action-settled',
+      'script-orchestrator/run-settled',
+    ])
+    const settledPayloads = emitted.filter(([name]) => name === 'script-orchestrator/action-settled').map(([, payload]) => payload)
+    const [first, second] = settledPayloads
+    expect(first).toEqual({ runId: view.runId, orchestrationId: 'nightly', name: 'e1', kind: 'event', status: 'succeeded' })
+    expect(second).toEqual({ runId: view.runId, orchestrationId: 'nightly', name: 'e2', kind: 'event', status: 'succeeded' })
+    // 回读一致性：每个 action-settled 到达时 run 记录已含终态与完整动作结果（写 2 已落）
+    expect(readBack).toEqual(['succeeded', 'succeeded'])
+    expect(storage.snapshot().runs[view.runId].actions).toHaveLength(2)
+  })
+
+  it('action-settled 对 failed 动作携带 error（{ code, message }，无堆栈）', async () => {
+    const ctx = makeRunner({
+      orchestrationOver: judgeWithActions(
+        { rules: [], fallback: ['page'] },
+        { page: { kind: 'plugin', action: 'ops.oncall' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const settled = ctx.emitted.find(([name]) => name === 'script-orchestrator/action-settled')?.[1]
+    expect(settled).toEqual({
+      runId: view.runId,
+      orchestrationId: 'nightly',
+      name: 'page',
+      kind: 'plugin',
+      status: 'failed',
+      error: { code: 'unknown_action', message: expect.any(String) },
+    })
+  })
+
+  it('dispatching 内存态：判定字段与逐动作进度经 liveView 可见（中途状态不落盘）', async () => {
+    let releaseSlow
+    const registry = {
+      resolve: (name) =>
+        name === 'slow.act'
+          ? { name, run: () => new Promise((resolve) => { releaseSlow = resolve }) }
+          : undefined,
+    }
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      registry,
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['slow', 'emit-ok'] }], fallback: [] },
+        { slow: { kind: 'plugin', action: 'slow.act' }, 'emit-ok': { kind: 'event', name: 'after-slow' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await vi.waitFor(() => {
+      if (ctx.runner.liveView(view.runId)?.status !== 'dispatching') throw new Error('not dispatching')
+    })
+    const live = ctx.runner.liveView(view.runId)
+    expect(live.matchedRule).toBe(0)
+    expect(live.usedFallback).toBe(false)
+    expect(live.actions).toEqual([]) // 挂起动作尚未结算
+    // 中途状态不落盘：持久记录仍是 queued 形状（status 来自写 1）
+    expect(ctx.storage.snapshot().runs[view.runId].status).toBe('queued')
+    releaseSlow()
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    expect(run.actions.map((a) => [a.name, a.status])).toEqual([['slow', 'succeeded'], ['emit-ok', 'succeeded']])
+  })
+
+  it('非零退出码照常派发（退出码是判定输入不是失败判据）：exitCode 谓词命中并执行动作', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: { not: 0 } }, actions: ['emit-bad'] }], fallback: [] },
+        { 'emit-bad': { kind: 'event', name: 'deploy-bad' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 3, signal: null })
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.matchedRule).toBe(0)
+    expect(run.status).toBe('succeeded')
+    expect(run.actions).toEqual([{ name: 'emit-bad', kind: 'event', status: 'succeeded' }])
+  })
+
+  it('spawn_failed 跳过判定与派发：无动作执行、无 action-settled、matchedRule 保持 null', async () => {
+    const fs = makeFakeFs()
+    fs.missing.add('D:\\work\\proj')
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      fs,
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['emit-ok'] }], fallback: [] },
+        { 'emit-ok': { kind: 'event', name: 'deploy-ok' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed')
+    expect(run.actions).toEqual([])
+    expect(run.matchedRule).toBeNull()
+    expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/action-settled')).toBe(false)
+    expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/deploy-ok')).toBe(false)
+  })
+})
+
+describe('dispatching 取消（契约 03/09：停止派发剩余动作、已执行结果保留、终态优先）', () => {
+  it('requestCancel：在途动作经 signal 中止、剩余 skipped、终态 canceled（即使已有成功动作）', async () => {
+    const registry = {
+      resolve: (name) =>
+        name === 'hang.act'
+          ? {
+              name,
+              run: (context) =>
+                new Promise((resolve, reject) => {
+                  context.signal.addEventListener('abort', () => reject(new Error('aborted')))
+                }),
+            }
+          : undefined,
+    }
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      registry,
+      orchestrationOver: judgeWithActions(
+        { rules: [], fallback: ['emit-ok', 'hang', 'emit-late'] },
+        {
+          'emit-ok': { kind: 'event', name: 'first' },
+          hang: { kind: 'plugin', action: 'hang.act' },
+          'emit-late': { kind: 'event', name: 'never' },
+        },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await vi.waitFor(() => {
+      if (ctx.runner.liveView(view.runId)?.status !== 'dispatching') throw new Error('not dispatching')
+    })
+    expect(ctx.runner.requestCancel(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('canceled') // 终态优先于动作汇总（已有一个成功动作也不改 partial）
+    expect(run.actions.map((a) => [a.name, a.status])).toEqual([
+      ['emit-ok', 'succeeded'],
+      ['hang', 'failed'],
+      ['emit-late', 'skipped'],
+    ])
+    expect(run.actions[1].error.code).toBe('action_error')
+    // 事件时序：自定义事件（动作效果）→ 三个 action-settled（含 skipped）按执行序 → run-settled(canceled)
+    const names = ctx.emitted.map(([name]) => name)
+    expect(names).toEqual([
+      'script-orchestrator/run-started',
+      'script-orchestrator/first',
+      'script-orchestrator/action-settled',
+      'script-orchestrator/action-settled',
+      'script-orchestrator/action-settled',
+      'script-orchestrator/run-settled',
+    ])
+    expect(ctx.emitted.at(-1)[1]).toMatchObject({ runId: view.runId, status: 'canceled' })
+    // 剩余动作未派发：never 事件未发出
+    expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/never')).toBe(false)
+  })
+
+  it('requestCancel 对非派发中的 run 返回 false（queued/running 取消矩阵属票 29）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    await waitForSpawn(ctx)
+    expect(ctx.runner.requestCancel(view.runId)).toBe(false) // running 阶段
+    expect(ctx.runner.requestCancel('run-00000000')).toBe(false) // 未知 run
+    await ctx.subprocess.spawns[0].finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
   })
 })
