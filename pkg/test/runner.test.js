@@ -2,7 +2,7 @@
 // 结算口径、输出收集、后代清理、事件发布时序。subprocess/fs/时钟全部注入，
 // 真实 Windows 进程路径另见 test/execution.process.test.js。
 import { describe, it, expect, vi } from 'vitest'
-import { createRunner } from '../lib/runner.js'
+import { createRunner, buildSettledPayload } from '../lib/runner.js'
 import { ServiceQueue } from '../lib/fifo.js'
 
 const NOW = 1_790_000_000_000
@@ -673,6 +673,72 @@ describe('终态唯一与停机（first-write-wins；进程树生命周期以 ru
 // ---------------- 判定与动作派发（契约 04/05/09；票 30） ----------------
 
 const judgeWithActions = (judge, actions) => ({ judge, actions })
+
+describe('buildSettledPayload · 64 KiB 计量与 tail 兜底（契约 06）', () => {
+  it('超限时对 stdoutTail/stderrTail 依次减半保留末尾（按 code point 切割，不产生半个代理对），其余字段不截', () => {
+    const run = {
+      runId: 'run-00000001',
+      orchestrationId: 'nightly',
+      status: 'succeeded',
+      trigger: 'every',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: iso(NOW),
+      script: {
+        command: 'node',
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        durationMs: 100,
+        // 30000 个三字节汉字 = 90000 字节 > 65536 → 减半到 15000 码点（45000 字节）
+        stdoutTail: '字'.repeat(30000),
+        stderrTail: 'err',
+        truncated: true,
+      },
+      matchedRule: 0,
+      usedFallback: false,
+      actions: [{ name: 'emit-ok', kind: 'event', status: 'succeeded', error: undefined, warnings: ['w'] }],
+    }
+    const payload = buildSettledPayload(run)
+    expect(Array.from(payload.stdoutTail)).toHaveLength(15000)
+    expect(payload.stdoutTail.endsWith('字')).toBe(true)
+    expect(payload.stderrTail).toBe('err') // 尚未超限不再截
+    expect(payload.actions).toEqual([{ name: 'emit-ok', kind: 'event', status: 'succeeded' }])
+    expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(65536)
+  })
+
+  it('星形字符（代理对）减半不产生半个代理对；stdout 依次先减、耗尽后轮到 stderrTail', () => {
+    // stdout 20000 星形码点（80000 字节）、stderr 30000 汉字（90000 字节）均超 65536：
+    // 「依次减半」= stdout 先反复减半直至耗尽仍超限（stderr 独占 90000），随后 stderr 减半
+    const run = {
+      runId: 'run-00000002',
+      orchestrationId: 'nightly',
+      status: 'succeeded',
+      trigger: 'every',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: iso(NOW),
+      script: {
+        command: 'node',
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        durationMs: 100,
+        stdoutTail: '𝕏'.repeat(20000),
+        stderrTail: '字'.repeat(30000),
+        truncated: true,
+      },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    }
+    const payload = buildSettledPayload(run)
+    expect(payload.stdoutTail).toBe('') // 先耗尽 stdout 再轮到 stderr（依次）
+    expect(Array.from(payload.stderrTail)).toHaveLength(15000)
+    expect(payload.stderrTail.endsWith('字')).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(65536)
+  })
+})
 
 describe('判定 → 派发 → 汇总（契约 04/05/09：脚本启动成功即进判定，动作按汇总定终态）', () => {
   it('event 动作端到端：发出全名与四键载荷（payload 已渲染）；run.actions[] 落盘；汇总 succeeded', async () => {
