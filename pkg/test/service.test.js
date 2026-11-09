@@ -75,6 +75,26 @@ describe('create（契约 docs/temp/06-events-service.md：校验 → 生成 id 
     })
   })
 
+  it('session 动作字段级校验（票 33 补固）：ephemeral + idleDisposeSeconds 受理并归一化保留；persistent 拒绝该字段（负向矩阵既有）', async () => {
+    const { service } = makeService()
+    const view = await service.create({
+      ...baseInput(),
+      actions: {
+        'emit-ok': { kind: 'event', name: 'rotate-ok' },
+        summarize: { kind: 'session', mode: 'ephemeral', prompt: '整理', idleDisposeSeconds: 120, framing: 'plain', title: '夜间整理' },
+      },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['emit-ok'] }], fallback: ['summarize'] },
+    })
+    expect(view.actions.summarize).toEqual({
+      kind: 'session',
+      mode: 'ephemeral',
+      title: '夜间整理',
+      prompt: '整理',
+      framing: 'plain',
+      idleDisposeSeconds: 120,
+    })
+  })
+
   it('fixed-delay 首次计划同为 createdAt + everySeconds（契约 02「创建」）', async () => {
     const { service } = makeService()
     const view = await service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 1800, mode: 'fixed-delay' } })

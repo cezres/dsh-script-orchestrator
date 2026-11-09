@@ -7,11 +7,12 @@
 //   已注册则以 ActionContext 调用（契约 06），超时（timeoutSeconds，默认 30 秒）→ failed
 //   timeout；注册面 registry.register 与 disposer 四不变量见 createActionRegistry。
 // - session：persistent 投递经 sessionHost（lib/session-action.js，票 32）；ephemeral
-//   的 agents.create/whenIdle/dispose 生命周期属票 33。
+//   投递共用同一渲染与首条消息路径，创建走 agents.create 自持 handle、回收生命周期
+//   （whenIdle → idleDisposeSeconds → dispose）移交 ephemeralRegistry（票 33）。
 // dispatching 取消（契约 03/09）：取消请求后停止派发剩余动作（记 skipped），在途动作经其
 // signal 中止、结果如实记录——run 终态优先于动作汇总的落盘由 runner（settle）负责。
 import { buildTemplateVariables, renderPayload, renderTemplate, appendWarning } from './judge.js'
-import { deliverPersistentSession, SessionActionError } from './session-action.js'
+import { deliverPersistentSession, deliverEphemeralSession, SessionActionError } from './session-action.js'
 import { REGISTERED_ACTION_PATTERN } from './validation.js'
 
 /** 保留前缀（契约 06：仅此一个，防冒名内置能力；其余一概不保留）。 */
@@ -114,6 +115,8 @@ const messageOf = (error) => (error instanceof Error ? error.message : String(er
  *   ctx.sessionController/ctx.sessions/ctx.get('sessionTitle') 装配；缺省时 session 动作
  *   failed internal_error——宿主语义面不可伪造）
  * @param {object} [deps.sessionEnv] session cwd 解析环境 { allowedRoots, defaultCwd, hostCwd, scriptCwd }
+ * @param {object} [deps.ephemeralRegistry] ephemeral 生命周期登记器（lib/ephemeral-lifecycle.js
+ *   createEphemeralRegistry；投递成功 adopt 启动回收、失败 retain 保留现场；index.js 装配）
  * @param {object} [deps.logger] 内部日志（event_listener_failed 等）
  * @param {{ requested: boolean, controller: AbortController | null }} [deps.cancellation]
  *   dispatching 取消面：runner 持有并在取消时置 requested + abort 当前动作 controller。
@@ -131,6 +134,7 @@ export async function dispatchActions({
   emit,
   sessionHost,
   sessionEnv,
+  ephemeralRegistry,
   logger,
   cancellation,
   onActionResult,
@@ -272,39 +276,62 @@ export async function dispatchActions({
         fail('template_invalid', `session 动作 '${key}' 的 prompt 渲染后去首尾空白为空（field: prompt）`)
         continue
       }
-      if (definition.mode === 'ephemeral') {
-        // 票序边界：ephemeral 的 agents.create 自持 handle + whenIdle/dispose 回收属票 33，
-        // persistent 与 ephemeral 共用同一段渲染与投递逻辑（契约 05），届时在此接入
-        fail('action_error', `session 动作 '${key}' 的 ephemeral 模式执行尚未实现（票 33 交付）；prompt 已按模板渲染`)
-        continue
-      }
+      const ephemeral = definition.mode === 'ephemeral'
       if (sessionHost === undefined) {
         // 防御：正常装配（index.js）总会注入；宿主会话服务缺失时不得伪造成功
         fail('internal_error', `session 动作 '${key}' 无法执行：宿主会话服务未注入（sessionHost）`)
         continue
       }
+      if (ephemeral && ephemeralRegistry === undefined) {
+        // 防御：ephemeral 的生命周期（回收/卸载 teardown）必须可跟踪，否则语义不成立
+        fail('internal_error', `session 动作 '${key}' 无法执行：ephemeral 生命周期登记器未注入（ephemeralRegistry）`)
+        continue
+      }
       try {
-        const { sessionId } = await deliverPersistentSession({
-          host: sessionHost,
-          definition,
-          renderedPrompt: renderedPrompt.text,
-          orchestration,
-          run,
-          verdict,
-          warnings,
-          sessionEnv,
-        })
+        // 两模式共用同一段渲染与首条消息投递（契约 05），只差创建路径与生命周期归属
+        const delivered = ephemeral
+          ? await deliverEphemeralSession({
+              host: sessionHost,
+              definition,
+              renderedPrompt: renderedPrompt.text,
+              orchestration,
+              run,
+              verdict,
+              warnings,
+              sessionEnv,
+            })
+          : {
+              ...(await deliverPersistentSession({
+                host: sessionHost,
+                definition,
+                renderedPrompt: renderedPrompt.text,
+                orchestration,
+                run,
+                verdict,
+                warnings,
+                sessionEnv,
+              })),
+            }
+        if (ephemeral) {
+          // 投递成功 → 启动回收生命周期（whenIdle → idleDisposeSeconds → dispose；
+          // 缺省 0 = 收敛即回收）。任务由登记表与 disposeAll 跟踪收口。
+          ephemeralRegistry.adopt(delivered.handle, delivered.agent, delivered.sessionId, definition.idleDisposeSeconds ?? 0)
+        }
         record({
           name: key,
           kind: 'session',
           status: 'succeeded',
-          sessionId,
+          sessionId: delivered.sessionId,
           ...(warnings.length > 0 ? { warnings } : {}),
         })
       } catch (error) {
         // SessionActionError 携带 code ∈ {cwd_not_allowed, preset_unknown, delivery_failed, internal_error}；
-        // delivery_failed 时 sessionId 已在 error 上——保留在动作记录（失败现场不回滚）
+        // delivery_failed 时 sessionId 已在 error 上——保留在动作记录（失败现场不回滚）。
+        // ephemeral 投递失败的 handle 经 retain 只登记卸载清理，不启动回收计时（契约 05）
         if (error instanceof SessionActionError) {
+          if (ephemeral && error.handle !== undefined && ephemeralRegistry !== undefined) {
+            ephemeralRegistry.retain(error.handle, error.sessionId)
+          }
           fail(error.code, error.message, error)
         } else {
           fail('internal_error', `session 动作 '${key}' 执行失败：${messageOf(error)}`)

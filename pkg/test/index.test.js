@@ -18,6 +18,11 @@ function makeCtx({ domain } = {}) {
     sessionRenames: [],
     sessionFollowups: [],
     sessionFlushes: [],
+    agentCreates: [],
+    defaultSelections: 0,
+    ephemeralHandles: [],
+    ephemeralDisposes: [],
+    ephemeralIdleWaiters: Promise.withResolvers(),
   }
   const fakeDomain =
     domain ??
@@ -86,10 +91,43 @@ function makeCtx({ domain } = {}) {
         return true
       },
     },
+    agents: {
+      create: async (options) => {
+        calls.agentCreates.push(options)
+        const sessionId = options.sessionId
+        const agent = {
+          id: sessionId,
+          session: { id: sessionId },
+          model: { select: () => {} },
+          followup: (message) => calls.sessionFollowups.push(message),
+          whenIdle: () => calls.ephemeralIdleWaiters.promise,
+        }
+        const handle = {
+          agent,
+          dispose: async () => {
+            calls.ephemeralDisposes.push(sessionId)
+          },
+        }
+        calls.ephemeralHandles.push(handle)
+        return handle
+      },
+    },
+    agentDefaultModel: {
+      currentSelection: () => {
+        calls.defaultSelections += 1
+        return { provider: 'host-default', model: 'host-default-model' }
+      },
+    },
     get: (key) => {
       if (key === 'sessionTitle') {
         return {
           rename: (session, title) => calls.sessionRenames.push({ session: session?.id ?? session, title }),
+        }
+      }
+      if (key === 'agentPresets') {
+        return {
+          resolve: async (id) => ({ id: id ?? 'standard' }),
+          mount: async () => {},
         }
       }
       return undefined
@@ -140,10 +178,13 @@ async function callRoute(route, url, body) {
 }
 
 describe('插件入口（lib/index.js）', () => {
-  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools/subprocess/sessionController/sessions）+ name', async () => {
+  it('导出面：apply + 同步 Config + inject 声明（+agents/agentDefaultModel，票 33 ephemeral）+ name', async () => {
     expect(typeof plugin).toBe('function')
     expect(Config).toBe(RawConfig)
-    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools', 'subprocess', 'sessionController', 'sessions'])
+    expect([...inject]).toEqual([
+      'storageDomain', 'connection', 'webServer', 'tools', 'subprocess',
+      'sessionController', 'sessions', 'agents', 'agentDefaultModel',
+    ])
     expect(name).toBe('script-orchestrator')
   })
 
@@ -570,6 +611,68 @@ describe('插件入口（lib/index.js）', () => {
     expect(calls.sessionFollowups[0].content[0].text).toContain(`{"runId":"${run.runId}"`)
     expect(calls.sessionFlushes).toEqual([sessionId])
     await first.value()
+  })
+
+  it('票 33 接线：ephemeral 动作经 agents.create 投递 → 回收生命周期（whenIdle 收敛后 dispose）；卸载 disposeAll 收口', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('ephemeral-wire', {
+      id: 'ephemeral-wire',
+      title: '临时整理',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: [], cwd: process.cwd() },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['summarize'] }], fallback: [] },
+      actions: { summarize: { kind: 'session', mode: 'ephemeral', prompt: '整理退出码 {{exitCode}}。', idleDisposeSeconds: 0 } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+      if (!run) throw new Error('run 未按 succeeded 结算')
+      return run
+    })
+    const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+    const sessionId = run.actions[0].sessionId
+    // agents.create 收到直铸 id + 缺省 model（currentSelection）+ preset resolve/mount 链 + cwd
+    expect(calls.agentCreates).toHaveLength(1)
+    expect(calls.agentCreates[0].sessionId).toBe(sessionId)
+    expect(calls.agentCreates[0].agentOptions).toEqual({ provider: 'host-default', model: 'host-default-model' })
+    expect(calls.agentCreates[0].meta).toEqual({ cwd: process.cwd(), agentPreset: 'standard' })
+    expect(typeof calls.agentCreates[0].setup).toBe('function')
+    // 首条消息已投递（共用渲染路径：banner + 渲染后 prompt）
+    expect(calls.sessionFollowups.some((m) => m.content[0].text.includes('整理退出码 0。'))).toBe(true)
+    // idleDisposeSeconds=0：whenIdle 尚未收敛（门闩未放行）→ 不 dispose
+    expect(calls.ephemeralDisposes).toEqual([])
+    calls.ephemeralIdleWaiters.resolve() // 会话空闲（turn 结束）
+    await vi.waitFor(() => expect(calls.ephemeralDisposes).toEqual([sessionId]))
+    // 卸载收口：disposeAll 幂等（已 dispose 的条目不再触发第二次）
+    await first.value()
+    expect(calls.ephemeralDisposes).toEqual([sessionId])
   })
 
   it('卸载顺序：先停调度与工具/桥（停生产者）→ runner 停机（在途清进程）→ 排干队列 → domain.close()', async () => {
