@@ -51,7 +51,7 @@ export function createManagementService({ storage, queue, config, now, emit, log
     }
   }
 
-  // 注册动作表（共享实例时与 runner 查表同源；registerAction 注册面属票 31）
+  // 编排集合持久变更 → 调度器重算单 timer（cron/every 统一经此联动）
   const notifyMutation = onMutation ?? (() => {})
 
   return {
