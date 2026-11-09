@@ -79,7 +79,7 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
 
   it('未实现/未知 endpoint 返回 internal_error envelope（不抛给传输层）', async () => {
     const handler = createBridgeHandler({ service: fakeService() })
-    for (const endpoint of ['edit', 'run', 'listActions', 'bogus']) {
+    for (const endpoint of ['edit', 'run', 'bogus']) {
       const result = await handler(endpoint, {}, undefined, {})
       expect(result.ok).toBe(false)
       expect(result.error.code).toBe('internal_error')
@@ -95,6 +95,49 @@ describe('createBridgeHandler（/script-orchestrator 一元 RPC，契约 docs/te
     expect(result.ok).toBe(false)
     expect(result.error.code).toBe('internal_error')
     expect(result.error.message).toContain('storage exploded')
+  })
+})
+
+describe('listActions 端点（契约 11 端点表：注册动作提示，票 31）', () => {
+  it('空 payload 或 undefined → 返回服务快照 { ok: true, value: Array<{ name, description? }> }', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({
+        listActions: () => [
+          { name: 'alpha.ping' },
+          { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+        ],
+      }),
+    })
+    await expect(handler('listActions', {}, undefined, {})).resolves.toEqual({
+      ok: true,
+      value: [
+        { name: 'alpha.ping' },
+        { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+      ],
+    })
+    await expect(handler('listActions', undefined, undefined, {})).resolves.toEqual({
+      ok: true,
+      value: [
+        { name: 'alpha.ping' },
+        { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+      ],
+    })
+  })
+
+  it('多余字段 → script_input_invalid（reason: unexpected + 准确 field）；非对象 payload → format', async () => {
+    const handler = createBridgeHandler({ service: fakeService({ listActions: () => [] }) })
+    const extra = await handler('listActions', { deep: 1 }, undefined, {})
+    expect(extra).toEqual({
+      ok: false,
+      error: {
+        code: 'script_input_invalid',
+        message: expect.stringContaining('deep'),
+        details: { field: 'deep', reason: 'unexpected' },
+      },
+    })
+    const notObject = await handler('listActions', 'x', undefined, {})
+    expect(notObject.ok).toBe(false)
+    expect(notObject.error.details).toEqual({ field: 'payload', reason: 'format' })
   })
 })
 

@@ -488,6 +488,47 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     view.unmount()
   })
 
+  it('票 31 注册动作展示：plugin 动作成功 + report() 警告、timeout 错误码、可用注册动作（name + description）', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView({
+              status: 'partial',
+              matchedRule: 0,
+              usedFallback: false,
+              actions: [
+                { name: 'page', kind: 'plugin', status: 'succeeded', warnings: ['已呼叫值班'] },
+                { name: 'slow-page', kind: 'plugin', status: 'failed', error: { code: 'timeout', message: "plugin 动作 'slow-page'（ops.slow）超过 2 秒未完成" } },
+              ],
+            }),
+          ],
+          availableActions: [
+            { name: 'alpha.ping' },
+            { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+          ],
+        },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    // 动作段：plugin 成功与失败（timeout 错误码）、report() 警告
+    expect(modalText).toContain('page')
+    expect(modalText).toContain('slow-page')
+    expect(modalText).toContain('timeout')
+    expect(modalText).toContain('已呼叫值班')
+    // 可用注册动作段：name 与 description
+    expect(modalText).toContain('可用注册动作')
+    expect(modalText).toContain('ops.oncall')
+    expect(modalText).toContain('按 severity 呼叫值班')
+    expect(modalText).toContain('alpha.ping')
+    view.unmount()
+  })
+
   it('活动 run 轮询：模态打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
     vi.useFakeTimers()
     try {
