@@ -4,9 +4,10 @@ Web 面板是 renderer 进程的 client 插件，不能直接取得 Host Context
 
 ## 桥接形态
 
-- **独立 Connection channel 的一元 RPC**：Host 适配器 `connection.rpc.handle('/script-orchestrator', handler)`；浏览器侧 `ctx.connection.rpc.call('/script-orchestrator', endpoint, payload, signal)`。
+- **独立 Connection channel 的一元 RPC**：契约语义为 `connection.rpc.handle('/script-orchestrator', handler)`；浏览器侧 `ctx.connection.rpc.call('/script-orchestrator', endpoint, payload, signal)`。
+- **实现备注（v0.1r，0.2.2-rc.1 实测）**：`connection.rpc.handle` 对第三方插件不可用——Cordis trace 把 `owner.webServer` 解析锚定到 client-connection 自身 fiber（其未注入 webServer），任何第三方插件调用必抛 `cannot get property "webServer" without inject`。实现改为**内联等价挂载**：`webServer.register` prefix 路由 + `connection.admit`（认证/fence 复用内建）+ 与宿主 `rpcFetchHandler` 对齐的 envelope 协议（client-request / server-response / gateway bad-request / handler failure）。浏览器侧调用面与错误形状零改动。
 - 不使用 Typert Remote（不要求 `./typert` 生成物与 `remote.$mount` 注册链）；不占用保留 channel `/api`。
-- 认证与 Host/Origin fence 完全复用 `connection.rpc.handle` 内建机制；v0.1 不加自定义 token、不做面板级权限。
+- 认证与 Host/Origin fence 复用 `connection.admit` 内建机制；v0.1 不加自定义 token、不做面板级权限。
 
 ## 端点表
 
@@ -18,6 +19,7 @@ Web 面板是 renderer 进程的 client 插件，不能直接取得 Host Context
 | `edit` | `EditInput`（四 action） | `OrchestrationView \| DeleteResult` | 暂停/恢复直接 `action: 'pause' / 'resume'`，CAS 全 action 生效 |
 | `run` | `{ id }` | `{ runId, status }` | **受理即返回**，`status` 可为非终态；不等结算 |
 | `listActions` | `{}` | `Array<{ name, description? }>` | 编辑器的注册动作提示 |
+| `spill` | `{ runId, stream: 'stdout' \| 'stderr' }` | `{ runId, stream, path, content, bytes }` | run 的完整溢写输出（排障读面，v0.1r）；溢写缺失/文件不存在/不可读 → `script_storage_unavailable`（`details.cause` 区分），面板显示「文件已不存在」 |
 
 - 参数与返回**原样复用服务契约形状**（零翻译 DTO，全部无损 JSON）；动作提示按需另调 `listActions`，不混入 `view` 返回。
 - run 的进度与结果一律经 `view` 回读，`view()` 的 run 记录是最终事实。

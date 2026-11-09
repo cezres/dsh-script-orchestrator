@@ -193,9 +193,13 @@ try {
   Stop-HeadlessHost $host2.Port
   $unitDir = Join-Path $SbxHome 'storages\script_orchestrator'
   New-Item -ItemType Directory -Force -Path (Join-Path $unitDir 'orchestrations'), (Join-Path $unitDir 'runs') | Out-Null
-  Set-Content (Join-Path $unitDir 'orchestrations\probe-ok.json') '{"version":1,"record":{"id":"probe-ok","title":"探测记录","status":"active"}}' -Encoding utf8NoBOM
+  Set-Content (Join-Path $unitDir 'orchestrations\probe-ok.json') '{"version":1,"record":{"id":"probe-ok","title":"探测记录","enabled":true,"overlap":"skip","trigger":{"kind":"every","everySeconds":300,"mode":"fixed-rate"},"script":{"command":"pwsh","args":[],"env":{}},"judge":{"rules":[],"fallback":[]},"actions":{},"createdAt":"2026-11-09T00:00:00.000Z","updatedAt":"2026-11-09T00:00:00.000Z","status":"active","nextOccurrence":null}}' -Encoding utf8NoBOM
+  # 票 25/26 起编排与 run 记录 schema 按实际形状收紧（strict）；票 35 起启动维护含孤儿清理/保留对账
   Set-Content (Join-Path $unitDir 'orchestrations\probe-bad.json') '{"version":1,"record":{"id":"probe-other"}}' -Encoding utf8NoBOM
-  Set-Content (Join-Path $unitDir 'runs\run-aaaaaaaa.json') '{"version":1,"record":{"runId":"run-aaaaaaaa"}}' -Encoding utf8NoBOM
+  # 最小骨架旧记录（票 24 时代形状）→ 宿主 schema 校验 backup-and-skip，静默缺席
+  Set-Content (Join-Path $unitDir 'orchestrations\probe-legacy.json') '{"version":1,"record":{"id":"probe-legacy","title":"旧骨架","status":"active"}}' -Encoding utf8NoBOM
+  # 有父的非终态 run：启动维护标 interrupted，记录保留（不属孤儿）
+  Set-Content (Join-Path $unitDir 'runs\run-aaaaaaaa.json') '{"version":1,"record":{"runId":"run-aaaaaaaa","orchestrationId":"probe-ok","trigger":"manual","scheduledAt":"2026-11-09T00:00:00.000Z","startedAt":null,"settledAt":null,"status":"queued","skipReason":null,"script":{"command":"pwsh","exitCode":null,"signal":null,"timedOut":false,"durationMs":0,"stdoutTail":"","stderrTail":"","truncated":false},"matchedRule":null,"usedFallback":false,"actions":[]}}' -Encoding utf8NoBOM
   $hostP = Start-HeadlessHost -logStem (Join-Path $Sandbox 'bootp')
   $sessionP = Get-AuthenticatedSession $hostP.Url
   $rpcP = Invoke-ListRpc $sessionP $hostP.Port
@@ -203,8 +207,11 @@ try {
   Check ([bool](($rpcP.result.ok -eq $true) -and (@($vP.items).Count -eq 1) -and ($vP.items[0].id -eq 'probe-ok'))) "探针启动后 list 恰含 probe-ok（实际：$($vP | ConvertTo-Json -Compress)）"
   Stop-HeadlessHost $hostP.Port
   Check (-not (Test-Path (Join-Path $unitDir 'orchestrations\probe-bad.json'))) '键≠id 的记录已按坏记录移除（probe-bad.json 消失）'
-  Check (Test-Path (Join-Path $unitDir 'orchestrations\probe-ok.json')) '键=id 的记录保留（probe-ok.json 存在）'
-  Check (Test-Path (Join-Path $unitDir 'runs\run-aaaaaaaa.json')) 'runs 表记录保留（run-aaaaaaaa.json 存在）'
+  Check (Test-Path (Join-Path $unitDir 'orchestrations\probe-ok.json')) '键=id 的合法记录保留（probe-ok.json 存在）'
+  Check (-not (@($vP.items) | Where-Object { $_.id -eq 'probe-legacy' })) '最小骨架旧记录按宿主语义静默缺席（backup-and-skip）'
+  Check (Test-Path (Join-Path $unitDir 'runs\run-aaaaaaaa.json')) 'runs 表记录保留（有父的非终态 run 不属孤儿）'
+  $runAfter = (Get-Content (Join-Path $unitDir 'runs\run-aaaaaaaa.json') -Raw | ConvertFrom-Json).record
+  Check ($runAfter.status -eq 'interrupted') '启动维护：非终态 run 已标 interrupted（契约 08「启动维护」①）'
   # 探针数据清理，恢复干净 home（后续卸载验证不依赖存储内容）
   Remove-Item -Recurse -Force (Join-Path $SbxHome 'storages') -ErrorAction SilentlyContinue
 

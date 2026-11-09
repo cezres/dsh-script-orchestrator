@@ -36,7 +36,7 @@
 
 | 类别 | 规则 |
 |---|---|
-| `dependencies`（自装） | 最小集 = `@deepseek-ai/dsh-util-time`（锁 `>=0.2.2-rc.1`，防 0.1.x 只有时区校验）＋ `@deepseek-ai/schemastery`（`~3.19.0`，用于同步 Config；归属见 [核实工作区插件、工具与配置机制](../../.scratch/script-orchestrator/issues/04-research-plugin-runtime.md)） |
+| `dependencies`（自装） | 最小集 = `@deepseek-ai/dsh-util-time`（锁 `>=0.2.2-rc.1`，防 0.1.x 只有时区校验）＋ `@deepseek-ai/schemastery`（`~3.19.0`，用于同步 Config；归属见 [核实工作区插件、工具与配置机制](../../.scratch/script-orchestrator/issues/04-research-plugin-runtime.md)）＋ `zod`（`4.4.3`，v0.1r 补：`dsh-storage-domain` 的 `domainTable` 约定 `valueSchema.parse` 为 zod API，记录 schema 必须用 zod；schemastery 无 `.parse`，仅用于同步 Config） |
 | `peerDependencies` | 仅在源码实际 import 时列：`@cordisjs/*` 框架、dsh-tools 等；`validateJsonSchemaValue` 从 `@deepseek-ai/dsh-tools` 公开根导入并列 peer（随宿主 `0.2.2-rc.1`）；client 的 react 走页面 seed（经 ModuleLoader），**无 npm 依赖** |
 | 禁止项 | 不为少量常量 import `@deepseek-ai/dsh-agent` 内部（内联）；只依赖公开 export，`lib/*` 内部路径是硬边界 |
 
