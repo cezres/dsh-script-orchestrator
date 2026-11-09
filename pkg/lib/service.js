@@ -288,9 +288,14 @@ async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMut
     // 修改 enabled 走暂停/恢复规则（契约 02「编辑」）：false = 暂停（任何原状态）
     status = 'paused'
     nextIso = null
-  } else if (schedulingChanged || (enabledChanged && patch.enabled === true && current.status !== 'active')) {
-    // 调度字段变化 → 编辑表重建；enabled:true 对非 active 编排 = 恢复语义（恢复表与编辑表
-    // 在「无未结算旧自动 run」时同一锚点 now）；ended 可经重算触发复活为 active（契约 07）
+  } else if (current.status === 'paused' && !(enabledChanged && patch.enabled === true)) {
+    // 显式暂停不被字段编辑意外解除（契约空白，语义连贯性解读）：调度编辑不预写计划
+    //（paused 的 nextOccurrence 恒 null，契约 09）；恢复时按 resume 表用新配置重算
+    status = 'paused'
+    nextIso = null
+  } else if (schedulingChanged || (enabledChanged && patch.enabled === true)) {
+    // 重算计划：active 因调度变化重锚（编辑表）；paused 经 enabled:true = 恢复语义（恢复表，
+    // 与编辑表在无未结算旧自动 run 时同锚点 now）；ended 经重算触发复活为 active（契约 07）
     const hasUnsettledAutoRun = hasUnsettledAutomaticRun(storage.table('runs'), current.id)
     if (hasUnsettledAutoRun && normalized.trigger.kind === 'every' && normalized.trigger.mode === 'fixed-delay') {
       // fixed-delay 旧自动 run 未结算：保持 null，旧 run 结算后按新 everySeconds 推进（编辑代际）
@@ -299,15 +304,21 @@ async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMut
     } else {
       const nextMs = nextOccurrence(normalized.trigger, nowMs)
       if (nextMs === null) {
-        // 更新路径的五年无解拒绝（契约 02「cron 子集」；与 create 同一规则）
-        throw inputInvalid(
-          'trigger.expression',
-          'no-occurrence',
-          'cron 表达式在编辑时刻起的 5 年内没有任何有效计划时刻',
-        )
+        if (schedulingChanged) {
+          // 更新路径的五年无解拒绝（契约 02「cron 子集」；与 create 同一规则：新配置永不有效）
+          throw inputInvalid(
+            'trigger.expression',
+            'no-occurrence',
+            'cron 表达式在编辑时刻起的 5 年内没有任何有效计划时刻',
+          )
+        }
+        // 配置未变而运行期意外无解（ended 编排 enable 尝试复活）：保持 ended 防御终态
+        status = 'ended'
+        nextIso = null
+      } else {
+        status = 'active'
+        nextIso = iso(nextMs)
       }
-      status = 'active'
-      nextIso = iso(nextMs)
     }
   }
   // 其余情形（非调度编辑且 enabled 未变/enabled:true 且原已 active）：状态与计划原样保留

@@ -834,3 +834,187 @@ describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、�
     expect(storage.snapshot().orchestrations.feb29.status).toBe('ended')
   })
 })
+
+describe('edit · update 调度重锚与编辑代际（契约 02「编辑」表；票 28）', () => {
+  it('调度字段变化（everySeconds/mode/expression/timeZone/kind）→ 编辑表重建；fixed-rate = editedAt + 新间隔', async () => {
+    let t = NOW
+    const { service } = makeService({ now: () => t })
+    await service.create(baseInput()) // next = NOW+300s
+    t = NOW + 100_000
+    const view = await service.edit({ id: 'log-rotate', action: 'update', patch: { trigger: { kind: 'every', everySeconds: 600, mode: 'fixed-rate' } } })
+    expect(view.trigger).toEqual({ kind: 'every', everySeconds: 600, mode: 'fixed-rate' })
+    expect(view.nextOccurrence).toBe(iso(NOW + 100_000 + 600_000)) // editedAt + 新 everySeconds
+    // cron → 严格晚于 editedAt 的下一匹配
+    t = NOW + 200_000
+    const cronView = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' } },
+    })
+    // editedAt = NOW+200s = 2026-09-21T14:16:40Z = 上海 22:16 → 次日本地 03:00 = 09-21T19:00Z
+    expect(cronView.trigger).toEqual({ kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' })
+    expect(cronView.nextOccurrence).toBe('2026-09-21T19:00:00.000Z')
+    // 相同值的 trigger（内容不变）不重锚：nextOccurrence 保持
+    const sameView = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' } },
+    })
+    expect(sameView.nextOccurrence).toBe('2026-09-21T19:00:00.000Z')
+  })
+
+  it('update 更新路径 cron 五年无解 → no-occurrence 拒绝且不写库（票 27 留的单点接入）', async () => {
+    const { service, storage, emitted } = makeService()
+    await service.create(baseInput())
+    await expect(
+      service.edit({ id: 'log-rotate', action: 'update', patch: { trigger: { kind: 'cron', expression: '0 3 30 2 *', timeZone: 'UTC' } } }),
+    ).rejects.toMatchObject({ details: { field: 'trigger.expression', reason: 'no-occurrence' } })
+    expect(storage.snapshot().orchestrations['log-rotate'].trigger.kind).toBe('every')
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('update 的 enabled 走暂停/恢复规则：true→false 暂停；false→true 恢复重锚', async () => {
+    let t = NOW
+    const { service } = makeService({ now: () => t })
+    await service.create(baseInput())
+    t = NOW + 50_000
+    const paused = await service.edit({ id: 'log-rotate', action: 'update', patch: { enabled: false } })
+    expect(paused.status).toBe('paused')
+    expect(paused.nextOccurrence).toBeNull()
+    expect(paused.enabled).toBe(false)
+    t = NOW + 200_000
+    const resumed = await service.edit({ id: 'log-rotate', action: 'update', patch: { enabled: true } })
+    expect(resumed.status).toBe('active')
+    expect(resumed.nextOccurrence).toBe(iso(NOW + 200_000 + 300_000)) // 恢复表：resumedAt + everySeconds
+    expect(resumed.enabled).toBe(true)
+  })
+
+  it('paused 编排的非调度编辑不解暂停：状态与 nextOccurrence 保持；调度编辑也不预写计划（恢复时按新配置重算）', async () => {
+    let t = NOW
+    const { service } = makeService({ now: () => t })
+    await service.create({ ...baseInput(), enabled: false }) // paused
+    const titled = await service.edit({ id: 'log-rotate', action: 'update', patch: { title: 'renamed' } })
+    expect(titled.status).toBe('paused')
+    expect(titled.nextOccurrence).toBeNull()
+    const schedEdit = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { trigger: { kind: 'every', everySeconds: 900, mode: 'fixed-rate' } },
+    })
+    expect(schedEdit.status).toBe('paused') // 显式暂停不被字段编辑意外解除
+    expect(schedEdit.nextOccurrence).toBeNull()
+    // 恢复时按新配置重锚
+    const resumed = await service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(resumed.status).toBe('active')
+    expect(Date.parse(resumed.nextOccurrence)).toBeGreaterThan(NOW)
+  })
+
+  it('ended 可经重算触发复活为 active（契约 07）；非调度编辑不复活', async () => {
+    let t = NOW
+    const { service, storage } = makeService({ now: () => t })
+    await service.create(baseInput())
+    storage.table('orchestrations').put('log-rotate', {
+      ...storage.snapshot().orchestrations['log-rotate'],
+      status: 'ended',
+      nextOccurrence: null,
+    })
+    const nonSched = await service.edit({ id: 'log-rotate', action: 'update', patch: { title: 'still ended' } })
+    expect(nonSched.status).toBe('ended')
+    expect(nonSched.nextOccurrence).toBeNull()
+    t = NOW + 100_000
+    const revived = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { trigger: { kind: 'every', everySeconds: 120, mode: 'fixed-rate' } },
+    })
+    expect(revived.status).toBe('active')
+    expect(revived.nextOccurrence).toBe(iso(NOW + 100_000 + 120_000))
+  })
+
+  it('fixed-delay 调度编辑且旧自动 run 未结算：保持 null；旧 run 结算后按新 everySeconds 推进（编辑代际）', async () => {
+    // 本用例打在 runner 集成面：结算推进用「当前持久 trigger」＝编辑代际防线（runner 既有实现），
+    // 此处锚定 service 侧「编辑时保持 null」与其协同结果
+    let t = NOW
+    const storage = makeStorage()
+    const emitted = []
+    const queue = new ServiceQueue()
+    const { createRunner } = await import('../lib/runner.js')
+    const { service } = (() => {
+      const service = createManagementService({
+        storage,
+        queue,
+        config: { maxRunsPerOrchestration: 100 },
+        now: () => t,
+        emit: (name, payload) => emitted.push([name, payload]),
+        logger: { error: () => {}, warn: () => {} },
+      })
+      return { service }
+    })()
+    let resolveDone
+    const subprocess = {
+      spawn: () => ({
+        done: new Promise((resolve) => { resolveDone = resolve }),
+        terminate: () => resolveDone({ exitCode: 1, signal: null }),
+        waitForExit: () => Promise.resolve(true),
+        collected: {
+          stdout: { readFrom: () => ({ text: '', lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', lossy: false }) },
+        },
+      }),
+    }
+    const runner = createRunner({
+      storage,
+      queue,
+      subprocess,
+      config: { maxConcurrentRuns: 2, defaultTimeoutSeconds: 300, maxOutputBytes: 262144, maxSpillBytes: 8388608, allowedRoots: [] },
+      emit: (name, payload) => emitted.push([name, payload]),
+      now: () => t,
+      logger: { error: () => {}, warn: () => {} },
+      fs: { stat: async () => ({ isDirectory: () => true }) },
+    })
+    await service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } })
+    // 模拟旧自动 run 在途（手动落一条 queued 的自动 run 并泵起来）
+    await runner.requestRun({ orchestrationId: 'log-rotate', trigger: 'every', scheduledAtMs: NOW })
+    // 触发编辑（everySeconds 300 → 120，仍是 fixed-delay）
+    const view = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { trigger: { kind: 'every', everySeconds: 120, mode: 'fixed-delay' } },
+    })
+    expect(view.trigger.everySeconds).toBe(120)
+    expect(view.nextOccurrence).toBeNull() // 旧自动 run 未结算：保持 null（契约 02 编辑表）
+    // 旧 run 结算（t = NOW+10s）：advanceFixedDelayIfDue 用当前（新）everySeconds 推进
+    t = NOW + 10_000
+    resolveDone({ exitCode: 0, signal: null })
+    await runner.waitIdle()
+    const after = storage.snapshot().orchestrations['log-rotate']
+    expect(after.trigger.everySeconds).toBe(120)
+    const nextMs = Date.parse(after.nextOccurrence)
+    expect(Math.abs(nextMs - (NOW + 10_000 + 120_000))).toBeLessThan(1_000) // settledAt + 新 everySeconds
+  })
+
+  it('旧 run 结算不覆盖编辑后的 fixed-rate 计划（fixed-rate 无结算推进，天然满足；锚定行为）', async () => {
+    // fixed-rate 的推进只发生在调度器 fire（沿 scheduledAt 相位），run 结算从不写 nextOccurrence
+    let t = NOW
+    const { service, storage } = makeService({ now: () => t })
+    await service.create(baseInput()) // fixed-rate, next=NOW+300s
+    storage.table('runs').put('run-cccccccc', {
+      runId: 'run-cccccccc',
+      orchestrationId: 'log-rotate',
+      trigger: 'every',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: null,
+      status: 'running',
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    })
+    t = NOW + 100_000
+    const view = await service.edit({ id: 'log-rotate', action: 'update', patch: { trigger: { kind: 'every', everySeconds: 900, mode: 'fixed-rate' } } })
+    expect(view.nextOccurrence).toBe(iso(NOW + 100_000 + 900_000))
+    expect(storage.snapshot().orchestrations['log-rotate'].nextOccurrence).toBe(iso(NOW + 100_000 + 900_000))
+  })
+})
