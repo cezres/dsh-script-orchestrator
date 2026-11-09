@@ -4,7 +4,7 @@
 
 **Blocked by:** 27 — 通过 cron 编排按计划执行
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] `script_edit` 支持 update/pause/resume，更新已支持字段时完成静态校验、持久化和写后回读；仅调度字段变化重建计划，非调度编辑不重锚。
 - [ ] `expectedUpdatedAt` 对 update/pause/resume 做乐观并发检查，冲突返回 `script_conflict`；pause/resume 按状态设置语义幂等 no-op，不错误重锚 fixed-delay。
