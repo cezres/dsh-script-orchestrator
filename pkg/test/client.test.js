@@ -241,6 +241,29 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     expect(options.prompt).toContain('周日')
   })
 
+  it('startEditSession 绑定：经 ctx.uiWorkspace.startSession 注入编辑 prompt（含编排 id、script_view 先看、script_edit 修改）', async () => {
+    const { exports } = await loadClientBundle()
+    const sessions = []
+    const { registrations } = mountRegistrations(exports, {
+      uiWorkspace: {
+        startSession: (...args) => {
+          sessions.push(args)
+        },
+      },
+    })
+    const props = panelEntry(registrations).definition.inject()
+    expect(typeof props.startEditSession).toBe('function')
+    props.startEditSession('log-rotate', 'log rotate')
+    expect(sessions).toHaveLength(1)
+    const [sessionId, options] = sessions[0]
+    expect(sessionId).toBeUndefined()
+    expect(options.whenDraftExists).toBe('append')
+    expect(options.prompt).toContain('log-rotate')
+    expect(options.prompt).toContain('script_view')
+    expect(options.prompt).toContain('script_edit')
+    expect(options.prompt).toContain('当前配置')
+  })
+
   it('面板渲染列表项：every 触发摘要、状态、下次时刻', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
@@ -289,6 +312,36 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
       close.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
     })
     expect(view.modal()).toBeFalsy()
+    view.unmount()
+  })
+
+  it('详情模态「编辑」按钮：点击 → startEditSession（id/title），不关闭模态、不额外回读（既有按钮与轮询不受影响）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const started = []
+    const call = (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      return Promise.resolve(endpoint === 'list' ? listResult() : viewResult())
+    }
+    const view = await renderPanel({
+      call,
+      subscribeReset: () => () => {},
+      startEditSession: (id, title) => started.push([id, title]),
+    })
+    await view.clickRow('log rotate')
+    const modal = view.modal()
+    const edit = [...modal.querySelectorAll('button')].find((b) => b.textContent === '编辑')
+    expect(edit, "button '编辑'").toBeTruthy()
+    expect([...modal.querySelectorAll('button')].some((b) => b.textContent === '关闭')).toBe(true)
+    const viewCallsBefore = calls.filter(([endpoint]) => endpoint === 'view').length
+    await act(async () => {
+      edit.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(started).toEqual([['log-rotate', 'log rotate']])
+    expect(view.modal()).toBeTruthy() // 编辑入口不改面板状态（不关闭模态）
+    expect(calls.filter(([endpoint]) => endpoint === 'view')).toHaveLength(viewCallsBefore) // 不额外回读
     view.unmount()
   })
 
