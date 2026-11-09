@@ -680,3 +680,157 @@ describe('edit · 形状校验、乐观并发与 update 基本路径（契约 06
     ).rejects.toMatchObject({ details: { field: 'trigger.everySeconds', reason: 'too-frequent' } })
   })
 })
+
+describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、编辑、暂停与恢复」；票 28）', () => {
+  async function makePaused(over = {}) {
+    let t = over.t0 ?? NOW
+    const world = makeService({ now: () => t })
+    const created = await world.service.create({ ...baseInput(), enabled: false, ...over.input })
+    return { ...world, created, setTime: (ms) => { t = ms } }
+  }
+
+  it('pause 仅从 active 生效：paused → paused 与 ended → pause 均幂等 no-op（不改记录、不发 changed、不改 updatedAt）', async () => {
+    const world = await makePaused()
+    const before = { ...world.storage.snapshot().orchestrations['log-rotate'] }
+    const view = await world.service.edit({ id: 'log-rotate', action: 'pause' })
+    expect(view.status).toBe('paused')
+    expect(view).toEqual(before)
+    expect(world.storage.snapshot().orchestrations['log-rotate']).toEqual(before)
+    expect(world.emitted).toEqual([['script-orchestrator/changed', undefined]]) // 仅 create 那条
+    // ended 同样 no-op
+    world.storage.table('orchestrations').put('log-rotate', { ...before, status: 'ended' })
+    const endedView = await world.service.edit({ id: 'log-rotate', action: 'pause' })
+    expect(endedView.status).toBe('ended')
+    expect(world.emitted).toHaveLength(1)
+  })
+
+  it('pause 对 active 生效：nextOccurrence=null、paused、updatedAt 推进、发 changed', async () => {
+    let t = NOW
+    const { service, storage, emitted } = makeService({ now: () => t })
+    await service.create(baseInput())
+    t = NOW + 30_000
+    const view = await service.edit({ id: 'log-rotate', action: 'pause' })
+    expect(view.status).toBe('paused')
+    expect(view.nextOccurrence).toBeNull()
+    expect(view.updatedAt).toBe(iso(NOW + 30_000))
+    expect(storage.snapshot().orchestrations['log-rotate'].status).toBe('paused')
+    expect(emitted).toHaveLength(2)
+  })
+
+  it('resume 仅从 paused 生效：active/ended 幂等 no-op（不重锚 fixed-delay）', async () => {
+    let t = NOW
+    const { service, emitted } = makeService({ now: () => t })
+    await service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } })
+    // active 上的 resume：no-op（fixed-delay 未被错误重锚——nextOccurrence 保持不变）
+    const activeView = await service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(activeView.status).toBe('active')
+    expect(activeView.nextOccurrence).toBe(iso(NOW + 300_000))
+    expect(emitted).toHaveLength(1)
+    // ended 上的 resume：no-op
+    const paused = await service.edit({ id: 'log-rotate', action: 'pause' })
+    expect(paused.status).toBe('paused')
+    // 手工置 ended 后 resume → no-op
+    const storage2 = makeService({ now: () => t })
+    await storage2.service.create(baseInput())
+    storage2.storage.table('orchestrations').put('log-rotate', {
+      ...storage2.storage.snapshot().orchestrations['log-rotate'],
+      status: 'ended',
+      nextOccurrence: null,
+    })
+    const endedResume = await storage2.service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(endedResume.status).toBe('ended')
+    expect(endedResume.nextOccurrence).toBeNull()
+    expect(storage2.emitted).toHaveLength(1)
+  })
+
+  it('resume 恢复表：fixed-rate 从 resumedAt 重新锚定；不补暂停期', async () => {
+    const world = await makePaused()
+    world.setTime(NOW + 600_000) // 暂停 10 分钟后恢复
+    const view = await world.service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(view.status).toBe('active')
+    expect(view.nextOccurrence).toBe(iso(NOW + 600_000 + 300_000)) // resumedAt + everySeconds，不补暂停期
+    expect(view.updatedAt).toBe(iso(NOW + 600_000))
+  })
+
+  it('resume 恢复表：cron 取严格晚于 resumedAt 的下一匹配', async () => {
+    let t = Date.parse('2026-09-21T14:13:20.000Z')
+    const { service } = makeService({ now: () => t })
+    await service.create({
+      ...baseInput(),
+      enabled: false,
+      trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' },
+    })
+    t = Date.parse('2026-09-22T10:00:00.000Z') // 上海本地 18:00
+    const view = await service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(view.status).toBe('active')
+    expect(view.nextOccurrence).toBe('2026-09-22T19:00:00.000Z') // 次日本地 03:00
+  })
+
+  it('resume 恢复表：fixed-delay 无未结算旧自动 run → resumedAt + everySeconds；有 → 保持 null 等结算', async () => {
+    const world = await makePaused({ input: { trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } } })
+    world.setTime(NOW + 60_000)
+    const view = await world.service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(view.nextOccurrence).toBe(iso(NOW + 60_000 + 300_000))
+    // 有未结算旧自动 run：保持 null（结算后由 runner 以当前 everySeconds 推进）
+    const world2 = await makePaused({ input: { trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } } })
+    world2.storage.table('runs').put('run-aaaaaaaa', {
+      runId: 'run-aaaaaaaa',
+      orchestrationId: 'log-rotate',
+      trigger: 'every',
+      scheduledAt: iso(NOW),
+      startedAt: null,
+      settledAt: null,
+      status: 'queued',
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    })
+    const view2 = await world2.service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(view2.status).toBe('active')
+    expect(view2.nextOccurrence).toBeNull()
+    // 手动 run 在途不阻塞恢复锚定（手动不推进序列）
+    const world3 = await makePaused({ input: { trigger: { kind: 'every', everySeconds: 300, mode: 'fixed-delay' } } })
+    world3.storage.table('runs').put('run-bbbbbbbb', {
+      runId: 'run-bbbbbbbb',
+      orchestrationId: 'log-rotate',
+      trigger: 'manual',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: null,
+      status: 'running',
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    })
+    const view3 = await world3.service.edit({ id: 'log-rotate', action: 'resume' })
+    expect(view3.nextOccurrence).toBe(iso(NOW + 300_000))
+  })
+
+  it('resume 运行期意外无解（cron）→ 转为 ended 防御终态（契约 02「恢复」）', async () => {
+    let t = Date.parse('2097-03-01T00:00:00.000Z')
+    const { service, storage } = makeService({ now: () => t })
+    // 直接落一条 paused 的 2/29 cron 编排（创建期在 2097 视角会被拒绝，故模拟「曾经合法、时过境迁」）
+    storage.table('orchestrations').put('feb29', {
+      id: 'feb29',
+      title: '2月29',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'cron', expression: '0 3 29 2 *', timeZone: 'UTC' },
+      script: { command: 'pwsh', args: [], env: {} },
+      judge: { rules: [], fallback: [] },
+      actions: {},
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      status: 'paused',
+      nextOccurrence: null,
+    })
+    const view = await service.edit({ id: 'feb29', action: 'resume' })
+    expect(view.status).toBe('ended') // 下一个 2/29 是 2104，距 resumedAt 超 5 年窗口
+    expect(view.nextOccurrence).toBeNull()
+    expect(storage.snapshot().orchestrations.feb29.status).toBe('ended')
+  })
+})

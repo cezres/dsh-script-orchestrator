@@ -221,9 +221,26 @@ export function createManagementService({ storage, queue, config, now, emit, log
           return updated
         }
         if (action === 'resume') {
-          // 状态设置语义（契约 09）：仅从 paused 生效；其余状态幂等 no-op。
-          // 恢复重锚（契约 02「恢复」表）随切片 2 落地，先返回当前视图占位。
-          return current
+          // 状态设置语义（契约 09）：仅从 paused 生效；active/ended 幂等 no-op（不重锚、不写库）
+          if (current.status !== 'paused') return current
+          // 契约 02「恢复」表：不补暂停期——cron 取严格晚于 resumedAt 的下一匹配，
+          // fixed-rate 从 resumedAt 加间隔，fixed-delay 视未结算旧自动 run 决定锚定或等待。
+          // 运行期意外无解（含 5 年窗口外）→ ended 防御终态。
+          const resumedMs = currentTime()
+          const hasUnsettledAutoRun = hasUnsettledAutomaticRun(storage.table('runs'), id)
+          const waitingForOldRun =
+            hasUnsettledAutoRun && current.trigger.kind === 'every' && current.trigger.mode === 'fixed-delay'
+          const nextMs = waitingForOldRun ? null : nextOccurrence(current.trigger, resumedMs)
+          const updated = {
+            ...current,
+            status: nextMs === null && !waitingForOldRun ? 'ended' : 'active',
+            nextOccurrence: nextMs === null ? null : iso(nextMs),
+            updatedAt: iso(resumedMs),
+          }
+          await orchestrations.put(id, updated)
+          safeEmit('script-orchestrator/changed')
+          notifyMutation()
+          return updated
         }
         // action === 'update'
         return applyUpdate({
