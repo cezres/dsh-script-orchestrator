@@ -188,7 +188,7 @@ describe('插件入口（lib/index.js）', () => {
     expect(name).toBe('script-orchestrator')
   })
 
-  it('apply：打开存储域 → provide scriptOrchestrator（空 list 可用）→ 挂 /script-orchestrator 路由 → 注册三工具', async () => {
+  it('apply：打开存储域 → provide scriptOrchestrator（空 list 可用）→ 挂 /script-orchestrator 路由 → 注册五工具', async () => {
     const { ctx, calls, getRoute } = makeCtx()
     const it = plugin(ctx, {})
     const first = await it.next()
@@ -198,7 +198,7 @@ describe('插件入口（lib/index.js）', () => {
     expect(calls.routes).toHaveLength(1)
     expect(calls.routes[0].kind).toBe('prefix')
     expect(calls.routes[0].path).toBe('/script-orchestrator')
-    expect(calls.tools.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view'])
+    expect(calls.tools.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view', 'script_edit', 'script_run'])
     const service = calls.provided[0][1]
     await expect(service.list()).resolves.toEqual({ items: [], total: 0, nextOffset: null })
     const rpc = await callRoute(
@@ -681,6 +681,8 @@ describe('插件入口（lib/index.js）', () => {
     const first = await it.next()
     await first.value()
     expect(calls.closeOrder).toEqual([
+      'tool:script_run',
+      'tool:script_edit',
       'tool:script_view',
       'tool:script_list',
       'tool:script_create',
