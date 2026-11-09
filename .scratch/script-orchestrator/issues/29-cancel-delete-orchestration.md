@@ -4,7 +4,7 @@
 
 **Blocked by:** 28 — 编辑触发、暂停/恢复并手动执行编排
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 工具 `exec.signal` 贯穿到 run：queued 直接 canceled、running 终止进程、judging 不响应、dispatching 停止剩余派发并保留已执行动作结果。
 - [ ] run 结算 canceled 且持久化后工具 Promise 才以宿主 `ABORTED` 静止；wait=false 已返回的 run 同样取消，`ABORTED_BEFORE_DISPATCH` 不产生 run 记录。
