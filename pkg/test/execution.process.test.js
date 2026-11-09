@@ -200,3 +200,36 @@ describe('正常退出后存活后代（Windows · 实际进程，票 26 验收�
     expect(run.script.exitCode).toBe(0)
   }, 30_000)
 })
+
+describe('输出溢写边界（Windows · 实际子进程，票 34：W2b 与 UTF-8）', () => {
+  it('超 spill cap 撤回：spill.maxBytes 500 + 3200 字节输出 → spillPath 缺省、truncated 仍 true、内存尾部不受影响（W2b）', async () => {
+    const ctx = makeRunner(
+      { script: { command: process.execPath, args: ['-e', 'for (let i = 0; i < 200; i++) console.log("line-" + String(i).padStart(4, "0"))'], env: {} } },
+      { maxOutputBytes: 500, maxSpillBytes: 500 },
+    )
+    const view = await ctx.runner.requestRun({ orchestrationId: 'proc', trigger: 'manual', scheduledAtMs: Date.now() })
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.script.truncated).toBe(true) // truncated 判定即 lossy，不受 spill 存在与否影响
+    expect(run.script.stdoutSpillPath).toBeUndefined() // 超 cap 撤回
+    expect(run.script.stdoutTail).toContain('line-0199') // 内存尾部不受影响
+  }, 30_000)
+
+  it('UTF-8 字节截断：多字节字符被切 → tail 为解码后文本末段、末行完整；maxSpillBytes=0 禁用溢写', async () => {
+    const ctx = makeRunner(
+      { script: { command: process.execPath, args: ['-e', 'for (let i = 0; i < 200; i++) console.log("中文" + String(i).padStart(4, "0"))'], env: {} } },
+      { maxOutputBytes: 500, maxSpillBytes: 0 },
+    )
+    const view = await ctx.runner.requestRun({ orchestrationId: 'proc', trigger: 'manual', scheduledAtMs: Date.now() })
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.script.truncated).toBe(true)
+    expect(run.script.stdoutSpillPath).toBeUndefined() // 0 = 禁用溢写，仅内存尾部
+    const tail = run.script.stdoutTail
+    expect(Array.from(tail).length).toBeLessThanOrEqual(2048) // tail 上限 = 解码后末 2048 code point
+    expect(tail).toContain('0199') // 末行仍在（尾部策略）
+    // 解码结果必须是有效文本：编码/解码往返一致（无孤立代理项；宿主按 UTF-8 字节边界安全截断）
+    expect(Buffer.from(tail, 'utf8').toString('utf8')).toBe(tail)
+    expect(tail).toContain('中文')
+  }, 30_000)
+})

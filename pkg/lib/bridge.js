@@ -176,12 +176,34 @@ function validateRunPayload(payload) {
 }
 
 /**
+ * spill 端点的最小形状校验：{ runId, stream }（票 34；读取 run 的完整溢写输出）。
+ * @param {unknown} payload
+ */
+function validateSpillPayload(payload) {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return invalid('payload', 'format', 'spill 的参数必须是对象')
+  }
+  for (const key of Object.keys(payload)) {
+    if (key !== 'runId' && key !== 'stream') {
+      return invalid(key, 'unexpected', `spill 不接受字段 '${key}'`)
+    }
+  }
+  if (!('runId' in payload)) return invalid('runId', 'missing', 'spill 缺少必填字段 runId')
+  if (typeof payload.runId !== 'string' || payload.runId.length === 0) {
+    return invalid('runId', 'format', 'runId 必须是非空字符串')
+  }
+  if (payload.stream !== 'stdout' && payload.stream !== 'stderr') {
+    return invalid('stream', 'invalid', "stream 必须是 'stdout' 或 'stderr'")
+  }
+  return null
+}
+
+/**
  * 建 /script-orchestrator 的 rpc.handle handler。
  * @param {object} deps
  * @param {object} deps.service 管理服务（ctx.scriptOrchestrator 实现面）
  */
-export function createBridgeHandler({ service }) {
-  const endpoints = {
+export function createBridgeHandler({ service }) {  const endpoints = {
     list: async (payload) => {
       const violation = validateListPayload(payload)
       if (violation) return violation
@@ -220,6 +242,12 @@ export function createBridgeHandler({ service }) {
         }
       }
       return { ok: true, value: service.listActions() }
+    },
+    // spill（票 34：读取 run 的完整溢写输出；排障读面，见票 34 Comments 的契约偏差）
+    spill: async (payload) => {
+      const violation = validateSpillPayload(payload)
+      if (violation) return violation
+      return { ok: true, value: await service.readSpill({ runId: payload.runId, stream: payload.stream }) }
     },
   }
   return async function bridgeHandler(endpoint, payload, _signal, _peer) {

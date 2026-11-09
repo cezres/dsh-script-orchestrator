@@ -471,3 +471,53 @@ describe('mountBridge（HTTP 挂载：webServer 路由 + connection.admit + enve
     expect(r.body).toContain('boom')
   })
 })
+
+describe('spill 端点（票 34：读取 run 的完整溢写输出；排障读面）', () => {
+  it("endpoint 'spill' 合法 payload → 服务值包装 { ok: true, value }", async () => {
+    const calls = []
+    const handler = createBridgeHandler({
+      service: fakeService({
+        readSpill: async (input) => {
+          calls.push(input)
+          return { runId: input.runId, stream: input.stream, path: 'C:/tmp/x.log', content: 'FULL', bytes: 4 }
+        },
+      }),
+    })
+    await expect(handler('spill', { runId: 'run-1', stream: 'stdout' }, undefined, {})).resolves.toEqual({
+      ok: true,
+      value: { runId: 'run-1', stream: 'stdout', path: 'C:/tmp/x.log', content: 'FULL', bytes: 4 },
+    })
+    expect(calls).toEqual([{ runId: 'run-1', stream: 'stdout' }])
+  })
+
+  it('最小形状校验：多余字段 / 缺 runId / 非法 stream / 非对象 → script_input_invalid', async () => {
+    const handler = createBridgeHandler({ service: fakeService() })
+    for (const payload of [
+      { runId: 'run-1', stream: 'stdout', extra: 1 },
+      { stream: 'stdout' },
+      { runId: 'run-1', stream: 'stderr2' },
+      { runId: '', stream: 'stdout' },
+      null,
+      ['run-1', 'stdout'],
+    ]) {
+      const result = await handler('spill', payload, undefined, {})
+      expect(result.ok).toBe(false)
+      expect(result.error.code).toBe('script_input_invalid')
+    }
+  })
+
+  it('文件已不存在（OrchestratorError）→ 契约错误 envelope（details 原样）', async () => {
+    const handler = createBridgeHandler({
+      service: fakeService({
+        readSpill: async () => {
+          throw new OrchestratorError('script_storage_unavailable', '溢写文件已不存在或不可读（ENOENT）', { cause: 'ENOENT' })
+        },
+      }),
+    })
+    const result = await handler('spill', { runId: 'run-1', stream: 'stdout' }, undefined, {})
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'script_storage_unavailable', message: '溢写文件已不存在或不可读（ENOENT）', details: { cause: 'ENOENT' } },
+    })
+  })
+})

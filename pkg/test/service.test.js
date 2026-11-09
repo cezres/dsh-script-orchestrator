@@ -1416,3 +1416,109 @@ describe('edit(action=delete) · 两阶段级联删除（契约 06「删除的�
     expect(logs).toEqual([])
   })
 })
+
+describe('readSpill（票 34：读取 run 的完整溢写输出；契约 03「输出收集」spill 注记）', () => {
+  const spillRun = (over = {}) => ({
+    runId: 'run-s1',
+    orchestrationId: 'o1',
+    trigger: 'every',
+    scheduledAt: iso(NOW),
+    startedAt: iso(NOW),
+    settledAt: iso(NOW),
+    status: 'partial',
+    skipReason: null,
+    script: {
+      command: 'pwsh',
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      durationMs: 10,
+      stdoutTail: 'tail',
+      stderrTail: '',
+      truncated: true,
+      stdoutSpillPath: 'C:/tmp/dsh-subprocess-x/out.log',
+      stderrSpillPath: 'C:/tmp/dsh-subprocess-x/err.log',
+    },
+    matchedRule: null,
+    usedFallback: false,
+    actions: [],
+    ...over,
+  })
+
+  it('读取 stdout 全文：返回 { runId, stream, path, content, bytes }（readFile utf8）', async () => {
+    const storage = makeStorage()
+    storage.table('runs').put('run-s1', spillRun())
+    const readCalls = []
+    const { service } = makeService({
+      storage,
+      fs: {
+        readFile: async (path, encoding) => {
+          readCalls.push([path, encoding])
+          return 'line-0000\nline-0199\n'
+        },
+      },
+    })
+    const result = await service.readSpill({ runId: 'run-s1', stream: 'stdout' })
+    expect(result).toEqual({
+      runId: 'run-s1',
+      stream: 'stdout',
+      path: 'C:/tmp/dsh-subprocess-x/out.log',
+      content: 'line-0000\nline-0199\n',
+      bytes: Buffer.byteLength('line-0000\nline-0199\n', 'utf8'),
+    })
+    expect(readCalls).toEqual([['C:/tmp/dsh-subprocess-x/out.log', 'utf8']])
+  })
+
+  it('读取 stderr 全文：取 stderrSpillPath', async () => {
+    const storage = makeStorage()
+    storage.table('runs').put('run-s1', spillRun())
+    const { service } = makeService({ storage, fs: { readFile: async () => 'stderr-full' } })
+    const result = await service.readSpill({ runId: 'run-s1', stream: 'stderr' })
+    expect(result.path).toBe('C:/tmp/dsh-subprocess-x/err.log')
+    expect(result.content).toBe('stderr-full')
+  })
+
+  it('未知 runId → script_unknown', async () => {
+    const { service } = makeService()
+    await expect(service.readSpill({ runId: 'nope', stream: 'stdout' })).rejects.toMatchObject({
+      code: 'script_unknown',
+      details: { id: 'nope' },
+    })
+  })
+
+  it('无溢写路径（未超内存上限 / 禁用溢写 / 超 cap 撤回）→ script_storage_unavailable（cause=spill-unavailable）', async () => {
+    const storage = makeStorage()
+    storage.table('runs').put('run-s2', spillRun({ runId: 'run-s2', script: { stdoutTail: '', stderrTail: '', truncated: false } }))
+    const { service } = makeService({ storage })
+    await expect(service.readSpill({ runId: 'run-s2', stream: 'stdout' })).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+      details: { cause: 'spill-unavailable' },
+    })
+  })
+
+  it('文件已不存在（ENOENT）→ script_storage_unavailable（cause=ENOENT；UI 呈现「文件已不存在」）', async () => {
+    const storage = makeStorage()
+    storage.table('runs').put('run-s1', spillRun())
+    const missing = Object.assign(new Error('no such file or directory'), { code: 'ENOENT' })
+    const { service } = makeService({ storage, fs: { readFile: async () => { throw missing } } })
+    await expect(service.readSpill({ runId: 'run-s1', stream: 'stdout' })).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+      details: { cause: 'ENOENT' },
+    })
+  })
+
+  it('参数非法（空 runId / 未知 stream）→ script_input_invalid', async () => {
+    const { service } = makeService()
+    await expect(service.readSpill({ runId: '', stream: 'stdout' })).rejects.toMatchObject({ code: 'script_input_invalid' })
+    await expect(service.readSpill({ runId: 'run-s1', stream: 'stdout2' })).rejects.toMatchObject({ code: 'script_input_invalid' })
+  })
+
+  it('未接线 fs → script_storage_unavailable（如实失败，不静默返回空）', async () => {
+    const storage = makeStorage()
+    storage.table('runs').put('run-s1', spillRun())
+    const { service } = makeService({ storage })
+    await expect(service.readSpill({ runId: 'run-s1', stream: 'stdout' })).rejects.toMatchObject({
+      code: 'script_storage_unavailable',
+    })
+  })
+})
