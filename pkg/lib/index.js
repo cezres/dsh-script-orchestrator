@@ -16,7 +16,7 @@ import { createActionRegistry } from './actions.js'
 
 export const name = 'script-orchestrator'
 export { Config }
-export const inject = ['storageDomain', 'connection', 'webServer', 'tools', 'subprocess']
+export const inject = ['storageDomain', 'connection', 'webServer', 'tools', 'subprocess', 'sessionController', 'sessions']
 
 export async function* apply(ctx, config) {
   const logger = ctx.logger('script-orchestrator')
@@ -48,6 +48,13 @@ export async function* apply(ctx, config) {
     hostCwd: process.cwd(),
     onOrchestrationMutated: () => rescheduleAfterMutation(),
     registry: actionRegistry,
+    // persistent session 动作投递面（契约 05/决策 21；票 32）：sessionController.create()
+    // 由 Host 代 compose 缺省 preset/model；sessionTitle 经 ctx.get 惰性取（可选服务）
+    sessionHost: {
+      sessionController: ctx.sessionController,
+      sessions: ctx.sessions,
+      getSessionTitle: () => ctx.get('sessionTitle'),
+    },
   })
   const scheduler = createScheduler({
     storage,

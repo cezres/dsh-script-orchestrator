@@ -5,10 +5,12 @@
 //   同步抛错由发布端兜底记 event_listener_failed，动作仍视为成功（契约 06 双层隔离）。
 // - plugin：逐动作执行前实时查注册表（不缓存），未注册/已摘除 → failed unknown_action；
 //   已注册则以 ActionContext 调用（契约 06）；registerAction/disposer 四不变量属票 31。
-// - session：本票交付 prompt 渲染与 template_invalid 判定；创建/投递/回收执行属票 32/33。
+// - session：persistent 投递经 sessionHost（lib/session-action.js，票 32）；ephemeral
+//   的 agents.create/whenIdle/dispose 生命周期属票 33。
 // dispatching 取消（契约 03/09）：取消请求后停止派发剩余动作（记 skipped），在途动作经其
 // signal 中止、结果如实记录——run 终态优先于动作汇总的落盘由 runner（settle）负责。
 import { buildTemplateVariables, renderPayload, renderTemplate, appendWarning } from './judge.js'
+import { deliverPersistentSession, SessionActionError } from './session-action.js'
 
 /**
  * 动作注册表（服务实例内部表）。票 30 只需查表（resolve）与快照（snapshot）面；
@@ -56,11 +58,15 @@ const messageOf = (error) => (error instanceof Error ? error.message : String(er
  * @param {string} deps.stdoutText 收集到的 stdout 全文（{{json:}} 解析源）
  * @param {object} deps.registry { resolve(name) }（createActionRegistry 或结构等同物）
  * @param {(name: string, payload?: unknown) => void} deps.emit 事件发布（宿主 ctx.emit）
+ * @param {object} [deps.sessionHost] 宿主会话服务面（persistent 投递；index.js 由
+ *   ctx.sessionController/ctx.sessions/ctx.get('sessionTitle') 装配；缺省时 session 动作
+ *   failed internal_error——宿主语义面不可伪造）
+ * @param {object} [deps.sessionEnv] session cwd 解析环境 { allowedRoots, defaultCwd, hostCwd, scriptCwd }
  * @param {object} [deps.logger] 内部日志（event_listener_failed 等）
  * @param {{ requested: boolean, controller: AbortController | null }} [deps.cancellation]
  *   dispatching 取消面：runner 持有并在取消时置 requested + abort 当前动作 controller。
  * @param {(result: object) => void} [deps.onActionResult] 每动作结算回调（live overlay 更新）
- * @returns {Promise<{ results: Array<{name,kind,status,error?,warnings?}>, canceled: boolean }>}
+ * @returns {Promise<{ results: Array<{name,kind,status,error?,warnings?,sessionId?}>, canceled: boolean }>}
  */
 export async function dispatchActions({
   actionKeys,
@@ -71,6 +77,8 @@ export async function dispatchActions({
   stdoutText,
   registry,
   emit,
+  sessionHost,
+  sessionEnv,
   logger,
   cancellation,
   onActionResult,
@@ -106,8 +114,15 @@ export async function dispatchActions({
     }
 
     const warnings = []
-    const fail = (code, message) =>
-      record({ name: key, kind: definition.kind, status: 'failed', error: { code, message }, ...(warnings.length > 0 ? { warnings } : {}) })
+    const fail = (code, message, extra) =>
+      record({
+        name: key,
+        kind: definition.kind,
+        status: 'failed',
+        error: { code, message },
+        ...(extra?.sessionId !== undefined ? { sessionId: extra.sessionId } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
+      })
 
     if (definition.kind === 'event') {
       const renderedPayload =
@@ -168,9 +183,44 @@ export async function dispatchActions({
         fail('template_invalid', `session 动作 '${key}' 的 prompt 渲染后去首尾空白为空（field: prompt）`)
         continue
       }
-      // 票序边界：session 动作的创建/投递/回收执行属票 32（persistent）/33（ephemeral），
-      // 本票交付渲染与失败隔离骨架；执行面以 action_error 占位，后续票替换
-      fail('action_error', `session 动作 '${key}' 的执行尚未实现（票 32/33 交付）；prompt 已按模板渲染`)
+      if (definition.mode === 'ephemeral') {
+        // 票序边界：ephemeral 的 agents.create 自持 handle + whenIdle/dispose 回收属票 33，
+        // persistent 与 ephemeral 共用同一段渲染与投递逻辑（契约 05），届时在此接入
+        fail('action_error', `session 动作 '${key}' 的 ephemeral 模式执行尚未实现（票 33 交付）；prompt 已按模板渲染`)
+        continue
+      }
+      if (sessionHost === undefined) {
+        // 防御：正常装配（index.js）总会注入；宿主会话服务缺失时不得伪造成功
+        fail('internal_error', `session 动作 '${key}' 无法执行：宿主会话服务未注入（sessionHost）`)
+        continue
+      }
+      try {
+        const { sessionId } = await deliverPersistentSession({
+          host: sessionHost,
+          definition,
+          renderedPrompt: renderedPrompt.text,
+          orchestration,
+          run,
+          verdict,
+          warnings,
+          sessionEnv,
+        })
+        record({
+          name: key,
+          kind: 'session',
+          status: 'succeeded',
+          sessionId,
+          ...(warnings.length > 0 ? { warnings } : {}),
+        })
+      } catch (error) {
+        // SessionActionError 携带 code ∈ {cwd_not_allowed, preset_unknown, delivery_failed, internal_error}；
+        // delivery_failed 时 sessionId 已在 error 上——保留在动作记录（失败现场不回滚）
+        if (error instanceof SessionActionError) {
+          fail(error.code, error.message, error)
+        } else {
+          fail('internal_error', `session 动作 '${key}' 执行失败：${messageOf(error)}`)
+        }
+      }
       continue
     }
 

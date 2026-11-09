@@ -488,6 +488,40 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     view.unmount()
   })
 
+  it('票 32 会话引用：session 动作展示 sessionId 与「可接管」提示；delivery_failed 的 sessionId 同样展示（排障入口）', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView({
+              actions: [{ name: 'open-triage', kind: 'session', status: 'succeeded', sessionId: 'session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee' }],
+            }),
+            runView({
+              runId: 'run-0000000b',
+              status: 'partial',
+              matchedRule: 0,
+              actions: [
+                { name: 'open-triage', kind: 'session', status: 'failed', sessionId: 'session-8c574c72-8422-4e02-ad00-55e4bbcf2a3b', error: { code: 'delivery_failed', message: '会话已创建（session-8c574c72-8422-4e02-ad00-55e4bbcf2a3b）但 flush 拒绝' } },
+              ],
+            }),
+          ],
+          availableActions: [],
+        },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    expect(modalText).toContain('session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee')
+    expect(modalText).toContain('可接管')
+    expect(modalText).toContain('session-8c574c72-8422-4e02-ad00-55e4bbcf2a3b')
+    expect(modalText).toContain('delivery_failed')
+    view.unmount()
+  })
+
   it('活动 run 轮询：模态打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
     vi.useFakeTimers()
     try {
