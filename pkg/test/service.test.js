@@ -42,6 +42,8 @@ function makeService(over = {}) {
     emit: over.emit ?? ((name, payload) => emitted.push([name, payload])),
     logger: over.logger ?? { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
     actionRegistry: over.actionRegistry,
+    runner: over.runner,
+    fs: over.fs,
   })
   return { service, storage, emitted, logs }
 }
@@ -706,14 +708,14 @@ describe('edit · 形状校验、乐观并发与 update 基本路径（契约 06
     }
   })
 
-  it('delete action：准确暂不支持错误（票 29 交付），不触碰记录', async () => {
+  it('delete action：受理前 throwIfAborted（abort 先于受理 → 无任何记录动作；票 29）', async () => {
     const { service, storage } = makeService()
     await service.create(baseInput())
-    await expect(service.edit({ id: 'log-rotate', action: 'delete' })).rejects.toMatchObject({
-      code: 'script_input_invalid',
-      details: { field: 'action', reason: 'unsupported-part' },
-    })
-    expect(Object.keys(storage.snapshot().orchestrations)).toEqual(['log-rotate'])
+    const controller = new AbortController()
+    controller.abort()
+    await expect(service.edit({ id: 'log-rotate', action: 'delete' }, undefined, controller.signal)).rejects.toThrow()
+    expect(Object.keys(storage.snapshot().orchestrations)).toEqual(['log-rotate']) // 记录原样
+    // delete 的既有行为断言见「edit(action=delete) · 两阶段级联删除」组
   })
 
   it('expectedUpdatedAt 乐观并发：匹配通过、不匹配 script_conflict、null 对已有 updatedAt 恒冲突', async () => {
@@ -1135,8 +1137,9 @@ async function makeRunnerWorld(over = {}) {
     config: { maxConcurrentRuns: over.maxConcurrentRuns ?? 2, defaultTimeoutSeconds: 300, maxOutputBytes: 262144, maxSpillBytes: 8388608, allowedRoots: [] },
     emit: (name, payload) => emitted.push([name, payload]),
     now: () => t,
-    logger: { error: () => {}, warn: () => {} },
+    logger: over.logger ?? { error: () => {}, warn: () => {} },
     fs: { stat: async () => ({ isDirectory: () => true }) },
+    registry: over.registry,
   })
   const service = createManagementService({
     storage,
@@ -1144,7 +1147,7 @@ async function makeRunnerWorld(over = {}) {
     config: { maxRunsPerOrchestration: 100, defaultTimeoutSeconds: 300, maxConcurrentRuns: over.maxConcurrentRuns ?? 2 },
     now: () => t,
     emit: (name, payload) => emitted.push([name, payload]),
-    logger: { error: () => {}, warn: () => {} },
+    logger: over.logger ?? { error: () => {}, warn: () => {} },
     runner,
   })
   return { service, runner, storage, emitted, spawns, setTime: (ms) => { t = ms }, getTime: () => t }
@@ -1256,5 +1259,160 @@ describe('run 服务契约（契约 06/07 script_run：手动执行、尽力等�
     const budget = world.service.computeWaitBudgetMs('log-rotate')
     expect(budget).toBe(90_000 + 30_000)
     await world.service.waitRun(manual.runId, 'log-rotate')
+  })
+})
+
+// ---------------- delete：取消在途 run 并级联删除（契约 06/03/09；票 29） ----------------
+
+describe('edit(action=delete) · 两阶段级联删除（契约 06「删除的编排」+ 03「取消与等待」）', () => {
+  it('无在途 run：CAS 与全状态可删；先删编排后删全部 runs，返回准确 removedRuns，不为删除发 changed', async () => {
+    const { service, storage, emitted } = makeService()
+    const created = await service.create(baseInput())
+    // 预置两条已结算 run（直接写表）
+    const settledRun = (status) => ({
+      runId: `run-${status === 'succeeded' ? '00000001' : '00000002'}`,
+      orchestrationId: created.id,
+      trigger: 'manual',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: iso(NOW),
+      status,
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 10, stdoutTail: '', stderrTail: '', truncated: false },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    })
+    await storage.table('runs').put('run-00000001', settledRun('succeeded'))
+    await storage.table('runs').put('run-00000002', settledRun('canceled'))
+    const changedBefore = emitted.filter(([n]) => n === 'script-orchestrator/changed').length
+
+    const result = await service.edit({ id: created.id, action: 'delete' })
+    expect(result).toEqual({ id: created.id, removedRuns: 2 }) // removedRuns 含全部被删 run（含曾取消的）
+    expect(storage.snapshot().orchestrations[created.id]).toBeUndefined()
+    expect(storage.snapshot().runs).toEqual({})
+    expect(emitted.filter(([n]) => n === 'script-orchestrator/changed').length).toBe(changedBefore) // 不为删除发 changed
+    await expect(service.edit({ id: created.id, action: 'delete' })).rejects.toMatchObject({ code: 'script_unknown' })
+    await expect(service.view(created.id)).rejects.toMatchObject({ code: 'script_unknown' })
+  })
+
+  it('CAS：expectedUpdatedAt 不匹配 → script_conflict 且记录原样保留；匹配则删除成功；null 恒冲突（票 28 口径）', async () => {
+    const { service, storage } = makeService()
+    const created = await service.create(baseInput())
+    await expect(
+      service.edit({ id: created.id, action: 'delete', expectedUpdatedAt: '2000-01-01T00:00:00.000Z' }),
+    ).rejects.toMatchObject({ code: 'script_conflict', details: { expected: '2000-01-01T00:00:00.000Z', actual: created.updatedAt } })
+    expect(storage.snapshot().orchestrations[created.id]).toBeTruthy()
+    await expect(service.edit({ id: created.id, action: 'delete', expectedUpdatedAt: null })).rejects.toMatchObject({ code: 'script_conflict' })
+    expect(await service.edit({ id: created.id, action: 'delete', expectedUpdatedAt: created.updatedAt })).toEqual({ id: created.id, removedRuns: 0 })
+    expect(storage.snapshot().orchestrations[created.id]).toBeUndefined()
+  })
+
+  it('paused / ended 状态均可删除（delete 任何状态可执行）', async () => {
+    const { service, storage } = makeService()
+    const paused = await service.create({ ...baseInput(), id: 'p1', enabled: false })
+    const ended = await service.create({ ...baseInput(), id: 'e1' })
+    storage.table('orchestrations').put('e1', { ...storage.snapshot().orchestrations.e1, status: 'ended' })
+    expect(await service.edit({ id: paused.id, action: 'delete' })).toEqual({ id: 'p1', removedRuns: 0 })
+    expect(await service.edit({ id: 'e1', action: 'delete' })).toEqual({ id: 'e1', removedRuns: 0 })
+    expect(storage.snapshot().orchestrations).toEqual({})
+  })
+
+  it('有在途 running run：先取消（run-settled(canceled) 照发）→ 等结算 → 同槽先删编排后删 runs；removedRuns 含被取消项', async () => {
+    const world = await makeRunnerWorld({ auto: false })
+    await world.service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 3600 } })
+    const running = await world.service.run('log-rotate')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(world.runner.liveView(running.runId)?.status).toBe('running') // 在途
+    const changedBefore = world.emitted.filter(([n]) => n === 'script-orchestrator/changed').length
+
+    const result = await world.service.edit({ id: 'log-rotate', action: 'delete' })
+    expect(result).toEqual({ id: 'log-rotate', removedRuns: 1 })
+    expect(world.storage.snapshot().orchestrations['log-rotate']).toBeUndefined()
+    expect(world.storage.snapshot().runs).toEqual({})
+    // 取消结算的事件照发（记录仍在时发布，载荷自足）；删除本身不发 changed
+    const settled = world.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').map(([, p]) => p).find((p) => p.runId === running.runId)
+    expect(settled).toMatchObject({ runId: running.runId, status: 'canceled' })
+    expect(world.emitted.filter(([n]) => n === 'script-orchestrator/changed').length).toBe(changedBefore)
+  })
+
+  it('删除等待窗口内新 run 一律不受理（markDeleting 阻断，无 run 记录产生）', async () => {
+    // 挂死 plugin 动作撑住删除等待窗口（脚本已结束、dispatching 永不结束）
+    const world = await makeRunnerWorld({
+      auto: false,
+      registry: { resolve: (name) => (name === 'hang.act' ? { name, run: () => new Promise(() => {}) } : undefined) },
+    })
+    await world.service.create({
+      ...baseInput(),
+      trigger: { kind: 'every', everySeconds: 3600 },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['hang'] }], fallback: [] },
+      actions: { hang: { kind: 'plugin', action: 'hang.act' } },
+    })
+    const running = await world.service.run('log-rotate')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    world.spawns[0].release({ exitCode: 0, signal: null }) // 脚本完成 → dispatching 挂住
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    // 挂起删除（deleteWaitMs 注入：窗口足够观察到受理阻断，随后超时降级完成删除）
+    const deleting = world.service.edit({ id: 'log-rotate', action: 'delete' }, undefined, undefined, { deleteWaitMs: 300 })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const during = await world.service.run('log-rotate')
+    expect(during).toBeNull() // 删除中受理被拒（不产生 run 记录）
+    expect(Object.keys(world.storage.snapshot().runs)).toEqual([running.runId])
+    expect(await deleting).toEqual({ id: 'log-rotate', removedRuns: 1 }) // 超时降级照删
+  })
+
+  it('等待超时降级：仍在途的 run 照删（迟到结算因记录不存在而 no-op），错误日志留痕', async () => {
+    // 挂死 plugin 动作（不监听 abort）→ dispatching 永不结束；deleteWaitMs 注入极小值 → 超时降级
+    const logs = []
+    const world = await makeRunnerWorld({
+      auto: false,
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      registry: { resolve: (name) => (name === 'never.act' ? { name, run: () => new Promise(() => {}) } : undefined) },
+    })
+    await world.service.create({
+      ...baseInput(),
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['hang'] }], fallback: [] },
+      actions: { hang: { kind: 'plugin', action: 'never.act' } },
+    })
+    const running = await world.service.run('log-rotate')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    world.spawns[0].release({ exitCode: 0, signal: null }) // 脚本完成 → dispatching 挂死
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(world.runner.liveView(running.runId)?.status).toBe('dispatching')
+    const result = await world.service.edit({ id: 'log-rotate', action: 'delete' }, undefined, undefined, { deleteWaitMs: 30 })
+    expect(result).toEqual({ id: 'log-rotate', removedRuns: 1 }) // 降级仍完成删除
+    expect(world.storage.snapshot().runs).toEqual({})
+    expect(logs.some((m) => String(m).includes('删除等待超时'))).toBe(true)
+  })
+
+  it('spill best-effort 清理：被删 run 的溢写文件尝试 unlink，失败仅记日志不影响删除', async () => {
+    const unlinked = []
+    const logs = []
+    const { service, storage } = makeService({
+      fs: { unlink: async (p) => { unlinked.push(p) } },
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+    })
+    const created = await service.create(baseInput())
+    await storage.table('runs').put('run-00000003', {
+      runId: 'run-00000003',
+      orchestrationId: created.id,
+      trigger: 'manual',
+      scheduledAt: iso(NOW),
+      startedAt: iso(NOW),
+      settledAt: iso(NOW),
+      status: 'succeeded',
+      skipReason: null,
+      script: {
+        command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 10,
+        stdoutTail: '', stderrTail: '', truncated: true,
+        stdoutSpillPath: 'C:\\Temp\\dsh-subprocess-x\\out.log', stderrSpillPath: 'C:\\Temp\\dsh-subprocess-x\\err.log',
+      },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    })
+    expect(await service.edit({ id: created.id, action: 'delete' })).toEqual({ id: created.id, removedRuns: 1 })
+    expect(unlinked).toEqual(['C:\\Temp\\dsh-subprocess-x\\out.log', 'C:\\Temp\\dsh-subprocess-x\\err.log'])
+    expect(logs).toEqual([])
   })
 })

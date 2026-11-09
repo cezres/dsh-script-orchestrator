@@ -51,6 +51,72 @@ function wrapExecute({ name, parameters, invoke, logger }) {
 
 const render = (_args, value) => [{ type: 'text', text: JSON.stringify(value) }]
 
+// ---------------- exec.signal 贯穿（契约 03「exec.signal 贯穿与静止」；票 29） ----------------
+
+const abortError = () => {
+  const error = new Error('run 已取消（exec.signal 中止，取消已按矩阵执行并等结算持久化）')
+  error.name = 'AbortError'
+  return error
+}
+
+/**
+ * abort 观察器（wait:false 返回后仍保持）：abort → service.cancelRun（按取消矩阵执行；
+ * 取消不依赖等待者存在）→ service.waitForRun 等结算持久化（fire-and-forget，仅保证时序正确）。
+ * 返回摘除函数。
+ */
+function armRunAbortWatch(service, runId, signal) {
+  if (!signal || typeof service?.cancelRun !== 'function') return () => {}
+  const onAbort = () => {
+    try {
+      service.cancelRun(runId)
+    } catch {
+      /* 取消尽力而为；run 可能已终态 */
+    }
+    Promise.resolve(service.waitForRun?.(runId)).catch(() => {})
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return () => signal.removeEventListener('abort', onAbort)
+}
+
+/**
+ * wait:true 的等待与 abort 竞争：abort → cancelRun → **等 run 结算 canceled 且持久化
+ * 完成后**才以 AbortError reject（宿主 ABORTED 静止——终止的是 run，不是等待）；
+ * 自然结算先到则返回 RunView 并摘除观察器（迟到的 abort 不再取消已终态 run）。
+ */
+function waitRunWithAbortWatch(service, runId, orchestrationId, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let dispose = () => {}
+    const finish = (settle, value) => {
+      if (settled) return
+      settled = true
+      dispose()
+      settle(value)
+    }
+    const onAbort = () => {
+      try {
+        service.cancelRun(runId)
+      } catch {
+        /* run 可能已终态 */
+      }
+      Promise.resolve(service.waitForRun?.(runId)).then(
+        () => finish(reject, abortError()),
+        () => finish(reject, abortError()),
+      )
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    dispose = () => signal.removeEventListener('abort', onAbort)
+    if (signal.aborted) {
+      onAbort() // 受理后立刻中止（受理与挂观察器之间的窗口）
+      return
+    }
+    Promise.resolve(service.waitRun(runId, orchestrationId)).then(
+      (view) => finish(resolve, view),
+      (error) => finish(reject, error),
+    )
+  })
+}
+
 // ---------------- JSON Schema（宿主支持子集：type/properties/required/additionalProperties/items/enum/const） ----------------
 // 数值范围、字符串长度、键名格式无法在子集内表达，由服务层语义校验兜底（reason: range/too-frequent/format）。
 
@@ -394,7 +460,7 @@ export function createToolDefinitions({ service, logger }) {
     {
       name: 'script_run',
       description:
-        '立即手动执行一次编排（trigger=manual，不改变下次自动触发；paused/ended 均允许）。wait 默认 true：尽力等待本次结算（最长 timeoutSeconds+30 秒，超限返回当前视图不报错）；wait:false 立即返回 { runId, status }。',
+        '立即手动执行一次编排（trigger=manual，不改变下次自动触发；paused/ended 均允许）。wait 默认 true：尽力等待本次结算（最长 timeoutSeconds+30 秒，超限返回当前视图不报错）；wait:false 立即返回 { runId, status }。调用被中止（exec.signal）时按取消矩阵取消本次 run：等待中的调用在 run 结算 canceled 并持久化后才静止（ABORTED）；wait:false 已返回的 run 同样会被取消。',
       parameters: runParameters,
       output: { schema: runOutputSchema, render },
       execute: wrapExecute({
@@ -402,14 +468,18 @@ export function createToolDefinitions({ service, logger }) {
         parameters: runParameters,
         logger,
         invoke: async (args, exec) => {
-          const accepted = await service.run(args.id, exec?.signal)
+          const signal = exec?.signal
+          const accepted = await service.run(args.id, signal)
           if (accepted === null || accepted === undefined) {
             return { code: 'internal_error', message: `run 受理未返回视图（编排 '${args.id}' 可能在受理瞬间被删除）` }
           }
           if (args.wait === false) {
+            // 已返回的 run 同样可被取消（契约 03「取消不依赖等待者存在」）：观察器保留
+            armRunAbortWatch(service, accepted.runId, signal)
             return { runId: accepted.runId, status: accepted.status }
           }
-          return await service.waitRun(accepted.runId, args.id)
+          if (!signal) return await service.waitRun(accepted.runId, args.id)
+          return await waitRunWithAbortWatch(service, accepted.runId, args.id, signal)
         },
       }),
     },

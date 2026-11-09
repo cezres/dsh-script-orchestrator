@@ -160,6 +160,33 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			// 删除编排（契约 11 行内操作 + 二次确认；票 29）：确认后经 edit action=delete——
+			// 服务端先取消在途 run 再同批级联删除；UI abort 只终止等待（无取消已受理删除入口）
+			const [deleteTarget, setDeleteTarget] = useState(null);
+			const [deleting, setDeleting] = useState(false);
+			async function confirmDelete(id) {
+				setDeleting(true);
+				setActionError(null);
+				let res;
+				try {
+					res = await call("edit", { id, action: "delete" });
+				} catch (e) {
+					setActionError({ code: "transport", message: String((e && e.message) || e) });
+					setDeleteTarget(null);
+					setDeleting(false);
+					return;
+				}
+				setDeleteTarget(null);
+				setDeleting(false);
+				if (res && res.ok) {
+					if (detailId === id) setDetailId(null); // 详情正开着已删除的编排 → 一并关闭
+					void refresh(); // 写后权威回读
+				} else {
+					const error = (res && res.error) || {};
+					setActionError({ code: error.code || "internal_error", message: error.message || "未知错误" });
+				}
+			}
+
 			useEffect(() => {
 				void refresh();
 				const off = subscribeReset ? subscribeReset(() => { void refresh(); setReloadKey((k) => k + 1); }) : null;
@@ -197,7 +224,13 @@ window.__ModuleLoader__.load({
 						h("b", null, "操作失败（", actionError.code, "）"),
 						h("span", { style: { marginLeft: 6 } }, actionError.message),
 						h("button", { style: { ...C.btn, marginLeft: "auto", padding: "2px 8px" }, onClick: () => setActionError(null) }, "关闭")) : null,
-					h(TableView, { items: state.data.items, onOpen: (id) => setDetailId(id), onAction: (id, action) => void runAction(id, action) })),
+					h(TableView, { items: state.data.items, onOpen: (id) => setDetailId(id), onAction: (id, action) => void runAction(id, action), onDelete: (o) => setDeleteTarget(o) })),
+				deleteTarget ? h(DeleteConfirmModal, {
+					target: deleteTarget,
+					deleting,
+					onCancel: () => { if (!deleting) setDeleteTarget(null); },
+					onConfirm: () => void confirmDelete(deleteTarget.id),
+				}) : null,
 				detailId ? h(DetailModal, { key: detailId + ":" + reloadKey, call, id: detailId, onClose: () => setDetailId(null) }) : null);
 		}
 
@@ -219,10 +252,11 @@ window.__ModuleLoader__.load({
 				h("button", { style: C.btn, onClick: onRetry }, "重试"));
 		}
 
-		function TableView({ items, onOpen, onAction }) {
+		function TableView({ items, onOpen, onAction, onDelete }) {
 			const th = { textAlign: "left", ...C.muted, fontSize: 11, padding: "6px 8px", borderBottom: "1px solid #e4e4e7" };
 			const td = { padding: "6px 8px", borderBottom: "1px solid #f0f0f2", fontSize: 12 };
-			// 行内操作（契约 11）：active → 暂停+执行；paused → 恢复+执行；ended → 执行（删除属票 29）
+			// 行内操作（契约 11）：active → 暂停+执行+删除；paused → 恢复+执行+删除；ended → 执行+删除
+			//（删除全状态可执行，经二次确认；票 29）
 			const actionButton = (o, action, label, primary) => h("button", {
 				style: primary ? { ...C.btnPri, padding: "3px 8px", fontSize: 11 } : { ...C.btn, padding: "3px 8px", fontSize: 11 },
 				onClick: (e) => { e.stopPropagation(); onAction && onAction(o.id, action); },
@@ -237,7 +271,30 @@ window.__ModuleLoader__.load({
 					h("td", { style: { ...td, whiteSpace: "nowrap" }, onClick: (e) => e.stopPropagation() },
 						o.status === "active" ? actionButton(o, "pause", "暂停") : null,
 						o.status === "paused" ? actionButton(o, "resume", "恢复") : null,
-						actionButton(o, "run", "执行", true))))));
+						actionButton(o, "run", "执行", true),
+						h("button", {
+							style: { ...C.btn, padding: "3px 8px", fontSize: 11, borderColor: "#fca5a5", color: "#dc2626" },
+							title: "取消在途 run 并级联删除全部执行记录（二次确认）",
+							onClick: () => onDelete && onDelete(o),
+						}, "删除"))))));
+		}
+
+		// 删除二次确认（契约 11：删除有二次确认、操作期间状态清晰；票 29）
+		function DeleteConfirmModal({ target, deleting, onConfirm, onCancel }) {
+			return h("div", {
+				style: { position: "fixed", inset: 0, background: "#0006", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 70 },
+			},
+				h("div", { style: { ...C.card, width: 430, maxWidth: "92vw", boxShadow: "0 12px 40px #0003" } },
+					h("div", { style: { fontWeight: 700, color: "#dc2626", fontSize: 14 } }, "删除编排"),
+					h("div", { style: { marginTop: 8, fontSize: 13 } }, "「", target.title || target.id, "」", h("span", { style: { ...C.muted, ...C.mono, fontSize: 11 } }, " ", target.id)),
+					h("div", { style: { ...C.muted, fontSize: 12, marginTop: 8 } }, "将取消在途 run 并删除全部执行记录（含历史）；此操作不可恢复。"),
+					h("div", { style: { ...C.row, marginTop: 14, justifyContent: "flex-end" } },
+						h("button", { style: C.btn, disabled: deleting, onClick: onCancel }, "取消"),
+						h("button", {
+							style: { ...C.btn, borderColor: "#dc2626", color: "#dc2626", fontWeight: 600 },
+							disabled: deleting,
+							onClick: onConfirm,
+						}, deleting ? "删除中…" : "确认删除"))));
 		}
 
 		// ---------------- 居中模态：详情（view 回读） ----------------

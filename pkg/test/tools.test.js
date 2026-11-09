@@ -63,6 +63,14 @@ function fakeService(script = {}) {
       return { ...RUN_VIEW }
     }),
     computeWaitBudgetMs: script.computeWaitMs ?? (() => 330_000),
+    cancelRun: script.cancelRun ?? ((runId) => {
+      calls.push(['cancelRun', runId])
+      return true
+    }),
+    waitForRun: script.waitForRun ?? ((runId) => {
+      calls.push(['waitForRun', runId])
+      return Promise.resolve({ ...RUN_VIEW, status: 'canceled' })
+    }),
   }
 }
 
@@ -389,5 +397,67 @@ describe('script_run.execute（契约 07 script_run：wait 语义）', () => {
       message: "编排 'x' 不存在",
       details: { id: 'x' },
     })
+  })
+})
+
+describe('script_run · exec.signal 贯穿（契约 03「exec.signal 贯穿与静止」；票 29）', () => {
+  it('signal 已中止（预取消）→ 异常上抛、不受理（无 run 记录动作）', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const { byName, service } = makeTools({
+      run: async (_id, signal) => {
+        signal?.throwIfAborted()
+        throw new Error('不应受理')
+      },
+    })
+    await expect(byName.script_run.execute({ id: 'log-rotate' }, { signal: controller.signal })).rejects.toThrow()
+    expect(service.calls).toEqual([])
+  })
+
+  it('wait:true + 等待中 abort：先 cancelRun → 等 run 结算持久化（waitForRun）→ 才以 AbortError 静止', async () => {
+    const controller = new AbortController()
+    let releaseWait
+    const { byName, service } = makeTools({
+      run: async () => ({ ...RUN_VIEW, status: 'running', settledAt: null }),
+      waitRun: () =>
+        new Promise((resolve) => {
+          releaseWait = resolve
+        }),
+    })
+    const pending = byName.script_run.execute({ id: 'log-rotate' }, { signal: controller.signal })
+    // 拒绝断言预先挂接（避免拒绝后短窗口无处理器被 Node 记为 unhandled）
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort() // 等待中中止
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    // 顺序：cancelRun 先于 waitForRun；AbortError 在 waitForRun 完成后才抛
+    const cancelIndex = service.calls.findIndex(([op]) => op === 'cancelRun')
+    const waitIndex = service.calls.findIndex(([op]) => op === 'waitForRun')
+    expect(cancelIndex).toBeGreaterThanOrEqual(0)
+    expect(waitIndex).toBeGreaterThan(cancelIndex)
+    await assertion
+  })
+
+  it('wait:true + 结算后到达的 abort：不取消（自然完成返回 RunView，迟到 cancelRun 不发生）', async () => {
+    const controller = new AbortController()
+    const { byName, service } = makeTools()
+    const result = await byName.script_run.execute({ id: 'log-rotate' }, { signal: controller.signal })
+    expect(result).toEqual(RUN_VIEW)
+    controller.abort()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(service.calls.some(([op]) => op === 'cancelRun')).toBe(false)
+  })
+
+  it('wait:false + 返回后 abort：受理的 run 同样被取消（取消不依赖等待者），工具值已静止', async () => {
+    const controller = new AbortController()
+    const { byName, service } = makeTools({
+      run: async () => ({ ...RUN_VIEW, status: 'running', settledAt: null }),
+    })
+    const result = await byName.script_run.execute({ id: 'log-rotate', wait: false }, { signal: controller.signal })
+    expect(result).toEqual({ runId: 'run-7f3c1a9e', status: 'running' })
+    expect(service.calls.some(([op]) => op === 'cancelRun')).toBe(false) // 返回前未取消
+    controller.abort()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(service.calls.some(([op]) => op === 'cancelRun')).toBe(true) // 返回后取消照常发生
   })
 })

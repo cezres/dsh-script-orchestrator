@@ -283,12 +283,12 @@ describe('edit 端点（契约 11 端点表 + 06 EditInput；票 28）', () => {
     expect(result.error.details).toMatchObject({ field, reason })
   })
 
-  it('契约错误原样透传：script_conflict / script_unknown；delete 的暂不支持同样透传', async () => {
+  it('契约错误原样透传：script_conflict / script_unknown；delete 成功返回 DeleteResult 零翻译', async () => {
     const handler = createBridgeHandler({
       service: fakeService({
         edit: async (input) => {
           if (input.action === 'delete') {
-            throw new OrchestratorError('script_input_invalid', 'delete 动作尚未实现（票 29 交付）', { field: 'action', reason: 'unsupported-part' })
+            return { id: input.id, removedRuns: 2 } // 票 29：service.delete 已交付
           }
           if (input.id === 'gone') throw new OrchestratorError('script_unknown', "编排 'gone' 不存在", { id: 'gone' })
           throw new OrchestratorError('script_conflict', '已被其他修改', { expected: 'a', actual: 'b' })
@@ -300,8 +300,10 @@ describe('edit 端点（契约 11 端点表 + 06 EditInput；票 28）', () => {
     const unknown = await handler('edit', { id: 'gone', action: 'resume' }, undefined, {})
     expect(unknown.error.code).toBe('script_unknown')
     const del = await handler('edit', { id: 'x', action: 'delete' }, undefined, {})
-    expect(del.error.code).toBe('script_input_invalid')
-    expect(del.error.details).toMatchObject({ field: 'action', reason: 'unsupported-part' })
+    expect(del).toEqual({ ok: true, value: { id: 'x', removedRuns: 2 } })
+    // delete 带乐观并发参数同样最小形状校验后透传
+    const cas = await handler('edit', { id: 'x', action: 'delete', expectedUpdatedAt: '2026-11-09T00:00:00.000Z' }, undefined, {})
+    expect(cas.ok).toBe(true)
   })
 })
 

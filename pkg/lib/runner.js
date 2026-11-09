@@ -4,8 +4,11 @@
 // 的有界等待与清理、run-started/run-settled 事件（持久写入与内存更新后发布）。
 // 票 30：脚本退出后进判定（judging 内存态）→ 非零动作串行派发（dispatching 内存态，
 // 不占 FIFO 槽、不落盘）→ 按契约 09 汇总定终态；action-settled 按动作执行序在写 2
-// 之后、run-settled 之前发布；dispatching 取消经 requestCancel 停止剩余派发（完整
-// 取消矩阵的 queued/running 面与 exec.signal/delete 接线属票 29）。
+// 之后、run-settled 之前发布。
+// 票 29：cancelRun 落实完整取消矩阵（queued 直接 canceled / running terminate 后
+// canceled / judging 不响应·派发面停止 / dispatching 停止剩余派发），first-write-wins
+// 终态唯一；shutdown（卸载=取消来源）将有界等待后未结算的 run 取消结算 canceled；
+// markDeleting 阻断删除中编排的新 run 受理（service.delete 两阶段协调）。
 // 服务 run / script_run 只经 requestRun 触发，不另造排队或结算逻辑（spec §2）。
 import { evaluateJudge } from './judge.js'
 import { dispatchActions, aggregateRunStatus } from './actions.js'
@@ -113,8 +116,13 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   const maxConcurrentRuns = config.maxConcurrentRuns ?? 2
   const queueCapacity = maxConcurrentRuns * 4
   const mutating = onOrchestrationMutated ?? (() => {})
-  // dispatching 取消面：runId → { requested, controller }（requestCancel 置位并中止在途动作）
+  // dispatching 取消面：runId → { requested, controller }（cancelRun 置位并中止在途动作）
   const dispatchCancellations = new Map()
+  // run 级取消标志：runId → { cancelRequested }（begin 起存在、settle 后清除；
+  // running 阶段的 terminate 后归 canceled、judging/dispatching 阶段的停止派发都读它）
+  const activeStates = new Map()
+  // 删除中编排（service.delete 两阶段协调）：此间 requestRun 一律不受理（无 run 记录）
+  const deletingOrchestrations = new Set()
 
   // 活动视图：runId → live 记录（内存态 running/judging/dispatching；queued 的覆盖字段）。
   // 中途状态不落盘（契约 08「只写两次」）；service.view 合并此视图对外呈现。
@@ -191,6 +199,9 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       if (shuttingDown) {
         throw new Error('runner is shutting down')
       }
+      // 删除中编排不受理新 run（契约 06 delete：先取消在途 → 同批删除；此间触发一律
+      // 不产生 run 记录——含 skip 记录，避免删除批次外再写入）
+      if (deletingOrchestrations.has(orchestrationId)) return null
       const orchestration = storage.table('orchestrations').get(orchestrationId)
       if (orchestration === undefined) return null
       const run = {
@@ -291,6 +302,17 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       return null
     }
     active.set(runId, true)
+    // run 级取消标志（cancelRun 的矩阵作用面）；领槽瞬间已请求取消 → 不 spawn 直接结算
+    const state = { cancelRequested: false }
+    activeStates.set(runId, state)
+    if (state.cancelRequested) {
+      activeStates.delete(runId)
+      active.delete(runId)
+      await settle(runId, { kind: 'canceled', script: run.script })
+      wakeIdleWaiters()
+      pump()
+      return null
+    }
     const startedMs = currentTime()
     const startedAt = iso(startedMs)
     live.set(runId, { ...run, status: 'running', startedAt })
@@ -309,6 +331,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     await settle(runId, enriched)
     active.delete(runId)
     activeHandles.delete(runId)
+    activeStates.delete(runId)
     wakeIdleWaiters()
     pump()
   }
@@ -336,7 +359,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     let dispatchCanceled = false
     if (verdict.actionKeys.length > 0 && orchestration !== undefined) {
       live.set(runId, { ...live.get(runId), status: 'dispatching', actions: [] })
-      const cancellation = { requested: false, controller: null }
+      // 取消请求贯穿：judging 期间到达的取消在派发开始时生效（全部动作 skipped）
+      const cancellation = { requested: activeStates.get(runId)?.cancelRequested === true, controller: null }
       dispatchCancellations.set(runId, cancellation)
       try {
         const dispatched = await dispatchActions({
@@ -411,6 +435,10 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   async function execute(runId, runAtStart, startedMs) {
     const orchestration = orchestrationOf(runAtStart)
     const script = orchestration.script
+    // 取消在 spawn 前到达（领槽后、进程未起的窗口）→ 不 spawn 直接 canceled
+    if (activeStates.get(runId)?.cancelRequested === true) {
+      return { kind: 'canceled', script: emptyScript(script.command), startedMs }
+    }
     const { cwd, failure } = await resolveWorkingDirectory(script)
     if (failure) {
       return { kind: 'spawn_failed', script: emptyScript(script.command, { warnings: [failure] }), startedMs }
@@ -462,6 +490,11 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     clearTimeout(timeoutTimer)
     const durationMs = currentTime() - startedMs
 
+    // 取消已请求（契约 03 取消矩阵 running 面）：terminate 后 done 无论 resolve
+    //（Windows Job 语义 {exitCode:1}）还是 reject，都结算 canceled——退出事实不是判定输入
+    if (activeStates.get(runId)?.cancelRequested === true) {
+      return { kind: 'canceled', script: emptyScript(script.command), startedMs }
+    }
     if (doneError !== null) {
       if (cancelState.reason === 'timeout') {
         // 超时：照常进入判定（契约 03「超时不是执行失败」）；reject 时退出事实未知
@@ -613,23 +646,65 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   }
 
   /**
-   * 停机（插件卸载序列）：停新触发；在途 run 有界等待后 terminate 清理进程范围
-   *（进程树生命周期以 run 为上限，不留后台存活者）；记录保持非终态，由下次启动的
-   * interrupted 维护收尾（契约 03「重启与崩溃」）。完整取消矩阵（结算 canceled）属票 29。
+   * run 取消（契约 03「取消与等待」取消矩阵；来源 = script_run abort / delete / 插件卸载）。
+   * 按阶段执行：queued → 移出队列 + 结算槽直接写 canceled；running → 置标志 + terminate()
+   * → done settle 后结算 canceled；judging → 不响应（求值照常），标志在派发开始生效；
+   * dispatching → 标志 + 中止在途动作 signal，剩余动作 skipped、已执行结果保留。
+   * 终态或未知 run 返回 false（幂等，不重复发布事件）。
+   */
+  function cancelRunInternal(runId) {
+    const persisted = storage.table('runs').get(runId)
+    if (persisted === undefined || TERMINAL_STATUSES.has(persisted.status)) return false
+    const state = activeStates.get(runId)
+    if (state !== undefined) {
+      state.cancelRequested = true
+      const dispatch = dispatchCancellations.get(runId)
+      if (dispatch !== undefined) {
+        dispatch.requested = true
+        try {
+          dispatch.controller?.abort()
+        } catch {
+          /* abort 不应抛；防御 */
+        }
+      }
+      const handle = activeHandles.get(runId)
+      if (handle !== undefined) {
+        try {
+          handle.terminate() // running 阶段终止进程；judging/dispatching 时进程已退（幂等 no-op）
+        } catch {
+          /* 进程可能已退出 */
+        }
+      }
+      return true
+    }
+    // queued/pending：移出待发队列（防 pump 领槽）+ 结算槽写 canceled
+    const index = pending.indexOf(runId)
+    if (index !== -1) pending.splice(index, 1)
+    settle(runId, { kind: 'canceled', script: persisted.script }).catch((error) => {
+      log.error?.(`script-orchestrator: 取消 run ${runId} 结算失败: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    return true
+  }
+
+  /**
+   * 停机（插件卸载序列）：停新触发；在途 run 有界等待后终止进程范围并**取消结算
+   * canceled**（契约 03 取消矩阵的「插件卸载」来源；票 26 的「留非终态交 interrupted」
+   * 升级为卸载即取消）。等待有界：超时未结算者记录留非终态，由下次启动 interrupted
+   * 收尾（降级路径，记错误日志）。
    */
   async function shutdown() {
     shuttingDown = true
     if (active.size > 0 || pending.length > 0) {
       await Promise.race([waitForIdle(), delay(2000)])
     }
-    for (const [runId] of [...active]) {
+    for (const runId of [...active.keys(), ...pending]) {
       try {
-        activeHandles.get(runId)?.terminate()
-      } catch {
-        /* 进程可能已退出 */
+        cancelRunInternal(runId)
+      } catch (error) {
+        log.error?.(`script-orchestrator: shutdown 取消 run ${runId} 异常: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
-    // terminate → done resolve → 结算槽排干（等待有界，避免无限挂卸载）
+    // 取消结算（FIFO 槽）排干（等待有界，避免无限挂卸载）
     await Promise.race([waitForIdle(), delay(3000)])
   }
 
@@ -660,27 +735,26 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       })
     },
     /**
-     * 外部结算入口（取消矩阵的防御面，票 29 的 cancel/delete 接线点）：
-     * 与自然结算同一 FIFO 槽位竞争，first-write-wins——已终态的 run 迟到结算为
-     * no-op（返回 null），不覆写、不重发 run-settled。
+     * 外部结算入口（取消与自然结算竞争的防御面）：与自然结算同一 FIFO 槽位竞争，
+     * first-write-wins——已终态的 run 迟到结算为 no-op（返回 null），不覆写、不重发
+     * run-settled。注意：dispatching 中的 run 应优先用 cancelRun（直接 settleExternal
+     * canceled 会丢在途动作结果）。
      */
     settleExternal: (runId, outcome) => settle(runId, outcome),
     /**
-     * dispatching 取消入口（契约 03/09 取消矩阵的 dispatching 面；票 29 接线工具/删除）：
-     * 置取消请求 + 中止在途动作的 signal → 派发器停止剩余动作（记 skipped）、已执行
-     * 结果保留，run 由自然结算写 canceled（终态优先于动作汇总）。
-     * 非派发中的 run（queued/running/未知）返回 false——完整矩阵属票 29。
+     * run 取消入口（契约 03「取消与等待」取消矩阵；来源 = script_run abort / delete /
+     * 插件卸载；shutdown 内部亦走同一路径）。按阶段执行，见 cancelRunInternal 注释。
+     * 终态或未知 run 返回 false（幂等，不重复发布事件）。
      */
-    requestCancel: (runId) => {
-      const cancellation = dispatchCancellations.get(runId)
-      if (cancellation === undefined) return false
-      cancellation.requested = true
-      try {
-        cancellation.controller?.abort()
-      } catch {
-        /* abort 不应抛；防御 */
-      }
-      return true
+    cancelRun: cancelRunInternal,
+    /**
+     * 删除中标记（service.delete 两阶段协调，票 29）：置位期间 requestRun 对该编排
+     * 一律不受理（返回 null、不产生任何 run 记录——含 skip 记录），防止删除等待窗口
+     * 内新 run 落库成为孤儿。
+     */
+    markDeleting: (orchestrationId, on = true) => {
+      if (on) deletingOrchestrations.add(orchestrationId)
+      else deletingOrchestrations.delete(orchestrationId)
     },
     /** 活动视图合并入口（service.view 用）：返回内存态视图或 undefined。 */
     liveView: (runId) => {
