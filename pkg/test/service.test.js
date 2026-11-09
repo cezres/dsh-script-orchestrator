@@ -41,6 +41,7 @@ function makeService(over = {}) {
     now: over.now ?? (() => NOW),
     emit: over.emit ?? ((name, payload) => emitted.push([name, payload])),
     logger: over.logger ?? { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+    actionRegistry: over.actionRegistry,
   })
   return { service, storage, emitted, logs }
 }
@@ -144,6 +145,29 @@ describe('view（契约 06：单条详情 + 最近 runs + availableActions）', 
     const created = await service.create(baseInput())
     const detail = await service.view(created.id)
     expect(detail).toEqual({ ...created, runs: [], availableActions: [] })
+  })
+
+  it('注入共享注册表时 listActions/availableActions 委托其 snapshot（票 30 查表点接线；registerAction 属票 31）', async () => {
+    const { service } = makeService({
+      actionRegistry: {
+        resolve: () => undefined,
+        snapshot: () => [
+          { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+          { name: 'ops.notify' },
+        ],
+      },
+    })
+    expect(service.listActions()).toEqual([
+      { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+      { name: 'ops.notify' },
+    ])
+    const created = await service.create(baseInput())
+    await expect(service.view(created.id)).resolves.toMatchObject({
+      availableActions: [
+        { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+        { name: 'ops.notify' },
+      ],
+    })
   })
 
   it('runs 选项默认 5，0–50 合法，越界/非整数 → script_input_invalid（range/format）', async () => {

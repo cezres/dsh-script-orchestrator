@@ -246,6 +246,18 @@ describe('run 记录 schema（契约 08「执行记录」：run 全部字段，�
     expect(() => runs.parse(skipped)).not.toThrow()
   })
 
+  it('票 30 动作结果形状通过：succeeded 带_warnings、failed 带 error、skipped（dispatching 取消的剩余动作）', () => {
+    const runs = domainSpec.tables.runs.valueSchema
+    const dispatched = goodRun()
+    dispatched.status = 'partial'
+    dispatched.actions = [
+      { name: 'emit-ok', kind: 'event', status: 'succeeded', warnings: ['unknown variable: {{nope}}'] },
+      { name: 'page', kind: 'plugin', status: 'failed', error: { code: 'unknown_action', message: '注册动作 ops.oncall 未注册' }, warnings: ['json path missing: $.x'] },
+      { name: 'emit-late', kind: 'event', status: 'skipped' },
+    ]
+    expect(() => runs.parse(dispatched)).not.toThrow()
+  })
+
   it('坏形状被拒（→ 宿主 backup-and-skip）：状态枚举外、缺必填、多余字段、动作结果缺键', () => {
     const runs = domainSpec.tables.runs.valueSchema
     expect(() => runs.parse({ ...goodRun(), status: 'exploded' })).toThrow()
