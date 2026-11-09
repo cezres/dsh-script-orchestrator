@@ -7,6 +7,7 @@ import {
   buildInlineUserMessage,
   resolveSessionCwd,
   deliverPersistentSession,
+  deliverEphemeralSession,
 } from '../lib/session-action.js'
 
 const RUN = {
@@ -304,5 +305,198 @@ describe('deliverPersistentSession · 标题与 flush 观测（决策 21 #3：re
     const result = await deliver(host, { kind: 'session', prompt: 'p' }, { warnings })
     expect(result).toEqual({ sessionId: 'session-u-1' })
     expect(warnings.join()).toContain('flush')
+  })
+})
+
+// ---------------- deliverEphemeralSession（契约 05 ephemeral 路径；票 33） ----------------
+
+/** fake 宿主会话服务（ephemeral 面）：agents.create / agentDefaultModel / agentPresets / sessions / sessionTitle。 */
+function makeEphemeralHost(over = {}) {
+  const calls = {
+    create: [],
+    mounts: [],
+    renames: [],
+    followups: [],
+    flushes: [],
+    selections: 0,
+    disposes: [],
+  }
+  const fakeSession = { id: over.mintedSessionId ?? 'will-be-set' }
+  const agent = {
+    session: fakeSession,
+    id: fakeSession.id,
+    model: { select: () => {} },
+    followup: (message) => {
+      calls.followups.push(message)
+      if (over.followupError) throw over.followupError
+    },
+  }
+  const presets =
+    over.noPresets === true
+      ? undefined
+      : {
+          resolve: async (id) => {
+            if (id !== undefined && (over.knownPresets ?? ['standard']).includes(id) === false) {
+              throw Object.assign(new Error(`Unknown agent preset: ${id}`), { code: 'agent-preset/not-found' })
+            }
+            return { id: id ?? 'standard' }
+          },
+          mount: async (agentCtx, id) => {
+            calls.mounts.push({ agentCtx, id })
+          },
+        }
+  const handle = {
+    agent,
+    dispose:
+      over.disposeImpl ??
+      (async () => {
+        calls.disposes.push('session' in handle ? handle.agent.id : 'unknown')
+      }),
+  }
+  const host = {
+    agents: {
+      create: async (options) => {
+        calls.create.push(options)
+        if (over.createError) throw over.createError
+        const sessionId = over.mintedSessionId ?? options.sessionId
+        fakeSession.id = sessionId
+        agent.id = sessionId
+        if (options.setup) await options.setup({ __agentCtx: true })
+        return handle
+      },
+    },
+    agentDefaultModel: {
+      currentSelection: () => {
+        calls.selections += 1
+        return { provider: 'host-default', model: 'host-default-model' }
+      },
+    },
+    getAgentPresets: () => presets,
+    sessions: {
+      flush: async (session) => {
+        calls.flushes.push(session)
+        if (over.flushError) throw over.flushError
+        return true
+      },
+    },
+    getSessionTitle: () => ({
+      rename: (session, title) => {
+        calls.renames.push(title)
+        if (over.renameError) throw over.renameError
+      },
+    }),
+  }
+  return { host, calls, agent, handle, fakeSession }
+}
+
+const deliverEphemeral = (host, definition, over = {}) =>
+  deliverEphemeralSession({
+    host,
+    definition,
+    renderedPrompt: over.renderedPrompt ?? '请整理。',
+    orchestration: { id: 'nightly-deploy-check', title: '夜间部署巡检' },
+    run: RUN,
+    verdict: VERDICT,
+    warnings: (over.warnings ??= []),
+    sessionEnv: { allowedRoots: [], defaultCwd: undefined, hostCwd: 'D:\\host', scriptCwd: 'D:\\proj' },
+    randomUUIDFn: over.randomUUIDFn ?? (() => 'u-1'),
+  })
+
+describe('deliverEphemeralSession · 成功路径（契约 05/决策 20/21：直铸 id + currentSelection + preset resolve/mount + agents.create 自持 handle）', () => {
+  it('全链：缺省 model 读 currentSelection、preset 解析为默认并 mount、meta 带 cwd+agentPreset；返回 {sessionId, agent, handle}', async () => {
+    const { host, calls, agent, handle } = makeEphemeralHost()
+    const result = await deliverEphemeral(host, { kind: 'session', mode: 'ephemeral', prompt: 'p' })
+    expect(result).toEqual({ sessionId: 'session-u-1', agent, handle })
+    expect(calls.create).toHaveLength(1)
+    const create = calls.create[0]
+    expect(create.sessionId).toBe('session-u-1')
+    expect(create.agentOptions).toEqual({ provider: 'host-default', model: 'host-default-model' }) // 缺省 model = Host 当前选择
+    expect(create.meta).toEqual({ cwd: 'D:\\proj', agentPreset: 'standard' }) // 缺省 preset 解析为默认 id
+    expect(typeof create.setup).toBe('function')
+    expect(calls.mounts).toEqual([{ agentCtx: { __agentCtx: true }, id: 'standard' }]) // setup 内 mount（composition 安装）
+    expect(calls.selections).toBe(1)
+    // 投递路径与 persistent 共用：缺省标题 rename → followup(内联 UserMessage) → flush
+    expect(calls.renames).toEqual(['夜间部署巡检 · 1a9e'])
+    expect(calls.followups[0].source).toEqual({ kind: 'user' })
+    expect(calls.followups[0].content[0].text).toBe(
+      buildFirstMessageText({ run: RUN, verdict: VERDICT, prompt: '请整理。', framing: 'banner' }),
+    )
+    expect(calls.flushes).toEqual([agent.session])
+  })
+
+  it('显式 model 直接进 agentOptions（不读 currentSelection）；显式 preset 进 resolve 与 meta', async () => {
+    const { host, calls } = makeEphemeralHost({ knownPresets: ['standard', 'minimal'] })
+    await deliverEphemeral(host, {
+      kind: 'session',
+      mode: 'ephemeral',
+      prompt: 'p',
+      model: { provider: 'p', model: 'm', reasoningEffort: 'high' },
+      preset: 'minimal',
+    })
+    expect(calls.selections).toBe(0)
+    expect(calls.create[0].agentOptions).toEqual({ provider: 'p', model: 'm', reasoningEffort: 'high' })
+    expect(calls.create[0].meta.agentPreset).toBe('minimal')
+    expect(calls.mounts[0].id).toBe('minimal')
+  })
+
+  it('宿主未提供 agentPresets 服务：无显式 preset 时照常创建（不带 preset 键）；显式 preset → preset_unknown', async () => {
+    const bare = makeEphemeralHost({ noPresets: true })
+    await deliverEphemeral(bare.host, { kind: 'session', mode: 'ephemeral', prompt: 'p' })
+    expect(bare.calls.create[0].meta).toEqual({ cwd: 'D:\\proj' })
+    expect(bare.calls.mounts).toEqual([])
+
+    const { host, calls } = makeEphemeralHost({ noPresets: true })
+    const error = await deliverEphemeral(host, { kind: 'session', mode: 'ephemeral', prompt: 'p', preset: 'standard' }).catch((e) => e)
+    expect(error).toMatchObject({ code: 'preset_unknown' })
+    expect(error.sessionId).toBeUndefined()
+    expect(calls.create).toEqual([])
+  })
+
+  it('preset 解析失败（存在注册表但 id 未知）→ preset_unknown，不创建会话', async () => {
+    const { host, calls } = makeEphemeralHost()
+    const error = await deliverEphemeral(host, { kind: 'session', mode: 'ephemeral', prompt: 'p', preset: 'no-such' }).catch((e) => e)
+    expect(error).toMatchObject({ code: 'preset_unknown' })
+    expect(error.message).toContain('no-such')
+    expect(calls.create).toEqual([])
+  })
+
+  it('cwd 越界 → cwd_not_allowed，不触碰 agents.create（session cwd 同受 allowedRoots 限制）', async () => {
+    const { host, calls } = makeEphemeralHost()
+    const error = await deliverEphemeralSession({
+      host,
+      definition: { kind: 'session', mode: 'ephemeral', prompt: 'p', cwd: 'E:\\evil' },
+      renderedPrompt: 'x',
+      orchestration: { id: 'o', title: 't' },
+      run: RUN,
+      verdict: VERDICT,
+      warnings: [],
+      sessionEnv: { allowedRoots: ['D:\\proj'], defaultCwd: undefined, hostCwd: 'D:\\host', scriptCwd: 'D:\\proj' },
+      randomUUIDFn: () => 'u-1',
+    }).catch((e) => e)
+    expect(error).toMatchObject({ code: 'cwd_not_allowed' })
+    expect(calls.create).toEqual([])
+  })
+})
+
+describe('deliverEphemeralSession · 投递失败（契约 05：delivery_failed 保留会话现场；票 33：不启动回收计时）', () => {
+  it('followup 抛错 → delivery_failed 携带 sessionId 与 handle（现场保留给调用方 retain，不 dispose）', async () => {
+    const { host, handle, calls } = makeEphemeralHost({ followupError: new Error('cannot append outside a SessionStore') })
+    const error = await deliverEphemeral(host, { kind: 'session', mode: 'ephemeral', prompt: 'p' }).catch((e) => e)
+    expect(error).toMatchObject({ code: 'delivery_failed', sessionId: 'session-u-1' })
+    expect(error.handle).toBe(handle) // 调用方据此 retain（不启动回收）
+    expect(calls.flushes).toEqual([])
+  })
+
+  it('flush 拒绝 → delivery_failed 携带 sessionId 与 handle；create 抛其他错 → internal_error 无 sessionId', async () => {
+    const flushCase = makeEphemeralHost({ flushError: new Error('persistence listener failed') })
+    const flushError = await deliverEphemeral(flushCase.host, { kind: 'session', mode: 'ephemeral', prompt: 'p' }).catch((e) => e)
+    expect(flushError).toMatchObject({ code: 'delivery_failed', sessionId: 'session-u-1' })
+    expect(flushError.handle).toBe(flushCase.handle)
+
+    const createCase = makeEphemeralHost({ createError: new Error('boom') })
+    const createError = await deliverEphemeral(createCase.host, { kind: 'session', mode: 'ephemeral', prompt: 'p' }).catch((e) => e)
+    expect(createError).toMatchObject({ code: 'internal_error' })
+    expect(createError.sessionId).toBeUndefined()
+    expect(createError.handle).toBeUndefined()
   })
 })

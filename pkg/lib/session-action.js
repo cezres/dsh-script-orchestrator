@@ -178,6 +178,27 @@ export async function deliverPersistentSession({
     }
   }
 
+  await deliverFirstMessage({ host, agent, definition, renderedPrompt, orchestration, run, verdict, warnings, sessionId, randomUUIDFn })
+  return { sessionId }
+}
+
+/**
+ * 两模式共用的首条消息投递（契约 05「两种模式共用同一段渲染与投递逻辑，只差生命周期管理」）：
+ * 标题 rename（失败仅 warnings）→ followup(内联 UserMessage) → await flush。
+ * followup/flush 失败 → SessionActionError(delivery_failed) 携带 sessionId。
+ */
+async function deliverFirstMessage({
+  host,
+  agent,
+  definition,
+  renderedPrompt,
+  orchestration,
+  run,
+  verdict,
+  warnings,
+  sessionId,
+  randomUUIDFn,
+}) {
   // 标题：缺省 `${编排标题} · ${runId 尾 4 位}`；显式空串视同未指定（归一化后必然被拒，无意义）
   const title =
     definition.title !== undefined && definition.title !== ''
@@ -212,5 +233,106 @@ export async function deliverPersistentSession({
     // flush 返回 boolean = 是否有持久化 listener 参与；false 不是拒绝（契约口径「flush 未拒绝」即成功），仅记观测
     appendWarning(warnings, `session ${sessionId} flush 无持久化 listener 参与（返回 false；投递管线未拒绝，按成功处理）`)
   }
-  return { sessionId }
+}
+
+/**
+ * ephemeral 模式创建与投递（契约 05 两模式表 + 决策 20/21；票 23 E3 逐行实证路径）：
+ * ① resolveSessionCwd（与 persistent 同一 allowedRoots 边界）
+ * ② preset 三步（研究 session-actions §4.1）：ctx.get('agentPresets').resolve(id ?? 缺省)；
+ *    服务缺失且无显式 preset → 裸创建（不装 composition）；显式 preset 而服务缺失/解析失败
+ *    → preset_unknown；mount 只能在 agents.create 的 setup 中做（meta.agentPreset 只是记录）
+ * ③ agentOptions = 显式 model ?? ctx.agentDefaultModel.currentSelection()（显式优先；研究 §4.2）
+ * ④ agents.create({ sessionId: 直铸 session-<uuid>, agentOptions, meta: {cwd, agentPreset?}, setup })
+ *    自持 {agent, dispose} handle——生命周期归插件（要执行 dispose；persistent 则宿主管）
+ * ⑤ 首条消息投递与 persistent 共用（deliverFirstMessage）
+ * 投递失败 → SessionActionError(delivery_failed) 携带 sessionId 与 handle（调用方 retain 现场、
+ * 不启动回收计时——契约 05「投递失败的 ephemeral 不启动回收计时」）。
+ * @returns {Promise<{ sessionId: string, agent: object, handle: { dispose } }>}
+ */
+export async function deliverEphemeralSession({
+  host,
+  definition,
+  renderedPrompt,
+  orchestration,
+  run,
+  verdict,
+  warnings,
+  sessionEnv,
+  randomUUIDFn = randomUUID,
+}) {
+  const { cwd, failure } = resolveSessionCwd({
+    actionCwd: definition.cwd,
+    scriptCwd: sessionEnv?.scriptCwd,
+    defaultCwd: sessionEnv?.defaultCwd,
+    hostCwd: sessionEnv?.hostCwd,
+    allowedRoots: sessionEnv?.allowedRoots,
+  })
+  if (failure !== null) throw new SessionActionError(failure.code, failure.message)
+
+  // preset 解析（研究 session-actions §4.1）：记录/解析/挂载是三步；resolve 省略 id → Host 默认
+  const presets = host.getAgentPresets?.()
+  if (presets === undefined && definition.preset !== undefined) {
+    throw new SessionActionError(
+      'preset_unknown',
+      `session 动作指定 preset '${definition.preset}' 但宿主未提供 agentPresets 服务（preset_unknown）`,
+    )
+  }
+  let resolvedPreset
+  if (presets !== undefined) {
+    try {
+      resolvedPreset = await presets.resolve(definition.preset)
+    } catch (error) {
+      if (definition.preset !== undefined && isPresetUnknown(error)) {
+        throw new SessionActionError(
+          'preset_unknown',
+          `session 动作指定的 preset '${definition.preset}' 不存在（preset_unknown）：${messageOf(error)}`,
+        )
+      }
+      throw new SessionActionError('internal_error', `agent preset 解析失败：${messageOf(error)}`)
+    }
+  }
+
+  // 缺省 model 读 Host 当前选择（显式优先；agentOptions 缺省时首 step 抛 has no provider/model——宿主事实）
+  const agentOptions =
+    definition.model !== undefined ? definition.model : host.agentDefaultModel.currentSelection()
+
+  const requestedId = `session-${randomUUIDFn()}`
+  let handle
+  try {
+    handle = await host.agents.create({
+      sessionId: requestedId,
+      agentOptions: agentOptions ?? undefined,
+      meta: {
+        cwd,
+        ...(resolvedPreset !== undefined ? { agentPreset: resolvedPreset.id } : {}),
+      },
+      ...(resolvedPreset !== undefined && presets !== undefined
+        ? { setup: async (agentCtx) => { await presets.mount(agentCtx, resolvedPreset.id) } }
+        : {}),
+    })
+  } catch (error) {
+    throw new SessionActionError('internal_error', `会话创建失败：${messageOf(error)}`)
+  }
+  const agent = handle.agent
+  const sessionId = agent.id
+
+  try {
+    await deliverFirstMessage({
+      host,
+      agent,
+      definition,
+      renderedPrompt,
+      orchestration,
+      run,
+      verdict,
+      warnings,
+      sessionId,
+      randomUUIDFn,
+    })
+  } catch (error) {
+    // 投递失败：保留现场（不 dispose）——handle 随错误交回调用方 retain（票 33：失败不启动回收计时）
+    if (error instanceof SessionActionError) error.handle = handle
+    throw error
+  }
+  return { sessionId, agent, handle }
 }

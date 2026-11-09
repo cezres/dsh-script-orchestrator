@@ -102,8 +102,10 @@ export function buildSettledPayload(run) {
  * @param {object} [deps.sessionHost] 宿主会话服务面（persistent session 动作投递；
  *   { sessionController, sessions, getSessionTitle() }，index.js 由 ctx 装配；缺省时
  *   session 动作 failed internal_error）
+ * @param {object} [deps.ephemeralRegistry] ephemeral 生命周期登记器（票 33；
+ *   createEphemeralRegistry 或结构等同物；缺省时 ephemeral 动作 failed internal_error）
  */
-export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry, sessionHost }) {
+export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry, sessionHost, ephemeralRegistry }) {
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
@@ -342,9 +344,11 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
           stdoutText: outcome.facts.stdoutText,
           registry,
           emit: publish,
-          // persistent session 动作投递面（票 32）：cwd 环境按当前编排（session cwd 缺省取编排脚本 cwd，
-          // 同受 allowedRoots 限制；defaultCwd/hostCwd 与脚本 cwd 解析同链）
+          // session 动作投递面（票 32 persistent / 票 33 ephemeral）：cwd 环境按当前编排
+          //（session cwd 缺省取编排脚本 cwd，同受 allowedRoots 限制；defaultCwd/hostCwd
+          // 与脚本 cwd 解析同链）；ephemeralRegistry 承接回收生命周期
           sessionHost,
+          ephemeralRegistry,
           sessionEnv: {
             allowedRoots: config.allowedRoots,
             defaultCwd: config.defaultCwd,

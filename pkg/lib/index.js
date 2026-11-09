@@ -13,10 +13,21 @@ import { createScheduler } from './scheduler.js'
 import { createBridgeHandler, mountBridge } from './bridge.js'
 import { registerTools } from './tools.js'
 import { createActionRegistry } from './actions.js'
+import { createEphemeralRegistry } from './ephemeral-lifecycle.js'
 
 export const name = 'script-orchestrator'
 export { Config }
-export const inject = ['storageDomain', 'connection', 'webServer', 'tools', 'subprocess', 'sessionController', 'sessions']
+export const inject = [
+  'storageDomain',
+  'connection',
+  'webServer',
+  'tools',
+  'subprocess',
+  'sessionController',
+  'sessions',
+  'agents',
+  'agentDefaultModel',
+]
 
 export async function* apply(ctx, config) {
   const logger = ctx.logger('script-orchestrator')
@@ -37,6 +48,9 @@ export async function* apply(ctx, config) {
   // 结算推进 fixed-delay 计划后由 onOrchestrationMutated 通知调度器重算（scheduler 在
   // 其后创建，经闭包引用；启动前 reschedule 为 no-op 安全）。
   let rescheduleAfterMutation = () => {}
+  // ephemeral 会话生命周期登记器（票 33）：投递成功 adopt（whenIdle → idleDisposeSeconds
+  // → dispose）、失败 retain 保留现场；卸载序列在 runner 停机后 disposeAll 收口
+  const ephemeralRegistry = createEphemeralRegistry({ logger })
   const runner = createRunner({
     storage,
     queue,
@@ -48,13 +62,19 @@ export async function* apply(ctx, config) {
     hostCwd: process.cwd(),
     onOrchestrationMutated: () => rescheduleAfterMutation(),
     registry: actionRegistry,
-    // persistent session 动作投递面（契约 05/决策 21；票 32）：sessionController.create()
-    // 由 Host 代 compose 缺省 preset/model；sessionTitle 经 ctx.get 惰性取（可选服务）
+    // session 动作投递面（契约 05/决策 21；票 32 persistent / 票 33 ephemeral）：
+    // persistent 经 sessionController.create()（Host 代 compose 缺省 preset/model）；
+    // ephemeral 经 agents.create 自持 handle（agentDefaultModel.currentSelection +
+    // agentPresets resolve/mount）；sessionTitle 经 ctx.get 惰性取（可选服务）
     sessionHost: {
       sessionController: ctx.sessionController,
       sessions: ctx.sessions,
       getSessionTitle: () => ctx.get('sessionTitle'),
+      agents: ctx.agents,
+      agentDefaultModel: ctx.agentDefaultModel,
+      getAgentPresets: () => ctx.get('agentPresets'),
     },
+    ephemeralRegistry,
   })
   const scheduler = createScheduler({
     storage,
@@ -93,11 +113,14 @@ export async function* apply(ctx, config) {
   yield async () => {
     // 先停生产者：调度器（不再触发新自动 run）与工具入口/桥，再停 runner
     //（在途 run 有界等待 + terminate 清进程范围；记录留非终态由下次启动 interrupted 收尾），
-    // 最后排干队列、关域（契约 08「关闭」）
+    // 再对 ephemeral 会话做确定性 teardown（票 33：live handle 全量 dispose；宿主
+    // owner-fiber teardown 兜底之下显式收口，保证顺序可测），最后排干队列、关域
+    //（契约 08「关闭」）
     scheduler.stop()
     disposeTools()
     disposeBridge()
     await runner.shutdown()
+    await ephemeralRegistry.disposeAll()
     await queue.close()
     await storage.close()
   }

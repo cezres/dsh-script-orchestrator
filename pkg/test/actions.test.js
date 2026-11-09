@@ -246,6 +246,49 @@ describe('session 动作（persistent 执行面属票 32；ephemeral 属票 33�
 
   const sessionEnv = { allowedRoots: [], defaultCwd: undefined, hostCwd: 'D:\\host', scriptCwd: 'D:\\proj' }
 
+  /** fake 宿主会话服务（ephemeral 面）：agents.create/agentDefaultModel/agentPresets/sessions/sessionTitle。 */
+  function makeEphemeralSessionHost(over = {}) {
+    const created = []
+    const followups = []
+    const handle = {
+      agent: {
+        id: 'session-eph',
+        session: { id: 'session-eph' },
+        model: { select: () => {} },
+        followup: (message) => {
+          followups.push(message)
+          if (over.followupError) throw over.followupError
+        },
+      },
+      dispose: async () => {},
+    }
+    handle.agent.id = over.sessionId ?? handle.agent.id
+    handle.agent.session.id = handle.agent.id
+    const host = {
+      agents: {
+        create: async (options) => {
+          const entry = { ...options, sessionId: handle.agent.id }
+          created.push(entry)
+          if (over.createError) throw over.createError
+          return handle
+        },
+      },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'host-default', model: 'host-default-model' }) },
+      getAgentPresets: () => ({
+        resolve: async (id) => {
+          if (id !== undefined && id !== 'standard') {
+            throw Object.assign(new Error(`Unknown agent preset: ${id}`), { code: 'agent-preset/not-found' })
+          }
+          return { id: id ?? 'standard' }
+        },
+        mount: async () => {},
+      }),
+      sessions: { flush: async () => true },
+      getSessionTitle: () => ({ rename: () => {} }),
+    }
+    return { host, created, followups, handle }
+  }
+
   it('persistent：prompt 渲染进首条消息正文（模板警告进记录），投递成功 → succeeded 且记录 sessionId', async () => {
     const { host, calls } = makeSessionHost()
     const deps = makeDeps({ sessionHost: host, sessionEnv })
@@ -323,18 +366,74 @@ describe('session 动作（persistent 执行面属票 32；ephemeral 属票 33�
     expect(results[0].error.message).toContain('宿主会话服务')
   })
 
-  it('mode: ephemeral 执行面属票 33：failed action_error 占位（消息注明票 33，不含 32）', async () => {
-    const { host } = makeSessionHost()
-    const deps = makeDeps({ sessionHost: host, sessionEnv })
+  it('mode: ephemeral：经 sessionHost 投递成功 → succeeded + sessionId，并移交 ephemeralRegistry.adopt（缺省 idleDisposeSeconds=0）', async () => {
+    const ephemeralHost = makeEphemeralSessionHost()
+    const adopted = []
+    const registry = { adopt: (...args) => adopted.push(args), retain: () => {}, disposeAll: async () => {} }
+    const deps = makeDeps({ sessionHost: ephemeralHost.host, sessionEnv, ephemeralRegistry: registry })
     const { results } = await dispatch(
       deps,
       ['s1'],
-      { s1: { kind: 'session', mode: 'ephemeral', prompt: 'p', idleDisposeSeconds: 5 } },
+      { s1: { kind: 'session', mode: 'ephemeral', prompt: '整理 {{exitCode}}' } },
     )
-    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'action_error' } })
-    expect(results[0].error.message).toContain('33')
-    expect(results[0].error.message).not.toContain('32')
+    expect(results[0]).toMatchObject({ name: 's1', kind: 'session', status: 'succeeded' })
+    expect(results[0].sessionId).toBe(ephemeralHost.created[0].sessionId)
+    expect(ephemeralHost.created[0].agentOptions).toEqual({ provider: 'host-default', model: 'host-default-model' })
+    expect(adopted).toHaveLength(1)
+    expect(adopted[0][0]).toBe(ephemeralHost.handle) // 自持 handle 移交生命周期
+    expect(adopted[0][2]).toBe(ephemeralHost.created[0].sessionId)
+    expect(adopted[0][3]).toBe(0) // idleDisposeSeconds 缺省 0
+    expect(ephemeralHost.followups[0].content[0].text).toContain('整理 0') // 模板已渲染（共用渲染）
+  })
+
+  it('mode: ephemeral + idleDisposeSeconds=7：延迟秒数透传 adopt', async () => {
+    const ephemeralHost = makeEphemeralSessionHost()
+    const adopted = []
+    const registry = { adopt: (...args) => adopted.push(args), retain: () => {}, disposeAll: async () => {} }
+    const deps = makeDeps({ sessionHost: ephemeralHost.host, sessionEnv, ephemeralRegistry: registry })
+    await dispatch(deps, ['s1'], { s1: { kind: 'session', mode: 'ephemeral', prompt: 'p', idleDisposeSeconds: 7 } })
+    expect(adopted[0][3]).toBe(7)
+  })
+
+  it('mode: ephemeral 投递失败（followup 抛错）→ failed delivery_failed + sessionId，handle 经 retain 登记但不启动回收（失败现场保留）', async () => {
+    const ephemeralHost = makeEphemeralSessionHost({ followupError: new Error('cannot append outside a SessionStore') })
+    const retained = []
+    const adopted = []
+    const registry = {
+      adopt: (...args) => adopted.push(args),
+      retain: (...args) => retained.push(args),
+      disposeAll: async () => {},
+    }
+    const deps = makeDeps({ sessionHost: ephemeralHost.host, sessionEnv, ephemeralRegistry: registry })
+    const { results } = await dispatch(
+      deps,
+      ['bad', 'emit-ok'],
+      { bad: { kind: 'session', mode: 'ephemeral', prompt: 'p' }, 'emit-ok': { kind: 'event', name: 'deploy-ok' } },
+    )
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'delivery_failed' } })
+    expect(results[0].sessionId).toBe(ephemeralHost.created[0].sessionId)
+    expect(retained).toEqual([[ephemeralHost.handle, ephemeralHost.created[0].sessionId]])
+    expect(adopted).toEqual([]) // 不启动回收计时
+    expect(results[1].status).toBe('succeeded') // 失败隔离
+  })
+
+  it('mode: ephemeral 而 ephemeralRegistry 未注入（防御）→ failed internal_error', async () => {
+    const ephemeralHost = makeEphemeralSessionHost()
+    const deps = makeDeps({ sessionHost: ephemeralHost.host, sessionEnv })
+    const { results } = await dispatch(deps, ['s1'], { s1: { kind: 'session', mode: 'ephemeral', prompt: 'p' } })
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'internal_error' } })
+    expect(results[0].error.message).toContain('ephemeral')
+  })
+
+  it('mode: ephemeral + 未知 preset → failed preset_unknown，不创建会话、不 adopt', async () => {
+    const ephemeralHost = makeEphemeralSessionHost({ createError: Object.assign(new Error('Unknown agent preset: nope'), { code: 'agent-preset/not-found' }) })
+    const adopted = []
+    const registry = { adopt: (...args) => adopted.push(args), retain: () => {}, disposeAll: async () => {} }
+    const deps = makeDeps({ sessionHost: ephemeralHost.host, sessionEnv, ephemeralRegistry: registry })
+    const { results } = await dispatch(deps, ['s1'], { s1: { kind: 'session', mode: 'ephemeral', prompt: 'p', preset: 'nope' } })
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'preset_unknown' } })
     expect(results[0].sessionId).toBeUndefined()
+    expect(adopted).toEqual([])
   })
 
   it('prompt 渲染后去首尾空白为空 → failed template_invalid（唯一触发路径；payload 不可能触发）', async () => {
