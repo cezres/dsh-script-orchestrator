@@ -78,7 +78,8 @@ function Start-HeadlessHost {
   $out = "$logStem.out.log"
   $err = "$logStem.err.log"
   Remove-Item $out, $err -ErrorAction SilentlyContinue
-  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList "/c", "`"$Dsh`" --profile $ProfileName --no-open" `
+  # --port 0：OS 动态分配端口（从 token URL 解析），避免与其他并行验证沙箱互相顶掉默认 3080
+  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList "/c", "`"$Dsh`" --profile $ProfileName --port 0 --no-open" `
     -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -WindowStyle Hidden
   $url = $null
   $deadline = (Get-Date).AddSeconds(120)
@@ -110,7 +111,14 @@ function Stop-HeadlessHost([int]$Port) {
     Write-Host "  杀端口 $Port 监听进程 pid=$pid0 ($((Get-Process -Id $pid0 -ErrorAction SilentlyContinue).ProcessName))"
     Stop-Process -Id $pid0 -Force -ErrorAction SilentlyContinue
   }
-  Start-Sleep -Seconds 2
+  # 等端口真正释放（Windows 上 Stop-Process 异步，socket 清理可滞后；不等会让下次启动 EADDRINUSE）
+  $deadline = (Get-Date).AddSeconds(20)
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+    $still = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $still) { Write-Host "  端口 $Port 已释放"; return }
+  }
+  Write-Host "  警告：端口 $Port 在 20 秒后仍被监听（$($still.OwningProcess -join ','))，继续但有 EADDRINUSE 风险" -ForegroundColor Yellow
 }
 
 function Get-AuthenticatedSession([string]$url) {
@@ -118,10 +126,36 @@ function Get-AuthenticatedSession([string]$url) {
   return $web
 }
 
-function Invoke-Rpc($session, [int]$port, [string]$endpoint, $payload, [string]$rpcId = 'verify27') {
+# RPC 会话：长等待（分钟级 sleep）后 web 会话 cookie 会过期（401 unauthorized），
+# 故封装为「401 自动用原 token URL 重建会话并重试一次」的单一入口。
+$script:RpcUrl = $null
+$script:RpcPort = 0
+$script:RpcSession = $null
+
+function Connect-Rpc([string]$url, [int]$port) {
+  $script:RpcUrl = $url
+  $script:RpcPort = $port
+  $script:RpcSession = Get-AuthenticatedSession $url
+}
+
+function Invoke-Rpc([string]$endpoint, $payload, [string]$rpcId = 'verify27') {
   $body = @{ type = 'client-request'; rpcId = $rpcId; method = $endpoint; payload = $payload } | ConvertTo-Json -Depth 20 -Compress
-  return Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/script-orchestrator/$endpoint" `
-    -ContentType 'application/json' -Body $body -WebSession $session -TimeoutSec 30
+  $uri = "http://127.0.0.1:$($script:RpcPort)/script-orchestrator/$endpoint"
+  for ($attempt = 1; $attempt -le 2; $attempt++) {
+    try {
+      return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' -Body $body -WebSession $script:RpcSession -TimeoutSec 30
+    }
+    catch {
+      $status = $null
+      if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+      if ($attempt -eq 1 -and ($status -eq 401 -or "$_" -match 'unauthorized')) {
+        Write-Host "  （会话过期，重建 web 会话后重试 $endpoint）"
+        $script:RpcSession = Get-AuthenticatedSession $script:RpcUrl
+        continue
+      }
+      throw
+    }
+  }
 }
 
 function To-UtcMs($value) {
@@ -131,8 +165,12 @@ function To-UtcMs($value) {
   return [DateTimeOffset]::Parse([string]$value, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds()
 }
 
-function Get-LatestRun($session, [int]$port, [string]$id) {
-  $v = Invoke-Rpc $session $port 'view' @{ id = $id } "run-$id"
+# 分钟边界判定（五位 cron 的匹配时刻秒/毫秒均为 0；Invoke-RestMethod 会把 ISO 字符串
+# 反序列化为 DateTime，故一切边界断言经 To-UtcMs 走毫秒取模）
+function Test-MinuteBoundary($ms) { return (($ms % 60000) -eq 0) }
+
+function Get-LatestRun([string]$id) {
+  $v = Invoke-Rpc 'view' @{ id = $id } "run-$id"
   return @{ orch = $v.result.value; run = @($v.result.value.runs)[0]; runsCount = @($v.result.value.runs).Count }
 }
 
@@ -151,12 +189,13 @@ function New-CronInput([string]$id, [string]$expression, [string]$timeZone, [has
 }
 
 # 非法 cron 创建：断言 script_input_invalid 的 field/reason（part 可选）
-function Assert-InvalidCron($session, [int]$port, [string]$label, $payload, [string]$field, [string]$reason, [string]$part = $null) {
-  $r = Invoke-Rpc $session $port 'create' $payload "inv-$label"
-  $ok = $r.result.ok -eq $false -and $r.result.error.code -eq 'script_input_invalid' -and
-    $r.result.error.details.field -eq $field -and $r.result.error.details.reason -eq $reason
-  if ($null -ne $part) { $ok = $ok -and $r.result.error.details.part -eq $part }
-  Check $ok "$label → script_input_invalid（$field/$reason$(if ($part) { "/$part" })；实际 $($r.result.error.details.field)/$($r.result.error.details.reason)/$($r.result.error.details.part)）"
+function Assert-InvalidCron([string]$label, $payload, [string]$field, [string]$reason, [string]$part = '') {
+  $r = Invoke-Rpc 'create' $payload "inv-$label"
+  $ok = ($r.result.ok -eq $false) -and ($r.result.error.code -eq 'script_input_invalid') -and
+    ($r.result.error.details.field -eq $field) -and ($r.result.error.details.reason -eq $reason)
+  if (-not [string]::IsNullOrEmpty($part)) { $ok = $ok -and ($r.result.error.details.part -eq $part) }
+  $actualPart = if ($null -ne $r.result.error.details.part) { "$($r.result.error.details.part)" } else { '' }
+  Check $ok "$label → script_input_invalid（$field/$reason$(if ($actualPart) { "/$actualPart" })）"
 }
 
 try {
@@ -172,34 +211,34 @@ try {
 
   Step '阶段 2 · 无头启动 + cron 创建校验矩阵（准确 script_input_invalid）'
   $host1 = Start-HeadlessHost -logStem (Join-Path $Sandbox 'boot1')
-  $session1 = Get-AuthenticatedSession $host1.Url
+  Connect-Rpc $host1.Url $host1.Port
   $baseOver = @{ script = @{ command = $Node; args = @('-e', '1'); cwd = $RepoRoot } }
 
-  Assert-InvalidCron $session1 $host1.Port '宏 @daily' (New-CronInput 'bad1' '@daily' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'macro'
-  Assert-InvalidCron $session1 $host1.Port '秒字段（六位）' (New-CronInput 'bad2' '*/10 * * * * *' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'second-field'
-  Assert-InvalidCron $session1 $host1.Port 'dow 星步进（受限字段）' (New-CronInput 'bad3' '0 3 * * */2' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'day-of-week'
-  Assert-InvalidCron $session1 $host1.Port 'minute 越界' (New-CronInput 'bad4' '60 3 * * *' 'UTC' $baseOver) 'trigger.expression' 'range' 'minute'
-  Assert-InvalidCron $session1 $host1.Port '偏移时区写法' (New-CronInput 'bad5' '0 3 * * *' 'UTC+8' $baseOver) 'trigger.timeZone' 'format'
-  Assert-InvalidCron $session1 $host1.Port '时区缩写' (New-CronInput 'bad6' '0 3 * * *' 'CST' $baseOver) 'trigger.timeZone' 'format'
-  Assert-InvalidCron $session1 $host1.Port '五年窗口无解（2 月 30）' (New-CronInput 'bad7' '0 3 30 2 *' 'UTC' $baseOver) 'trigger.expression' 'no-occurrence'
-  Assert-InvalidCron $session1 $host1.Port '名称写法 MON' (New-CronInput 'bad8' '0 3 * * MON' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'day-of-week'
+  Assert-InvalidCron '宏 @daily' (New-CronInput 'bad1' '@daily' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'macro'
+  Assert-InvalidCron '秒字段（六位）' (New-CronInput 'bad2' '*/10 * * * * *' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'second-field'
+  Assert-InvalidCron 'dow 星步进（受限字段）' (New-CronInput 'bad3' '0 3 * * */2' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'day-of-week'
+  Assert-InvalidCron 'minute 越界' (New-CronInput 'bad4' '60 3 * * *' 'UTC' $baseOver) 'trigger.expression' 'range' 'minute'
+  Assert-InvalidCron '偏移时区写法' (New-CronInput 'bad5' '0 3 * * *' 'UTC+8' $baseOver) 'trigger.timeZone' 'format'
+  Assert-InvalidCron '时区缩写' (New-CronInput 'bad6' '0 3 * * *' 'CST' $baseOver) 'trigger.timeZone' 'format'
+  Assert-InvalidCron '五年窗口无解（2 月 30）' (New-CronInput 'bad7' '0 3 30 2 *' 'UTC' $baseOver) 'trigger.expression' 'no-occurrence'
+  Assert-InvalidCron '名称写法 MON' (New-CronInput 'bad8' '0 3 * * MON' 'UTC' $baseOver) 'trigger.expression' 'unsupported-part' 'day-of-week'
 
   # 失败矩阵后列表仍空：失败不产生任何记录
-  $list0 = Invoke-Rpc $session1 $host1.Port 'list' @{} 'list0'
+  $list0 = Invoke-Rpc 'list' @{} 'list0'
   Check ($list0.result.value.total -eq 0) '校验矩阵全部失败：不产生任何记录（total=0）'
 
   Step '阶段 3 · 创建 A（*/2 Asia/Shanghai）+ B（*/2 UTC，供停机错过）+ P（enabled:false 暂停）'
   $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  $rA = Invoke-Rpc $session1 $host1.Port 'create' (New-CronInput 'verify-cron-a' '*/2 * * * *' 'Asia/Shanghai') 'cA'
+  $rA = Invoke-Rpc 'create' (New-CronInput 'verify-cron-a' '*/2 * * * *' 'Asia/Shanghai') 'cA'
   Check ($rA.result.ok -eq $true) "A 创建受理（kind=cron，next=$($rA.result.value.nextOccurrence)）"
   $aNext0 = To-UtcMs $rA.result.value.nextOccurrence
   Check (($aNext0 - $t0) -gt 0 -and ($aNext0 - $t0) -le 120000) 'A：首次计划在 (创建时刻, +120s] 内（严格晚于 createdAt 的下一匹配）'
-  Check ("$($rA.result.value.nextOccurrence)" -match ':00\.000Z$') 'A：计划时刻落在分钟边界（五位 cron 分钟粒度）'
+  Check (Test-MinuteBoundary $aNext0) 'A：计划时刻落在分钟边界（五位 cron 分钟粒度）'
 
-  $rB = Invoke-Rpc $session1 $host1.Port 'create' (New-CronInput 'verify-cron-b' '*/2 * * * *' 'UTC') 'cB'
+  $rB = Invoke-Rpc 'create' (New-CronInput 'verify-cron-b' '*/2 * * * *' 'UTC') 'cB'
   Check ($rB.result.ok -eq $true) "B 创建受理（next=$($rB.result.value.nextOccurrence)）"
 
-  $rP = Invoke-Rpc $session1 $host1.Port 'create' (New-CronInput 'verify-cron-p' '*/2 * * * *' 'UTC' @{ enabled = $false }) 'cP'
+  $rP = Invoke-Rpc 'create' (New-CronInput 'verify-cron-p' '*/2 * * * *' 'UTC' @{ enabled = $false }) 'cP'
   Check ($rP.result.ok -eq $true -and $rP.result.value.status -eq 'paused' -and $null -eq $rP.result.value.nextOccurrence) `
     'P：enabled:false → paused、nextOccurrence = null'
 
@@ -207,12 +246,12 @@ try {
   $wait = 130 - [int](([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $t0) / 1000)
   if ($wait -gt 0) { Start-Sleep -Seconds $wait }
 
-  $a = Get-LatestRun $session1 $host1.Port 'verify-cron-a'
+  $a = Get-LatestRun 'verify-cron-a'
   Check ($a.run -and $a.run.trigger -eq 'cron') "A：自动 run 已持久化（trigger=$($a.run.trigger) status=$($a.run.status)）"
   Check ($a.run.status -eq 'succeeded' -and $a.run.script.exitCode -eq 0 -and $a.run.script.stdoutTail -match 'CRON-MARKER-OK') `
     'A：run succeeded、exitCode=0、stdoutTail 含标记（脚本结果可回读）'
   $aSched = To-UtcMs $a.run.scheduledAt
-  Check (($aSched - $t0) -gt 0 -and ($aSched - $t0) -le 130000 -and "$($a.run.scheduledAt)" -match ':00\.000Z$') `
+  Check (($aSched - $t0) -gt 0 -and ($aSched - $t0) -le 130000 -and (Test-MinuteBoundary $aSched)) `
     "A：scheduledAt=计划时刻（分钟边界；$($a.run.scheduledAt)）"
   $aNext1 = To-UtcMs $a.orch.nextOccurrence
   Check (($aNext1 - $aSched) -eq 120000) "A：nextOccurrence = scheduledAt + 2 分钟（$($a.orch.nextOccurrence)）"
@@ -220,14 +259,25 @@ try {
   Check ($a.orch.trigger.kind -eq 'cron' -and $a.orch.trigger.expression -eq '*/2 * * * *' -and $a.orch.trigger.timeZone -eq 'Asia/Shanghai') `
     'A：view 回读 trigger 三件套（kind/expression/timeZone）'
 
-  $p = Get-LatestRun $session1 $host1.Port 'verify-cron-p'
+  $p = Get-LatestRun 'verify-cron-p'
   Check ($p.runsCount -eq 0 -and $p.orch.status -eq 'paused' -and $null -eq $p.orch.nextOccurrence) 'P：暂停期间未触发（无 run、nextOccurrence=null）'
 
   $bootErr = Get-Content $host1.Err -Raw -ErrorAction SilentlyContinue
   Check ($null -eq $bootErr -or $bootErr -notmatch 'script-orchestrator') '启动 stderr 无 script-orchestrator 错误'
 
   Step '阶段 5 · 记录 B 基线 → 杀宿主 → 停机跨多个计划时刻（300s）→ 冷重启'
-  $b = Get-LatestRun $session1 $host1.Port 'verify-cron-b'
+  # 先等到 B 当前保留计划过去 ≥10s（该计划已触发并计入基线；杀宿主不再与在途计划竞态，
+  # 否则杀前最后一刻的正常触发会被误计为停机新增 run）
+  $b = Get-LatestRun 'verify-cron-b'
+  if ($null -ne $b.orch.nextOccurrence) {
+    $bNextRaw = To-UtcMs $b.orch.nextOccurrence
+    $wait2 = [int](($bNextRaw + 10000 - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) / 1000) + 1
+    if ($wait2 -gt 0) {
+      Write-Host "  等待 B 保留计划（$($b.orch.nextOccurrence)）结算后取稳定基线（${wait2}s）…"
+      Start-Sleep -Seconds $wait2
+    }
+  }
+  $b = Get-LatestRun 'verify-cron-b'
   $bRuns0 = $b.runsCount
   $bNext0 = $null
   if ($null -ne $b.orch.nextOccurrence) { $bNext0 = To-UtcMs $b.orch.nextOccurrence }
@@ -236,15 +286,15 @@ try {
   Write-Host '  停机等待 300 秒（跨 2-3 个 */2 计划时刻）…'
   Start-Sleep -Seconds 300
   $host2 = Start-HeadlessHost -logStem (Join-Path $Sandbox 'boot2')
-  $session2 = Get-AuthenticatedSession $host2.Url
+  Connect-Rpc $host2.Url $host2.Port
   Start-Sleep -Seconds 5 # 允许调度器处理过期计划（错过合并 → 触发）
   $bootAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
-  $b2 = Get-LatestRun $session2 $host2.Port 'verify-cron-b'
+  $b2 = Get-LatestRun 'verify-cron-b'
   Check ($b2.runsCount -eq ($bRuns0 + 1)) "B：停机多次错过合并为 1 个 run（runs=$($b2.runsCount)，基线 $bRuns0 + 1，中间触发不留记录）"
   Check ($b2.run -and $b2.run.trigger -eq 'cron' -and $b2.run.status -eq 'succeeded') "B：补的 run 结算成功（trigger=$($b2.run.trigger) status=$($b2.run.status)）"
   $bSched = To-UtcMs $b2.run.scheduledAt
-  $schedOk = ("$($b2.run.scheduledAt)" -match ':00\.000Z$') -and ($bSched -le $bootAt) -and
+  $schedOk = (Test-MinuteBoundary $bSched) -and ($bSched -le $bootAt) -and
     ($null -eq $bNext0 -or $bSched -ge $bNext0)
   Check $schedOk "B：scheduledAt=最近一次错过的计划时刻（分钟边界 ≤ 重启时刻；$($b2.run.scheduledAt)）"
   $bNext2 = To-UtcMs $b2.orch.nextOccurrence
@@ -253,15 +303,15 @@ try {
   $bNextMin = [DateTimeOffset]::FromUnixTimeMilliseconds($bNext2).UtcDateTime.Minute
   Check (($bSchedMin % 2 -eq 0) -and ($bNextMin % 2 -eq 0)) "B：合并时刻与下一计划都在 */2 匹配边界（$bSchedMin / $bNextMin 分）"
 
-  $p2 = Get-LatestRun $session2 $host2.Port 'verify-cron-p'
+  $p2 = Get-LatestRun 'verify-cron-p'
   Check ($p2.runsCount -eq 0 -and $p2.orch.status -eq 'paused' -and $null -eq $p2.orch.nextOccurrence) 'P：暂停的编排重启后不补跑（无 run、仍 paused）'
 
   # A 的未来计划在重启后同样保留（杀宿主时 A.next 已推进；重启时若已过期会合并补一次——只断言计划形状）
-  $a2 = Get-LatestRun $session2 $host2.Port 'verify-cron-a'
+  $a2 = Get-LatestRun 'verify-cron-a'
   $aNext2Ms = $null
   if ($null -ne $a2.orch.nextOccurrence) { $aNext2Ms = To-UtcMs $a2.orch.nextOccurrence }
-  Check (($a2.orch.status -eq 'active' -and $null -ne $aNext2Ms -and "$($a2.orch.nextOccurrence)" -match ':00\.000Z$') -or $a2.orch.status -eq 'active') `
-    "A：重启后仍 active（next=$($a2.orch.nextOccurrence)，未来计划按存储保留）"
+  Check ($a2.orch.status -eq 'active' -and $null -ne $aNext2Ms -and (Test-MinuteBoundary $aNext2Ms)) `
+    "A：重启后仍 active 且计划在分钟边界（next=$($a2.orch.nextOccurrence)）"
 
   $bootErr2 = Get-Content $host2.Err -Raw -ErrorAction SilentlyContinue
   Check ($null -eq $bootErr2 -or $bootErr2 -notmatch 'script-orchestrator') '重启 stderr 无 script-orchestrator 错误'
@@ -296,3 +346,4 @@ else {
   $script:Failures | ForEach-Object { Write-Host "   - $_" -ForegroundColor Red }
   exit 1
 }
+
