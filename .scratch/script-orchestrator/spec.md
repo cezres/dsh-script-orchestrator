@@ -69,6 +69,8 @@ panel（Web client；单包双面：管理表格 + 居中模态 + 对话式创�
 - 运行验收链：五工具 smoke → 分别创建 every 与 cron 编排并各自动触发一次 → 判定 → 三动作 → 事件 → 面板对话入口与居中模态 run 历史 → 删除级联；
 - W1/W2 语义复测（terminate→`{1,null}`、spill 可读、超 cap 撤回）。
 
+> **验收结果（2026-11-09）**：上述验收门由 [完成 Windows 全链路交付验收](issues/36-windows-release-acceptance.md) 执行并通过——单元/进程/集成测试 580 用例全绿，隔离集成矩阵 verify-ticket24–36 全部 PASS；完整环境、命令、结果与残余风险见 [验收记录](evidence/ticket36-acceptance.md)。HMR 与坏 client 包实例化未验证（如实列为残余风险）；macOS 仍仅源码证据声明。
+
 **macOS（证据声明，非验收门）**：PGID 终止回退、`signal` 语义未实机验证——代码路径按源码事实实现（[核实子进程与跨平台终止语义](issues/03-research-subprocess.md)），不做实机断言。
 
 ## 6 · 已知残余风险（如实交接）
