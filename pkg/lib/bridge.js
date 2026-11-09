@@ -143,7 +143,19 @@ export function createBridgeHandler({ service }) {
       if (violation) return violation
       return { ok: true, value: await service.view(payload.id, 'runs' in payload ? { runs: payload.runs } : {}) }
     },
-    // edit/run/listActions 属后续票（spec §3 步骤 6；票 28/26/31）
+    // listActions（契约 11 端点表：编辑器的注册动作提示；票 31 开放注册后上线）
+    listActions: async (payload) => {
+      if (payload !== undefined) {
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+          return invalid('payload', 'format', 'listActions 的参数必须是空对象 {}')
+        }
+        for (const key of Object.keys(payload)) {
+          return invalid(key, 'unexpected', `listActions 不接受字段 '${key}'（空对象 {} 即可）`)
+        }
+      }
+      return { ok: true, value: service.listActions() }
+    },
+    // edit/run 属后续票（spec §3 步骤 6；票 28/26）
   }
   return async function bridgeHandler(endpoint, payload, _signal, _peer) {
     try {

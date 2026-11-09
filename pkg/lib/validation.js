@@ -1,7 +1,9 @@
 // OrchestrationInput 校验与归一化（唯一事实源：服务层；契约 docs/temp/01-domain-model.md、
 // 02-triggers.md、03-execution.md、04-judge.md、05-actions.md）。
 // 工具层与桥只做各自传输层的形状校验（07 / 11），语义规则全部在此定义一次。
-// 票 25 范围：trigger 只接受 every；cron 属票 27（在此给出准确的「尚未支持」错误）。
+// trigger：every（票 25）+ cron（票 27：五位 Vixie 子集白名单 + 显式 IANA 时区；
+// 库 Cron.parse 接受的语法是超集，契约子集在此收紧，错误 field/reason/part 全可控）。
+import { canonicalizeTimeZone } from '@deepseek-ai/dsh-util-time'
 import { inputInvalid, isPlainObject, isLosslessJson } from './errors.js'
 
 export const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -69,15 +71,141 @@ function validateTrigger(trigger) {
     throw inputInvalid('trigger.kind', 'format', 'trigger.kind 缺失或不是字符串')
   }
   if (trigger.kind === 'every') return validateEveryTrigger(trigger)
-  if (trigger.kind === 'cron') {
-    // 契约 02 定义了 cron，但实现按票序尚未交付（票 27）：给出准确的暂不支持错误
-    throw inputInvalid(
-      'trigger.kind',
+  if (trigger.kind === 'cron') return validateCronTrigger(trigger)
+  throw inputInvalid('trigger.kind', 'format', `未知的 trigger.kind '${trigger.kind}'（v0.1 仅 every / cron）`)
+}
+
+// ---------------- cron（契约 02「cron 子集」） ----------------
+
+// 五位字段范围；星步进（星号斜杠 n）仅分钟与小时（契约 02 逐字：分钟与小时支持 /step）。
+const CRON_FIELD_SPECS = [
+  { name: 'minute', min: 0, max: 59, allowStarStep: true },
+  { name: 'hour', min: 0, max: 23, allowStarStep: true },
+  { name: 'day-of-month', min: 1, max: 31, allowStarStep: false },
+  { name: 'month', min: 1, max: 12, allowStarStep: false },
+  { name: 'day-of-week', min: 0, max: 7, allowStarStep: false }, // 0 与 7 都表示周日（折叠由 Cron.parse 完成）
+]
+
+const expressionInvalid = (reason, message, part) =>
+  inputInvalid('trigger.expression', reason, message, part === undefined ? {} : { part })
+
+/** 单字段元素形态：a、a-b、a-b/n（数值系；星步进由 star-step 分支先行处理）。 */
+const CRON_ELEMENT = /^(\d+)(?:-(\d+))?(?:\/(\d+))?$/
+
+function validateCronFieldElement(element, spec) {
+  // 名称写法（JAN/MON 等）是明确不支持的部件，先于一般语法错误报告
+  if (/[A-Za-z]/.test(element)) {
+    throw expressionInvalid(
       'unsupported-part',
-      "cron 触发尚未实现（后续票交付）；当前仅接受 kind: 'every'",
+      `cron ${spec.name} 字段不接受名称写法 '${element}'（全部字段只接受数字）`,
+      spec.name,
     )
   }
-  throw inputInvalid('trigger.kind', 'format', `未知的 trigger.kind '${trigger.kind}'（v0.1 仅 every / cron）`)
+  const match = CRON_ELEMENT.exec(element)
+  if (match === null) {
+    throw expressionInvalid(
+      'format',
+      `cron ${spec.name} 字段元素 '${element}' 必须是 a、a-b 或 a-b/step（数字形式）`,
+      spec.name,
+    )
+  }
+  const start = Number(match[1])
+  const end = match[2] === undefined ? undefined : Number(match[2])
+  const step = match[3] === undefined ? undefined : Number(match[3])
+  for (const value of [start, end]) {
+    if (value !== undefined && (value < spec.min || value > spec.max)) {
+      throw expressionInvalid('range', `cron ${spec.name} 字段值 ${value} 越界（${spec.min}–${spec.max}）`, spec.name)
+    }
+  }
+  // 无范围的裸 step（5/15）不在契约子集（契约仅允许 */n 形式的星步进）
+  if (end === undefined && step !== undefined) {
+    throw expressionInvalid('format', `cron ${spec.name} 字段不接受无范围 step '${element}'（仅 a-b/step 或 */n）`, spec.name)
+  }
+  if (end !== undefined && start > end) {
+    throw expressionInvalid('format', `cron ${spec.name} 字段范围 ${start}-${end} 反转（须升序）`, spec.name)
+  }
+  if (step !== undefined && step < 1) {
+    throw expressionInvalid('format', `cron ${spec.name} 字段 step 必须是正整数（得到 ${match[3]}）`, spec.name)
+  }
+}
+
+function validateCronField(raw, spec) {
+  const elements = raw.split(',')
+  for (const element of elements) {
+    if (element.length === 0) {
+      throw expressionInvalid('format', `cron ${spec.name} 字段列表含空元素（'${raw}'）`, spec.name)
+    }
+    if (element === '*') {
+      // 星只允许独占整字段（*,5 的混用无意义且超契约子集）
+      if (elements.length !== 1) {
+        throw expressionInvalid('format', `cron ${spec.name} 字段的 '*' 不能与其他元素混用（'${raw}'）`, spec.name)
+      }
+      continue
+    }
+    if (element.startsWith('*/')) {
+      if (!spec.allowStarStep) {
+        throw expressionInvalid(
+          'unsupported-part',
+          `cron ${spec.name} 字段不支持星步进 '${element}'（*/step 仅分钟与小时）`,
+          spec.name,
+        )
+      }
+      if (elements.length !== 1) {
+        throw expressionInvalid('format', `cron ${spec.name} 字段的星步进不能与其他元素混用（'${raw}'）`, spec.name)
+      }
+      const stepText = element.slice(2)
+      if (!/^\d+$/.test(stepText) || Number(stepText) < 1) {
+        throw expressionInvalid('format', `cron ${spec.name} 字段 step 必须是正整数（'${element}'）`, spec.name)
+      }
+      continue
+    }
+    validateCronFieldElement(element, spec)
+  }
+}
+
+function validateCronTrigger(trigger) {
+  const unexpected = firstUnexpectedKey(trigger, new Set(['kind', 'expression', 'timeZone']), 'trigger')
+  if (unexpected) throw unexpected
+  if (!('expression' in trigger)) {
+    throw inputInvalid('trigger.expression', 'missing', 'trigger.expression 缺失（cron 必须给出五位表达式）')
+  }
+  requireString(trigger.expression, 'trigger.expression')
+  if (!('timeZone' in trigger)) {
+    throw inputInvalid('trigger.timeZone', 'missing', 'trigger.timeZone 缺失（cron 必须显式给出 IANA 时区）')
+  }
+  requireString(trigger.timeZone, 'trigger.timeZone')
+
+  const { expression } = trigger
+  if (expression.trim() !== expression) {
+    throw expressionInvalid('format', 'cron 表达式不能含首尾空白')
+  }
+  if (expression.startsWith('@')) {
+    throw expressionInvalid('unsupported-part', `不支持宏 '${expression}'（仅五位数字 cron）`, 'macro')
+  }
+  const fields = expression.split(/\s+/)
+  if (fields.length > 5) {
+    throw expressionInvalid(
+      'unsupported-part',
+      `cron 表达式必须是五个字段（得到 ${fields.length} 个：秒/年字段不受支持）`,
+      'second-field',
+    )
+  }
+  if (fields.length !== 5) {
+    throw expressionInvalid('format', `cron 表达式必须是五个空白分隔字段 minute hour day-of-month month day-of-week（得到 ${fields.length} 个）`)
+  }
+  fields.forEach((raw, index) => validateCronField(raw, CRON_FIELD_SPECS[index]))
+
+  // 时区：显式 IANA Area/Location 或 UTC；拒绝缩写与偏移写法（契约 02「时区与夏令时」）。
+  // 别名规范化为平台规范名（库设计：zone 随记录持久并在另一进程重解析）。
+  const zone = canonicalizeTimeZone(trigger.timeZone)
+  if (zone.kind === 'rejected') {
+    throw inputInvalid(
+      'trigger.timeZone',
+      'format',
+      `时区 '${trigger.timeZone}' 不是可接受的 IANA Area/Location 名（拒绝原因 ${zone.reason}；偏移写法须用 Etc/GMT-x 形式）`,
+    )
+  }
+  return { kind: 'cron', expression, timeZone: zone.timeZone }
 }
 
 // ---------------- script ----------------

@@ -337,7 +337,6 @@ describe('create 校验矩阵（契约 01–05；失败不产生任何记录、�
     ['enabled 非布尔', (i) => { i.enabled = 'yes' }, 'enabled', 'format'],
     ['overlap 非法', (i) => { i.overlap = 'both' }, 'overlap', 'format'],
     ['trigger 缺失', (i) => { delete i.trigger }, 'trigger', 'missing'],
-    ['trigger.kind cron（尚未实现）', (i) => { i.trigger = { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' } }, 'trigger.kind', 'unsupported-part'],
     ['trigger.kind 未知', (i) => { i.trigger = { kind: 'daily' } }, 'trigger.kind', 'format'],
     ['every + 多余字段', (i) => { i.trigger.expression = '0 3 * * *' }, 'trigger.expression', 'unexpected'],
     ['everySeconds 缺失', (i) => { delete i.trigger.everySeconds }, 'trigger.everySeconds', 'missing'],
@@ -440,5 +439,228 @@ describe('create 校验矩阵（契约 01–05；失败不产生任何记录、�
     expect(view.script.args).toEqual([])
     expect(view.script.env).toEqual({})
     expect(view.status).toBe('active')
+  })
+})
+
+describe('registerAction / listActions（契约 06 注册动作：票 31）', () => {
+  it('registerAction 是同步方法：返回 disposer 函数（非 Promise）', () => {
+    const { service } = makeService()
+    const dispose = service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(typeof dispose).toBe('function')
+    expect(dispose).not.toBeInstanceOf(Promise)
+  })
+
+  it('注册后 listActions() 按 name 排序返回 { name, description? }；view 的 availableActions 与服务一致', async () => {
+    const { service } = makeService()
+    service.registerAction({ name: 'ops.oncall', description: '按 severity 呼叫值班', run: async () => {} })
+    service.registerAction({ name: 'alpha.ping', run: async () => {} })
+    const expected = [
+      { name: 'alpha.ping' },
+      { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+    ]
+    expect(service.listActions()).toEqual(expected)
+    const created = await service.create(baseInput())
+    const detail = await service.view(created.id)
+    expect(detail.availableActions).toEqual(expected)
+    expect(detail.availableActions).toEqual(service.listActions())
+  })
+
+  it('不合规名字 / 保留前缀 / definition 形状错误 → 同步抛 Error（非 rejected Promise）', () => {
+    const { service } = makeService()
+    expect(() => service.registerAction({ name: 'oncall', run: async () => {} })).toThrow()
+    expect(() => service.registerAction({ name: 'a.b.c', run: async () => {} })).toThrow()
+    expect(() => service.registerAction({ name: 'script-orchestrator.echo', run: async () => {} })).toThrow(/script-orchestrator/)
+    expect(() => service.registerAction({ name: 'ops.oncall' })).toThrow() // 缺 run
+  })
+
+  it('重名注册同步抛 Error（消息含冲突名），既有注册不受影响', () => {
+    const { service } = makeService()
+    service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(() => service.registerAction({ name: 'ops.oncall', run: async () => {} })).toThrow(/ops\.oncall/)
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall' }])
+  })
+
+  it('disposer 摘除后 listActions 与 view.availableActions 同步反映（幂等、可重注册）', async () => {
+    const { service } = makeService()
+    const dispose = service.registerAction({ name: 'ops.oncall', description: 'v1', run: async () => {} })
+    dispose()
+    dispose() // 幂等
+    expect(service.listActions()).toEqual([])
+    // 同步紧随的重注册不误冲突（disposer 同步完成摘除）
+    const dispose2 = service.registerAction({ name: 'ops.oncall', description: 'v2', run: async () => {} })
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall', description: 'v2' }])
+    const created = await service.create(baseInput())
+    expect((await service.view(created.id)).availableActions).toEqual([{ name: 'ops.oncall', description: 'v2' }])
+    dispose2()
+    expect((await service.view(created.id)).availableActions).toEqual([])
+  })
+
+  it('缺省自建注册表（未注入 actionRegistry）与注入共享实例行为一致：注册 → 快照 → 摘除', () => {
+    const { service } = makeService() // 未注入 actionRegistry
+    const dispose = service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall' }])
+    dispose()
+    expect(service.listActions()).toEqual([])
+  })
+})
+
+describe('create cron 校验（契约 02「cron 子集」「时区与夏令时」「校验错误」；票 27）', () => {
+  /** 基线合法 cron 输入。 */
+  const cronInput = (over = {}) => ({
+    ...baseInput(),
+    trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' },
+    ...over,
+  })
+
+  // [标签, expression, 期望 reason, 期望 part]（timeZone 基线合法；expression 变异）
+  const expressionCases = [
+    ['宏 @daily', '@daily', 'unsupported-part', 'macro'],
+    ['宏 @weekly 带时区前缀空格', ' @weekly', 'format', undefined],
+    ['秒字段（六位）', '*/10 * * * * *', 'unsupported-part', 'second-field'],
+    ['秒字段 + 年（七位）', '0 0 0 1 1 * 2030', 'unsupported-part', 'second-field'],
+    ['月份名称 JAN', '0 3 1 JAN *', 'unsupported-part', 'month'],
+    ['星期名称 MON', '0 3 * * MON', 'unsupported-part', 'day-of-week'],
+    ['minute 越界 60', '60 3 * * *', 'range', 'minute'],
+    ['minute 越界 -5', '-5 3 * * *', 'format', 'minute'],
+    ['hour 越界 24', '0 24 * * *', 'range', 'hour'],
+    ['day-of-month 越界 0', '0 3 0 * *', 'range', 'day-of-month'],
+    ['day-of-month 越界 32', '0 3 32 * *', 'range', 'day-of-month'],
+    ['month 越界 13', '0 3 * 13 *', 'range', 'month'],
+    ['month 越界 0', '0 3 * 0 *', 'range', 'month'],
+    ['day-of-week 越界 8', '0 3 * * 8', 'range', 'day-of-week'],
+    ['范围反转 50-10', '50-10 3 * * *', 'format', 'minute'],
+    ['step 为 0', '*/0 3 * * *', 'format', 'minute'],
+    ['step 非整数', '*/1.5 3 * * *', 'format', 'minute'],
+    ['无范围 step 5/15（仅 */n 允许）', '5/15 * * * *', 'format', 'minute'],
+    ['star-step 用于 day-of-month', '0 3 */2 * *', 'unsupported-part', 'day-of-month'],
+    ['star-step 用于 month', '0 3 * */2 *', 'unsupported-part', 'month'],
+    ['star-step 用于 day-of-week', '0 3 * * */2', 'unsupported-part', 'day-of-week'],
+    ['星与列表混用 *,5', '*,5 3 * * *', 'format', 'minute'],
+    ['star-step 与列表混用 */5,30', '*/5,30 3 * * *', 'format', 'minute'],
+    ['空列表元素 5,,6', '5,,6 3 * * *', 'format', 'minute'],
+    ['逗号结尾 5,', '5, 3 * * *', 'format', 'minute'],
+    ['四字段', '0 3 * *', 'format', undefined],
+    ['空字符串', '', 'format', undefined],
+    ['首尾空白', ' 0 3 * * * ', 'format', undefined],
+    ['列表内范围步进越界 a-b/n 的 b 越界', '0 3 1-32/2 * *', 'range', 'day-of-month'],
+  ]
+
+  it.each(expressionCases)('expression %s → script_input_invalid（%s）', async (_label, expression, reason, part) => {
+    const { service, storage, emitted } = makeService()
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', expression, timeZone: 'Asia/Shanghai' } }))).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'trigger.expression', reason, ...(part === undefined ? {} : { part }) },
+    })
+    expect(storage.snapshot().orchestrations).toEqual({})
+    expect(emitted).toEqual([])
+  })
+
+  // [标签, timeZone, 期望 reason]
+  const timeZoneCases = [
+    ['缩写 GMT', 'GMT', 'format'],
+    ['缩写 CST', 'CST', 'format'],
+    ['偏移写法 UTC+8', 'UTC+8', 'format'],
+    ['数字偏移 +08:00', '+08:00', 'format'],
+    ['未知名 Asia/Nope', 'Asia/Nope', 'format'],
+    ['单段名 Shanghai', 'Shanghai', 'format'],
+  ]
+
+  it.each(timeZoneCases)('timeZone %s → script_input_invalid（format）', async (_label, timeZone, reason) => {
+    const { service } = makeService()
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 * * *', timeZone } }))).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'trigger.timeZone', reason },
+    })
+  })
+
+  it('timeZone 缺失 → missing；非字符串 → format；cron 带 everySeconds/mode → unexpected', async () => {
+    const { service } = makeService()
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 * * *' } }))).rejects.toMatchObject({
+      details: { field: 'trigger.timeZone', reason: 'missing' },
+    })
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 8 } }))).rejects.toMatchObject({
+      details: { field: 'trigger.timeZone', reason: 'format' },
+    })
+    await expect(
+      service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'UTC', everySeconds: 300, mode: 'fixed-rate' } })),
+    ).rejects.toMatchObject({ details: { field: 'trigger.everySeconds', reason: 'unexpected' } })
+  })
+
+  it('expression 缺失 → missing；非字符串 → format', async () => {
+    const { service } = makeService()
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', timeZone: 'UTC' } }))).rejects.toMatchObject({
+      details: { field: 'trigger.expression', reason: 'missing' },
+    })
+    await expect(service.create(cronInput({ trigger: { kind: 'cron', expression: 42, timeZone: 'UTC' } }))).rejects.toMatchObject({
+      details: { field: 'trigger.expression', reason: 'format' },
+    })
+  })
+
+  it('合法子集通过：dow 7 与 0 同为周日；别名时区可接受（规范名随平台）', async () => {
+    const { service } = makeService()
+    const view = await service.create(cronInput({ trigger: { kind: 'cron', expression: '0 9 * * 1,3,5', timeZone: 'Asia/Calcutta' } }))
+    // canonicalizeTimeZone 委托 Intl resolvedOptions：本机 ICU 对别名保留原样（Asia/Calcutta），
+    // 其他平台可能规范化为 Asia/Kolkata——两者都表示同一 zone，断言集合成员而非具体值。
+    expect(['Asia/Calcutta', 'Asia/Kolkata']).toContain(view.trigger.timeZone)
+    expect(view.trigger.expression).toBe('0 9 * * 1,3,5')
+    expect(view.trigger.kind).toBe('cron')
+    const sunday = await service.create(cronInput({ id: 'sunday', title: 'sunday', trigger: { kind: 'cron', expression: '0 9 * * 7', timeZone: 'Etc/GMT-8' } }))
+    expect(sunday.trigger).toEqual({ kind: 'cron', expression: '0 9 * * 7', timeZone: 'Etc/GMT-8' })
+    // minute/hour 的 */n、a-b/n、逗号列表均属契约子集
+    const stepped = await service.create(cronInput({ id: 'stepped', title: 'stepped', trigger: { kind: 'cron', expression: '*/15 3 * * *', timeZone: 'UTC' } }))
+    expect(stepped.trigger.expression).toBe('*/15 3 * * *')
+    const listed = await service.create(cronInput({ id: 'listed', title: 'listed', trigger: { kind: 'cron', expression: '0,30 3 1-7/2 * *', timeZone: 'UTC' } }))
+    expect(listed.trigger.expression).toBe('0,30 3 1-7/2 * *')
+  })
+
+  it('创建 active cron：nextOccurrence = 严格晚于 createdAt 的下一匹配（独立手算）', async () => {
+    const { service } = makeService()
+    // NOW = 2026-09-21T14:13:20Z = 上海本地 22:13 → 下一个本地 03:00 是 09-22 03:00 = 09-21T19:00Z
+    const view = await service.create(cronInput())
+    expect(view.status).toBe('active')
+    expect(view.nextOccurrence).toBe('2026-09-21T19:00:00.000Z')
+  })
+
+  it('createdAt 恰为匹配时刻：nextOccurrence 严格大于（取次日同时刻）', async () => {
+    const { service } = makeService({ now: () => Date.parse('2026-09-21T19:00:00.000Z') }) // 上海本地 09-22 03:00
+    const view = await service.create(cronInput())
+    expect(view.nextOccurrence).toBe('2026-09-22T19:00:00.000Z') // 次日本地 03:00
+  })
+
+  it('enabled:false 的 cron 创建为 paused、nextOccurrence = null（仍持久化并发布 changed）', async () => {
+    const { service, emitted } = makeService()
+    const view = await service.create(cronInput({ enabled: false }))
+    expect(view.status).toBe('paused')
+    expect(view.nextOccurrence).toBeNull()
+    expect(emitted).toEqual([['script-orchestrator/changed', undefined]])
+  })
+
+  it('五年窗口内无解 → script_input_invalid（reason: no-occurrence）且失败不产生任何记录', async () => {
+    const { service, storage, emitted } = makeService()
+    // 2 月 30 日：库 400 年地平线内永无解
+    await expect(
+      service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 30 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'trigger.expression', reason: 'no-occurrence' },
+    })
+    // 2 月 29 日在 2097 年视角：下一个 2/29 是 2104（其间 2100 非闰年），距参考时刻超 5 年窗口
+    const future = makeService({ now: () => Date.parse('2097-03-01T00:00:00.000Z') })
+    await expect(
+      future.service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 29 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({ details: { field: 'trigger.expression', reason: 'no-occurrence' } })
+    // 同一 2/29 表达式在 2026 年视角有解（2028-02-29 在窗口内）：正常创建
+    const ok = await service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 29 2 *', timeZone: 'UTC' } }))
+    expect(ok.nextOccurrence).toBe('2028-02-29T03:00:00.000Z')
+    expect(storage.snapshot().orchestrations).toHaveProperty('log-rotate')
+    expect(emitted).toEqual([['script-orchestrator/changed', undefined]])
+  })
+
+  it('无解拒绝与 enabled 无关：paused 创建同样拒绝（配置永不有效，契约 02「不写入立即 ended 的编排」）', async () => {
+    const { service, storage } = makeService()
+    await expect(
+      service.create(cronInput({ enabled: false, trigger: { kind: 'cron', expression: '0 3 30 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({ details: { field: 'trigger.expression', reason: 'no-occurrence' } })
+    expect(storage.snapshot().orchestrations).toEqual({})
   })
 })

@@ -1,9 +1,9 @@
 // 管理服务（ctx.scriptOrchestrator 的实现面，契约 docs/temp/06-events-service.md）。
 // 语义唯一权威：校验规则、错误码、分页过滤都在此定义一次；工具（07）与桥（11）是薄适配层。
-// 票 25 范围：create（every）/list/view/listActions；edit/run/registerAction 属票 28/26/31。
+// 票 25 范围：create（every）/list/view/listActions；edit/run 属票 28/26。
 // 一切持久写入经服务层 FIFO 整槽（契约 08「写入」）；changed 在持久写入完成后发布（契约 06）。
-// 票 30：动作注册表可与 runner 共享同一实例（index.js 装配）——listActions 取快照、
-// runner 逐动作实时查表用同一张表；registerAction 的注册面属票 31。
+// 票 31：registerAction 开放注册面（registry.register，同步校验 + disposer 四不变量）；
+// 与 runner 共享同一注册表实例（index.js 装配）——listActions 快照与执行期查表同源。
 import { OrchestratorError, inputInvalid } from './errors.js'
 import { validateOrchestrationInput } from './validation.js'
 import { nextOccurrence } from './triggers.js'
@@ -31,7 +31,7 @@ function slugifyTitle(title) {
  * @param {object} [deps.runner] 执行引擎（liveView 合并活动 run 的内存态到 view）
  * @param {() => void} [deps.onMutation] 编排集合持久变更后的回调（调度器重算 timer）
  * @param {object} [deps.actionRegistry] 动作注册表（缺省自建；与 runner 共享同一实例时
- *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction；注册面属票 31）
+ *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction）
  */
 export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry }) {
   void config
@@ -51,7 +51,7 @@ export function createManagementService({ storage, queue, config, now, emit, log
     }
   }
 
-  // 注册动作表（共享实例时与 runner 查表同源；registerAction 注册面属票 31）
+  // 编排集合持久变更 → 调度器重算单 timer（cron/every 统一经此联动）
   const notifyMutation = onMutation ?? (() => {})
 
   return {
@@ -81,6 +81,15 @@ export function createManagementService({ storage, queue, config, now, emit, log
 
         const createdAtMs = currentTime()
         const createdAt = new Date(createdAtMs).toISOString()
+        // 契约 02「cron 子集」：创建/更新时从校验参考时刻起 5 年内无任何有效计划时刻 → 拒绝，
+        // 不写入立即 ended 的编排（错误 reason: no-occurrence）；与 enabled 无关（配置永不有效）。
+        if (normalized.trigger.kind === 'cron' && nextOccurrence(normalized.trigger, createdAtMs) === null) {
+          throw inputInvalid(
+            'trigger.expression',
+            'no-occurrence',
+            'cron 表达式在创建时刻起的 5 年内没有任何有效计划时刻',
+          )
+        }
         // 契约 02「创建」：enabled:false → paused、nextOccurrence = null；
         // 两种 every 模式首次计划均为 createdAt + everySeconds，不立即执行。
         const status = normalized.enabled ? 'active' : 'paused'
@@ -155,6 +164,16 @@ export function createManagementService({ storage, queue, config, now, emit, log
     /** 注册动作表快照，按 name 排序（契约 06）。 */
     listActions() {
       return registry.snapshot()
+    },
+
+    /**
+     * 注册一个可被 plugin 动作调用的具名动作（契约 06）；同步返回 disposer。
+     * 所有权只属调用方：本服务不自动叠加 effect/清理——调用方插件用 ctx.effect
+     * 持有 disposer（契约明文「registerAction 自身不绑定清理」）。
+     * 名字格式、保留前缀、重名与 definition 形状校验全部同步抛 Error（注册表是唯一权威）。
+     */
+    registerAction(definition) {
+      return registry.register(definition)
     },
   }
 }

@@ -225,6 +225,11 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     expect(options.whenDraftExists).toBe('append')
     expect(options.prompt).toContain('script_create')
     expect(options.prompt).toContain('every')
+    // 票 27：引导 prompt 覆盖 cron（五位表达式、显式时区、每日/每周预设生成 cron、周日为 0）
+    expect(options.prompt).toContain('cron')
+    expect(options.prompt).toContain('时区')
+    expect(options.prompt).toContain('0 3 * * *')
+    expect(options.prompt).toContain('周日')
   })
 
   it('面板渲染列表项：every 触发摘要、状态、下次时刻', async () => {
@@ -339,6 +344,57 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
       for (const listener of [...resetListeners]) listener()
     })
     expect(calls).toEqual(['list', 'view', 'list', 'view'])
+    view.unmount()
+  })
+
+  it('cron 编排：列表与详情模态显示表达式、时区与下次时刻；每日预设回显语义摘要（契约 02「每日/每周面板预设」）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const cronOrch = {
+      ...ORCH,
+      id: 'nightly-check',
+      title: '夜间巡检',
+      trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' },
+    }
+    const call = (endpoint) =>
+      Promise.resolve(endpoint === 'list'
+        ? { ok: true, value: { items: [cronOrch], total: 1, nextOffset: null } }
+        : { ok: true, value: { ...cronOrch, runs: [], availableActions: [] } })
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    let text = view.text()
+    expect(text).toContain('0 3 * * *')
+    expect(text).toContain('Asia/Shanghai')
+    expect(text).toContain('每天 03:00')
+    expect(text).toContain('2026-11-09 00:05')
+    await view.clickRow('夜间巡检')
+    const modal = view.modal()
+    expect(modal.textContent).toContain('0 3 * * *')
+    expect(modal.textContent).toContain('Asia/Shanghai')
+    expect(modal.textContent).toContain('每天 03:00')
+    expect(modal.textContent).toContain('2026-11-09 00:05')
+    view.unmount()
+  })
+
+  it('每周预设回显语义摘要（0 9 * * 1,3,5 / 周日 0 与 7 等价）；复杂表达式只显示原文', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const weekly = { ...ORCH, id: 'w', title: 'w', trigger: { kind: 'cron', expression: '0 9 * * 1,3,5', timeZone: 'UTC' } }
+    const sunday = { ...ORCH, id: 's', title: 's', trigger: { kind: 'cron', expression: '0 9 * * 0', timeZone: 'UTC' } }
+    const sunday7 = { ...ORCH, id: 's7', title: 's7', trigger: { kind: 'cron', expression: '0 9 * * 7', timeZone: 'UTC' } }
+    const complex = { ...ORCH, id: 'c', title: 'c', trigger: { kind: 'cron', expression: '*/15 3 * * *', timeZone: 'UTC' } }
+    const call = () =>
+      Promise.resolve({ ok: true, value: { items: [weekly, sunday, sunday7, complex], total: 4, nextOffset: null } })
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    const text = view.text()
+    expect(text).toContain('每周一/三/五 09:00')
+    expect(text).toContain('每周日 09:00')
+    expect(text).not.toContain('每天 09:00')
+    // 复杂表达式（step）不强行回显简单摘要，只显示原文
+    const complexRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('*/15'))
+    expect(complexRow).toBeTruthy()
+    expect(complexRow.textContent).toContain('*/15 3 * * *')
     view.unmount()
   })
 })
@@ -485,6 +541,47 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     expect(modalText).toContain('unknown variable: {{nope}}')
     expect(modalText).toContain('unknown_action')
     expect(modalText).toContain('已跳过')
+    view.unmount()
+  })
+
+  it('票 31 注册动作展示：plugin 动作成功 + report() 警告、timeout 错误码、可用注册动作（name + description）', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView({
+              status: 'partial',
+              matchedRule: 0,
+              usedFallback: false,
+              actions: [
+                { name: 'page', kind: 'plugin', status: 'succeeded', warnings: ['已呼叫值班'] },
+                { name: 'slow-page', kind: 'plugin', status: 'failed', error: { code: 'timeout', message: "plugin 动作 'slow-page'（ops.slow）超过 2 秒未完成" } },
+              ],
+            }),
+          ],
+          availableActions: [
+            { name: 'alpha.ping' },
+            { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+          ],
+        },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    // 动作段：plugin 成功与失败（timeout 错误码）、report() 警告
+    expect(modalText).toContain('page')
+    expect(modalText).toContain('slow-page')
+    expect(modalText).toContain('timeout')
+    expect(modalText).toContain('已呼叫值班')
+    // 可用注册动作段：name 与 description
+    expect(modalText).toContain('可用注册动作')
+    expect(modalText).toContain('ops.oncall')
+    expect(modalText).toContain('按 severity 呼叫值班')
+    expect(modalText).toContain('alpha.ping')
     view.unmount()
   })
 

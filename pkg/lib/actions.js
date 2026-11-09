@@ -4,21 +4,70 @@
 // - event：发出 script-orchestrator/<短名>，载荷固定四键（契约 05）；发出即忘——listener
 //   同步抛错由发布端兜底记 event_listener_failed，动作仍视为成功（契约 06 双层隔离）。
 // - plugin：逐动作执行前实时查注册表（不缓存），未注册/已摘除 → failed unknown_action；
-//   已注册则以 ActionContext 调用（契约 06）；registerAction/disposer 四不变量属票 31。
+//   已注册则以 ActionContext 调用（契约 06），超时（timeoutSeconds，默认 30 秒）→ failed
+//   timeout；注册面 registry.register 与 disposer 四不变量见 createActionRegistry。
 // - session：persistent 投递经 sessionHost（lib/session-action.js，票 32）；ephemeral
 //   的 agents.create/whenIdle/dispose 生命周期属票 33。
 // dispatching 取消（契约 03/09）：取消请求后停止派发剩余动作（记 skipped），在途动作经其
 // signal 中止、结果如实记录——run 终态优先于动作汇总的落盘由 runner（settle）负责。
 import { buildTemplateVariables, renderPayload, renderTemplate, appendWarning } from './judge.js'
 import { deliverPersistentSession, SessionActionError } from './session-action.js'
+import { REGISTERED_ACTION_PATTERN } from './validation.js'
+
+/** 保留前缀（契约 06：仅此一个，防冒名内置能力；其余一概不保留）。 */
+const RESERVED_ACTION_PREFIX = 'script-orchestrator.'
 
 /**
- * 动作注册表（服务实例内部表）。票 30 只需查表（resolve）与快照（snapshot）面；
- * registerAction 的注册/重名/disposer 四不变量属票 31。
+ * 动作注册表（服务实例内部表）。register（注册与 disposer 四不变量）/ resolve
+ * （执行期逐动作实时查表）/ snapshot（listActions 与 availableActions 展示快照）。
  */
 export function createActionRegistry() {
-  const entries = new Map()
+  const entries = new Map() // name → { name, description?, run, token }
   return {
+    /**
+     * 注册一个具名动作（契约 06 registerAction）；返回 disposer。
+     * 校验失败与重名均同步抛 Error（不进契约 09 错误码表——这是对插件作者的
+     * 编程错误，不是编排配置错误）。disposer 四不变量：
+     * 幂等（重复调用无害）、同步（返回前完成摘除）、按注册 token 精确删除
+     * （只删自己那次，同名新注册不被旧 disposer 误删）、注册表为实例内部表
+     * （服务整体替换时旧实例 disposer 不影响新实例）。
+     * 所有权只属调用方 ctx.effect（本注册表不绑定任何清理）。
+     */
+    register(definition) {
+      if (definition === null || typeof definition !== 'object' || Array.isArray(definition)) {
+        throw new Error('registerAction 的 definition 必须是对象 { name, description?, run }')
+      }
+      const { name, description, run } = definition
+      if (typeof name !== 'string' || !REGISTERED_ACTION_PATTERN.test(name)) {
+        throw new Error(
+          `注册动作名 '${String(name)}' 不合规：必须形如 <namespace>.<verb>（恰好一个点，两段各 ^[a-z][a-z0-9-]{0,29}$，整体最长 61）`,
+        )
+      }
+      if (name.startsWith(RESERVED_ACTION_PREFIX)) {
+        throw new Error(`注册动作名 '${name}' 使用保留前缀 '${RESERVED_ACTION_PREFIX}'（防冒名内置能力），不可注册`)
+      }
+      if (description !== undefined && typeof description !== 'string') {
+        throw new Error(`注册动作 '${name}' 的 description 必须是字符串（省略即可）`)
+      }
+      if (typeof run !== 'function') {
+        throw new Error(`注册动作 '${name}' 的 run 必须是函数 run(context): Promise<void>`)
+      }
+      if (entries.has(name)) {
+        // 重名同步抛错（契约 06）：不覆盖；「先 dispose 再注册」由调用方生命周期保证
+        throw new Error(`注册动作名 '${name}' 已被注册（重复注册不覆盖；同一存活期内不应重复注册）`)
+      }
+      const token = Symbol('orchestrator-action-token')
+      entries.set(name, { name, ...(description !== undefined ? { description } : {}), run, token })
+      let disposed = false
+      return () => {
+        if (disposed) return // ①幂等
+        disposed = true
+        // ②同步：返回前完成摘除；③按 token 精确删除：只删自己那次注册
+        const current = entries.get(name)
+        if (current !== undefined && current.token === token) entries.delete(name)
+        // ④实例隔离由闭包内的 entries（每实例一张表）自然保证
+      }
+    },
     /** 逐动作执行前实时查表（契约 06：不缓存解析结果）。 */
     resolve(name) {
       return entries.get(name)
@@ -44,6 +93,9 @@ export function aggregateRunStatus(results) {
   if (succeeded === 0) return 'failed'
   return 'partial'
 }
+
+/** plugin 动作默认超时（契约 05 公共约束：30 秒，可由 timeoutSeconds 覆盖 1–300）。 */
+export const DEFAULT_ACTION_TIMEOUT_SECONDS = 30
 
 const messageOf = (error) => (error instanceof Error ? error.message : String(error))
 
@@ -157,21 +209,58 @@ export async function dispatchActions({
       }
       const controller = new AbortController()
       if (cancellation) cancellation.controller = controller
-      try {
-        await registration.run({
-          orchestration: { id: orchestration.id, title: orchestration.title },
-          run: { runId: run.runId, status: 'succeeded', trigger: run.trigger },
-          payload: renderedPayload ?? null,
-          // 中止来源仅两个：动作超时（票 31 接线）与整个 run 被取消（契约 06）
-          signal: controller.signal,
-          report: (message) => appendWarning(warnings, String(message)),
+      // 超时（契约 05 公共约束）：默认 30 秒，timeoutSeconds 覆盖（1–300，创建期已校验）。
+      // 渲染已在执行前完成（不计入超时）；到期先中止 signal（动作实现应收尾），不再等
+      // 待其 Promise——串行继续（实现完全无视 signal 时不得挂死整个 run）。
+      const timeoutSeconds = definition.timeoutSeconds ?? DEFAULT_ACTION_TIMEOUT_SECONDS
+      const timeoutMs = timeoutSeconds * 1000
+      let timeoutArmed = null // { promise, timer }
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        timeoutArmed = { timer: null, promise: null }
+        timeoutArmed.promise = new Promise((resolve) => {
+          timeoutArmed.timer = setTimeout(() => resolve('timeout'), timeoutMs)
         })
-        record({ name: key, kind: 'plugin', status: 'succeeded', ...(warnings.length > 0 ? { warnings } : {}) })
-      } catch (error) {
-        fail('action_error', `plugin 动作 '${key}'（${definition.action}）执行失败：${messageOf(error)}`)
+      }
+      // 动作实现的执行结果（同步 throw 也归入 reject 分支）；迟到结算由下方吞掉，
+      // 不让游离 rejection 外溢（宿主纪律：未捕获 rejection 可能致命）
+      const execution = Promise.resolve()
+        .then(() =>
+          registration.run({
+            orchestration: { id: orchestration.id, title: orchestration.title },
+            run: { runId: run.runId, status: 'succeeded', trigger: run.trigger },
+            payload: renderedPayload ?? null,
+            // 中止来源仅两个：动作超时（本处置 abort）与整个 run 被取消（cancellation）；
+            // 注册摘除不触发（契约 06）
+            signal: controller.signal,
+            report: (message) => appendWarning(warnings, String(message)),
+          }),
+        )
+        .then(
+          () => 'done',
+          (error) => ({ error }),
+        )
+      let settled
+      try {
+        settled = await (timeoutArmed === null ? execution : Promise.race([execution, timeoutArmed.promise]))
       } finally {
+        if (timeoutArmed?.timer !== null) clearTimeout(timeoutArmed.timer)
         if (cancellation?.controller === controller) cancellation.controller = null
       }
+      if (settled === 'timeout') {
+        try {
+          controller.abort() // 契约 06：动作超时是 signal 的中止来源之一
+        } catch {
+          /* abort 不应抛；防御 */
+        }
+        execution.catch(() => {}) // 吞掉迟到的成功/失败（已按 timeout 结算）
+        fail('timeout', `plugin 动作 '${key}'（${definition.action}）超过 ${timeoutSeconds} 秒未完成`)
+        continue
+      }
+      if (typeof settled === 'object' && settled !== null && 'error' in settled) {
+        fail('action_error', `plugin 动作 '${key}'（${definition.action}）执行失败：${messageOf(settled.error)}`)
+        continue
+      }
+      record({ name: key, kind: 'plugin', status: 'succeeded', ...(warnings.length > 0 ? { warnings } : {}) })
       continue
     }
 
