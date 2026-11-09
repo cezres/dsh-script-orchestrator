@@ -102,6 +102,43 @@ describe('domainSpec（存储域声明，契约 docs/temp/08-storage.md）', () 
     })
     expect(() => domainSpec.tables.orchestrations.valueSchema.parse(view)).not.toThrow()
   })
+
+  it('对齐（cron，票 27）：service.create 写入的 cron 记录（含 ended 状态）恰好通过编排记录 schema', async () => {
+    const storage = await openStorage({ openDomain: async () => fakeDomain(), logger: null })
+    const service = createManagementService({
+      storage,
+      queue: new ServiceQueue(),
+      config: { maxRunsPerOrchestration: 100 },
+      now: () => 1_790_000_000_000,
+      emit: () => {},
+    })
+    const active = await service.create({
+      title: 'nightly check',
+      trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' },
+      script: { command: 'pwsh' },
+      judge: { rules: [], fallback: [] },
+      actions: {},
+    })
+    expect(active.trigger).toEqual({ kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' })
+    expect(() => domainSpec.tables.orchestrations.valueSchema.parse(active)).not.toThrow()
+    // cron 编排 run（trigger: 'cron'）也须通过 run schema（自动执行的持久化形状）
+    expect(() =>
+      domainSpec.tables.runs.valueSchema.parse({
+        runId: 'run-7f3c1a9e',
+        orchestrationId: active.id,
+        trigger: 'cron',
+        scheduledAt: '2026-09-21T19:00:00.000Z',
+        startedAt: null,
+        settledAt: null,
+        status: 'queued',
+        skipReason: null,
+        script: { command: 'pwsh', exitCode: null, signal: null, timedOut: false, durationMs: 0, stdoutTail: '', stderrTail: '', truncated: false },
+        matchedRule: null,
+        usedFallback: false,
+        actions: [],
+      }),
+    ).not.toThrow()
+  })
 })
 
 describe('openStorage（打开与键校验）', () => {
