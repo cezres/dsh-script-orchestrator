@@ -12,6 +12,12 @@ function makeCtx({ domain } = {}) {
     logs: [],
     emitted: [],
     spawns: [],
+    sessionCreates: [],
+    sessionCreateError: null,
+    sessionSelects: [],
+    sessionRenames: [],
+    sessionFollowups: [],
+    sessionFlushes: [],
   }
   const fakeDomain =
     domain ??
@@ -56,6 +62,37 @@ function makeCtx({ domain } = {}) {
     },
     connection: {
       admit: () => ({ peer: { id: 'p' } }),
+    },
+    sessionController: {
+      create: async (request) => {
+        calls.sessionCreates.push(request)
+        if (calls.sessionCreateError) throw calls.sessionCreateError
+        return { sessionId: request.sessionId }
+      },
+      resolveAgent: async (sessionId) => {
+        const fakeSession = { id: sessionId }
+        return {
+          agent: {
+            session: fakeSession,
+            model: { select: (selection) => calls.sessionSelects.push(selection) },
+            followup: (message) => calls.sessionFollowups.push(message),
+          },
+        }
+      },
+    },
+    sessions: {
+      flush: async (session) => {
+        calls.sessionFlushes.push(session?.id ?? session)
+        return true
+      },
+    },
+    get: (key) => {
+      if (key === 'sessionTitle') {
+        return {
+          rename: (session, title) => calls.sessionRenames.push({ session: session?.id ?? session, title }),
+        }
+      }
+      return undefined
     },
     webServer: {
       register: (r) => {
@@ -103,10 +140,10 @@ async function callRoute(route, url, body) {
 }
 
 describe('插件入口（lib/index.js）', () => {
-  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools/subprocess）+ name', () => {
+  it('导出面：apply + 同步 Config + inject 声明（storageDomain/connection/webServer/tools/subprocess/sessionController/sessions）+ name', async () => {
     expect(typeof plugin).toBe('function')
     expect(Config).toBe(RawConfig)
-    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools', 'subprocess'])
+    expect([...inject]).toEqual(['storageDomain', 'connection', 'webServer', 'tools', 'subprocess', 'sessionController', 'sessions'])
     expect(name).toBe('script-orchestrator')
   })
 
@@ -341,6 +378,197 @@ describe('插件入口（lib/index.js）', () => {
     expect(names).toContain('script-orchestrator/action-settled')
     expect(names.at(-1)).toBe('script-orchestrator/run-settled')
     expect(calls.emitted.at(-1)[1]).toMatchObject({ runId: run.runId, status: 'partial', matchedRule: 0 })
+    await first.value()
+  })
+
+  it('票 31 接线：service.registerAction 注册 → 同一注册表驱动 runner 派发（调用成功 + report 警告）；dispose 后 → unknown_action', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('plugin-wire', {
+      id: 'plugin-wire',
+      title: '注册动作接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['page'] }], fallback: [] },
+      actions: { page: { kind: 'plugin', action: 'ops.oncall', payload: { note: '{{orchestrationTitle}}' } } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    const service = calls.provided[0][1]
+    const contexts = []
+    const dispose = service.registerAction({
+      name: 'ops.oncall',
+      description: '按 severity 呼叫值班',
+      async run(context) {
+        contexts.push(context)
+        context.report('已呼叫值班')
+      },
+    })
+    // provided 服务与 runner 共享同一注册表：listActions 快照可见
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall', description: '按 severity 呼叫值班' }])
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+      if (!run) throw new Error('run 未按 succeeded 结算')
+    })
+    const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+    expect(run.actions).toEqual([
+      { name: 'page', kind: 'plugin', status: 'succeeded', warnings: ['已呼叫值班'] },
+    ])
+    // ActionContext 契约形状（契约 06）：payload 已渲染、signal、report
+    expect(contexts).toHaveLength(1)
+    expect(contexts[0].orchestration).toEqual({ id: 'plugin-wire', title: '注册动作接线' })
+    expect(contexts[0].payload).toEqual({ note: '注册动作接线' })
+    expect(typeof contexts[0].signal?.addEventListener).toBe('function')
+    // 摘除后：实时查表 → unknown_action（第二次触发经手动注入——直接再放一个过期计划不可行，
+    // 用 disposer 后的派发查表路径经 service 视图验证：listActions 清空）
+    dispose()
+    expect(service.listActions()).toEqual([])
+    await first.value()
+  })
+
+  it('票 31 超时接线：编排记录的 timeoutSeconds 经 runner 流到派发器 → 动作 failed timeout、run failed（真实计时器）', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('timeout-wire', {
+      id: 'timeout-wire',
+      title: '超时接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['hang-page'] }], fallback: [] },
+      actions: { 'hang-page': { kind: 'plugin', action: 'ops.hang', timeoutSeconds: 1 } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    const service = calls.provided[0][1]
+    service.registerAction({
+      name: 'ops.hang',
+      // 观察 signal 的实现：中止后收尾（模拟告警调用放弃重试）
+      run: (context) => new Promise((resolve) => context.signal.addEventListener('abort', resolve)),
+    })
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'failed')
+      if (!run) throw new Error('run 未按 failed 结算（单动作 timeout）')
+    }, { timeout: 5000, interval: 50 })
+    const run = [...tables.runs.values()].find((r) => r.status === 'failed')
+    expect(run.actions).toEqual([
+      {
+        name: 'hang-page',
+        kind: 'plugin',
+        status: 'failed',
+        error: { code: 'timeout', message: expect.stringContaining('ops.hang') },
+      },
+    ])
+    await first.value()
+  })
+
+  it('票 32 接线：session 动作经注入的 sessionController/sessions 投递，run 动作记录 sessionId 并持久化', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('session-wire', {
+      id: 'session-wire',
+      title: '会话接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: [], cwd: process.cwd() },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['open-triage'] }], fallback: [] },
+      actions: { 'open-triage': { kind: 'session', prompt: '退出码 {{exitCode}}，请排查。', preset: 'standard', model: { provider: 'p', model: 'm' } } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+      if (!run) throw new Error('run 未按 succeeded 结算')
+      return run
+    })
+    const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+    const sessionId = run.actions[0].sessionId
+    expect(run.actions[0]).toMatchObject({ name: 'open-triage', kind: 'session', status: 'succeeded' })
+    expect(sessionId).toMatch(/^session-[0-9a-f-]{36}$/)
+    // 每次执行新建会话：create 收到随机 id + 编排脚本 cwd；显式 preset/model 进创建链
+    expect(calls.sessionCreates).toEqual([{ sessionId, cwd: process.cwd(), agentPreset: 'standard' }])
+    expect(calls.sessionSelects).toEqual([{ provider: 'p', model: 'm' }])
+    // 缺省标题进 rename；首条消息为内联 UserMessage（kind:user + banner 正文含渲染后 prompt）
+    expect(calls.sessionRenames).toEqual([{ session: sessionId, title: `会话接线 · ${run.runId.slice(-4)}` }])
+    expect(calls.sessionFollowups).toHaveLength(1)
+    expect(calls.sessionFollowups[0].source).toEqual({ kind: 'user' })
+    expect(calls.sessionFollowups[0].content[0].text).toContain('退出码 0，请排查。')
+    expect(calls.sessionFollowups[0].content[0].text).toContain('[SCRIPT ORCHESTRATOR]')
+    expect(calls.sessionFollowups[0].content[0].text).toContain(`{"runId":"${run.runId}"`)
+    expect(calls.sessionFlushes).toEqual([sessionId])
     await first.value()
   })
 

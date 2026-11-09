@@ -352,6 +352,10 @@ window.__ModuleLoader__.load({
 							ACTION_STATUS_CN[a.status] || a.status),
 						h("span", { style: { ...C.mono } }, a.name),
 						h("span", { style: { ...C.muted } }, ACTION_KIND_CN[a.kind] || a.kind),
+						// 会话引用（票 32）：成功与 delivery_failed 的 sessionId 都展示——
+						// persistent 会话随时可接管，失败现场靠该 id 找回
+						a.sessionId ? h("span", { style: { ...C.mono, fontSize: 10 } },
+							a.sessionId, a.kind === "session" && a.status === "succeeded" ? "（可接管）" : "") : null,
 						a.error ? h("span", { style: { ...C.mono, color: "#dc2626", fontSize: 10 } }, a.error.code, "：", a.error.message) : null,
 						a.warnings && a.warnings.length > 0 ? h("span", { style: { color: "#d97706", fontSize: 10 } }, a.warnings.join("；")) : null))) : null);
 		}

@@ -99,8 +99,11 @@ export function buildSettledPayload(run) {
  * @param {string} [deps.hostCwd] Host 进程工作目录（cwd 解析兜底；默认 process.cwd()）
  * @param {() => void} [deps.onOrchestrationMutated] 编排持久变更（fixed-delay 推进等）后的回调（scheduler 重算 timer 用）
  * @param {object} [deps.registry] 动作注册表 { resolve(name) }（plugin 动作逐动作实时查表；createActionRegistry 或结构等同物）
+ * @param {object} [deps.sessionHost] 宿主会话服务面（persistent session 动作投递；
+ *   { sessionController, sessions, getSessionTitle() }，index.js 由 ctx 装配；缺省时
+ *   session 动作 failed internal_error）
  */
-export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry }) {
+export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry, sessionHost }) {
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
@@ -340,6 +343,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
           orchestration: { id: orchestration.id, title: orchestration.title },
           run: {
             runId,
+            orchestrationId: runAtStart.orchestrationId,
             trigger: runAtStart.trigger,
             scheduledAt: runAtStart.scheduledAt,
             startedAt: overlay.startedAt ?? runAtStart.startedAt ?? null,
@@ -349,6 +353,15 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
           stdoutText: outcome.facts.stdoutText,
           registry,
           emit: publish,
+          // persistent session 动作投递面（票 32）：cwd 环境按当前编排（session cwd 缺省取编排脚本 cwd，
+          // 同受 allowedRoots 限制；defaultCwd/hostCwd 与脚本 cwd 解析同链）
+          sessionHost,
+          sessionEnv: {
+            allowedRoots: config.allowedRoots,
+            defaultCwd: config.defaultCwd,
+            hostCwd: hostWorkingDir,
+            scriptCwd: orchestration.script.cwd,
+          },
           logger: log,
           cancellation,
           // 逐动作结算进度并入内存视图（面板轮询可见；结算后 live 移除、回落持久记录）
