@@ -137,6 +137,7 @@ function makeRunner(over = {}) {
     fs: over.fs ?? makeFakeFs(),
     hostCwd: over.hostCwd ?? 'D:\\work\\proj',
     registry: over.registry,
+    sessionHost: over.sessionHost,
   })
   return { runner, storage, subprocess, emitted, logs, advance: (ms) => { clock += ms } }
 }
@@ -763,6 +764,69 @@ describe('判定 → 派发 → 汇总（契约 04/05/09：脚本启动成功即
       orchestration: { id: 'nightly', title: '夜间巡检' },
       run: { runId: view.runId, status: 'succeeded', exitCode: 0 },
     })
+  })
+
+  it('票 32：persistent session 动作经 runner 派发——sessionEnv 由 config/hostCwd/编排 script.cwd 组装；成功记录 sessionId 并落盘', async () => {
+    const creates = []
+    const sessionHost = {
+      sessionController: {
+        create: async (request) => {
+          creates.push(request)
+          return { sessionId: request.sessionId }
+        },
+        resolveAgent: async (id) => ({ agent: { session: { id }, model: { select: () => {} }, followup: () => {} } }),
+      },
+      sessions: { flush: async () => true },
+      getSessionTitle: () => undefined,
+    }
+    const ctx = makeRunner({
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['open-triage'] }], fallback: [] },
+        { 'open-triage': { kind: 'session', prompt: '排查 {{exitCode}}' } },
+      ),
+      sessionHost,
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    expect(run.actions[0]).toMatchObject({ name: 'open-triage', kind: 'session', status: 'succeeded' })
+    expect(run.actions[0].sessionId).toBe(creates[0].sessionId)
+    // 编排 script.cwd 未设 → session cwd 缺省链落到 hostCwd（与脚本 cwd 解析同链）
+    expect(creates[0].cwd).toBe('D:\\work\\proj')
+  })
+
+  it('票 32：config.allowedRoots 约束 session cwd（动作显式 cwd 越界；脚本 cwd 在界内正常执行）→ cwd_not_allowed，不创建会话', async () => {
+    const creates = []
+    const sessionHost = {
+      sessionController: {
+        create: async (request) => {
+          creates.push(request)
+          return { sessionId: request.sessionId }
+        },
+        resolveAgent: async (id) => ({ agent: { session: { id }, model: { select: () => {} }, followup: () => {} } }),
+      },
+      sessions: { flush: async () => true },
+      getSessionTitle: () => undefined,
+    }
+    const ctx = makeRunner({
+      config: { ...BASE_CONFIG, allowedRoots: ['D:\\work'] },
+      orchestrationOver: {
+        script: { command: 'node', args: ['check.js'], env: {}, cwd: 'D:\\work\\proj' },
+        ...judgeWithActions(
+          { rules: [{ when: { exitCode: 0 }, actions: ['open-triage'] }], fallback: [] },
+          { 'open-triage': { kind: 'session', prompt: 'p', cwd: 'E:\\evil' } },
+        ),
+      },
+      sessionHost,
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('failed') // 脚本正常执行进判定；唯一动作 cwd_not_allowed → 0 成 1 败
+    expect(run.actions[0]).toMatchObject({ status: 'failed', error: { code: 'cwd_not_allowed' } })
+    expect(run.actions[0].sessionId).toBeUndefined()
+    expect(creates).toEqual([])
   })
 
   it('动作汇总矩阵：一成一败 → partial；全败 → failed（零动作 succeeded 已由上文覆盖）', async () => {

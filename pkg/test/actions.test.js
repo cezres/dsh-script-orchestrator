@@ -1,8 +1,9 @@
 // 动作派发器（契约 docs/temp/05-actions.md、06-events-service.md、09-states-errors.md）：
-// 按声明顺序串行执行、失败隔离、event 载荷、plugin 注册表查表点（注册本体属票 31）、
-// session 渲染与占位（执行属票 32/33）、dispatching 取消停止剩余派发、动作汇总。
+// 按声明顺序串行执行、失败隔离、event 载荷、plugin 注册表查表点与超时（票 31）、
+// session persistent 投递（执行面属票 32；ephemeral 属票 33）、dispatching 取消停止剩余派发、动作汇总。
 import { describe, it, expect, vi } from 'vitest'
 import { dispatchActions, aggregateRunStatus, createActionRegistry } from '../lib/actions.js'
+import { buildFirstMessageText } from '../lib/session-action.js'
 
 const ORCH = { id: 'nightly-deploy-check', title: '夜间部署巡检' }
 
@@ -204,17 +205,136 @@ describe('plugin 动作（契约 05/06：逐动作实时查表；registerAction 
   })
 })
 
-describe('session 动作（渲染属本票；执行属票 32/33）', () => {
-  it('prompt 渲染（模板警告进记录）；本票执行面为 failed action_error 占位（消息注明后续票）', async () => {
-    const deps = makeDeps()
+describe('session 动作（persistent 执行面属票 32；ephemeral 属票 33）', () => {
+  /** fake 宿主会话服务（记录调用，可注入投递各环节失败）。 */
+  function makeSessionHost(over = {}) {
+    const calls = { create: [], rename: [], followup: [], flush: [] }
+    const fakeSession = { id: 'fake-session' }
+    const agent = {
+      session: fakeSession,
+      model: { select: () => {} },
+      followup: (message) => {
+        calls.followup.push(message)
+        if (over.followupError) throw over.followupError
+      },
+    }
+    return {
+      host: {
+        sessionController: {
+          create: async (request) => {
+            calls.create.push(request)
+            if (over.createError) throw over.createError
+            return { sessionId: request.sessionId }
+          },
+          resolveAgent: async () => ({ agent }),
+        },
+        sessions: {
+          flush: async () => {
+            calls.flush.push(true)
+            if (over.flushError) throw over.flushError
+            return true
+          },
+        },
+        getSessionTitle: () =>
+          over.noTitleService
+            ? undefined
+            : { rename: (session, title) => { calls.rename.push(title); if (over.renameError) throw over.renameError } },
+      },
+      calls,
+    }
+  }
+
+  const sessionEnv = { allowedRoots: [], defaultCwd: undefined, hostCwd: 'D:\\host', scriptCwd: 'D:\\proj' }
+
+  it('persistent：prompt 渲染进首条消息正文（模板警告进记录），投递成功 → succeeded 且记录 sessionId', async () => {
+    const { host, calls } = makeSessionHost()
+    const deps = makeDeps({ sessionHost: host, sessionEnv })
     const { results } = await dispatch(
       deps,
       ['open-triage'],
       { 'open-triage': { kind: 'session', prompt: '退出码 {{exitCode}}，stdout：{{stdoutTail}}' } },
     )
-    expect(results[0]).toMatchObject({ name: 'open-triage', kind: 'session', status: 'failed', error: { code: 'action_error' } })
-    expect(results[0].error.message).toContain('32')
-    expect(results[0].warnings).toBeUndefined()
+    expect(results[0]).toMatchObject({ name: 'open-triage', kind: 'session', status: 'succeeded' })
+    expect(results[0].sessionId).toBe(calls.create[0].sessionId) // run.actions[].sessionId = create 返回的会话 id
+    expect(results[0].sessionId).toMatch(/^session-[0-9a-f-]{36}$/)
+    expect(results[0].warnings).toBeUndefined() // 无警告时省略键
+    expect(calls.rename).toEqual(['夜间部署巡检 · 1a9e'])
+    const message = calls.followup[0]
+    expect(message.role).toBe('user')
+    expect(message.source).toEqual({ kind: 'user' })
+    expect(message.content[0].text).toBe(
+      buildFirstMessageText({
+        run: deps.run,
+        verdict: { matchedRule: VERDICT.matchedRule, usedFallback: VERDICT.usedFallback },
+        prompt: '退出码 0，stdout：deploy ok',
+        framing: 'banner',
+      }),
+    )
+  })
+
+  it('followup 抛错（已 dispose 会话实证路径）→ failed delivery_failed，sessionId 保留在动作记录（失败隔离：后续动作照常）', async () => {
+    const { host } = makeSessionHost({ followupError: new Error('cannot append outside a SessionStore') })
+    const deps = makeDeps({ sessionHost: host, sessionEnv })
+    const { results } = await dispatch(
+      deps,
+      ['bad-session', 'emit-ok'],
+      { 'bad-session': { kind: 'session', prompt: 'p' }, 'emit-ok': { kind: 'event', name: 'deploy-ok' } },
+    )
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'delivery_failed' } })
+    expect(results[0].sessionId).toMatch(/^session-/)
+    expect(results[0].error.message).toContain(results[0].sessionId)
+    expect(results[1].status).toBe('succeeded')
+  })
+
+  it('session cwd 越界（sessionEnv.allowedRoots）→ failed cwd_not_allowed，不创建会话', async () => {
+    const { host, calls } = makeSessionHost()
+    const deps = makeDeps({
+      sessionHost: host,
+      sessionEnv: { ...sessionEnv, allowedRoots: ['D:\\proj'] },
+    })
+    const { results } = await dispatch(
+      deps,
+      ['s1'],
+      { s1: { kind: 'session', prompt: 'p', cwd: 'E:\\evil' } },
+    )
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'cwd_not_allowed' } })
+    expect(results[0].sessionId).toBeUndefined()
+    expect(calls.create).toEqual([])
+  })
+
+  it('preset 解析失败 → failed preset_unknown；rename 失败仅记 warnings 不失败动作', async () => {
+    const presetHost = makeSessionHost({ createError: Object.assign(new Error('Unknown agent preset: nope'), { code: 'agent-preset/not-found' }) })
+    const depsA = makeDeps({ sessionHost: presetHost.host, sessionEnv })
+    const { results: resultsA } = await dispatch(depsA, ['s1'], { s1: { kind: 'session', prompt: 'p', preset: 'nope' } })
+    expect(resultsA[0]).toMatchObject({ status: 'failed', error: { code: 'preset_unknown' } })
+    expect(resultsA[0].sessionId).toBeUndefined()
+
+    const renamedHost = makeSessionHost({ renameError: new Error('title invalid') })
+    const depsB = makeDeps({ sessionHost: renamedHost.host, sessionEnv })
+    const { results: resultsB } = await dispatch(depsB, ['s2'], { s2: { kind: 'session', prompt: 'p' } })
+    expect(resultsB[0].status).toBe('succeeded')
+    expect(resultsB[0].warnings.some((w) => w.includes('标题重命名失败'))).toBe(true)
+  })
+
+  it('宿主会话服务未注入（防御）→ failed internal_error', async () => {
+    const deps = makeDeps()
+    const { results } = await dispatch(deps, ['s1'], { s1: { kind: 'session', prompt: 'p' } })
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'internal_error' } })
+    expect(results[0].error.message).toContain('宿主会话服务')
+  })
+
+  it('mode: ephemeral 执行面属票 33：failed action_error 占位（消息注明票 33，不含 32）', async () => {
+    const { host } = makeSessionHost()
+    const deps = makeDeps({ sessionHost: host, sessionEnv })
+    const { results } = await dispatch(
+      deps,
+      ['s1'],
+      { s1: { kind: 'session', mode: 'ephemeral', prompt: 'p', idleDisposeSeconds: 5 } },
+    )
+    expect(results[0]).toMatchObject({ status: 'failed', error: { code: 'action_error' } })
+    expect(results[0].error.message).toContain('33')
+    expect(results[0].error.message).not.toContain('32')
+    expect(results[0].sessionId).toBeUndefined()
   })
 
   it('prompt 渲染后去首尾空白为空 → failed template_invalid（唯一触发路径；payload 不可能触发）', async () => {
