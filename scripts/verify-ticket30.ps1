@@ -124,7 +124,9 @@ function Start-HeadlessHost {
   $out = "$logStem.out.log"
   $err = "$logStem.err.log"
   Remove-Item $out, $err -ErrorAction SilentlyContinue
-  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList "/c", "`"$Dsh`" --profile $ProfileName --no-open" `
+  # --port 0：OS 分配空闲端口（避免与并行 worktree 的无头宿主抢默认 3080；
+  # 实际端口从打印的 token URL 解析）
+  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList "/c", "`"$Dsh`" --profile $ProfileName --no-open --port 0" `
     -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -WindowStyle Hidden
   $url = $null
   $deadline = (Get-Date).AddSeconds(120)
@@ -276,8 +278,8 @@ try {
     judge = @{ rules = @( @{ when = @{ exitCode = 0 }; actions = @('ghost') } ); fallback = @() }
     actions = @{ x = @{ kind = 'event'; name = 'ok-thing' } }
   } 'cD2'
-  Check ($badRef.result.ok -eq $false -and $badRef.result.error.details.field -like '*ghost*') `
-    '非法配置（引用未定义动作键）→ script_input_invalid(missing) 不落库'
+  Check ($badRef.result.ok -eq $false -and $badRef.result.error.details.reason -eq 'missing' -and $badRef.result.error.details.field -eq 'judge.rules[0].actions[0]') `
+    '非法配置（引用未定义动作键）→ script_input_invalid(missing, judge.rules[0].actions[0]) 不落库'
   $listBad = Invoke-Rpc $session1 $host1.Port 'list' @{} 'cD3'
   Check (@($listBad.result.value.items).Count -eq 3) '两次非法 create 后列表仍只有 3 条（未落库）'
 
