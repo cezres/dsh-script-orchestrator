@@ -24,7 +24,13 @@ window.__ModuleLoader__.load({
 		const CREATE_PROMPT =
 			"请帮我创建一个「脚本编排」：按计划自动运行脚本，并依据运行结果执行动作。请先向我逐项确认配置，再调用 script_create 工具创建：\n" +
 			"1. 标题（1–120 字）与 id（可省略，由标题生成）；\n" +
-			"2. 触发方式：every 间隔（整数秒，不低于 60）与模式（fixed-rate 固定相位 / fixed-delay 上次完成后再等；cron 属后续版本）；\n" +
+			"2. 触发方式（二选一）：\n" +
+			"   - every 间隔（整数秒，不低于 60）与模式（fixed-rate 固定相位 / fixed-delay 上次完成后再等）；\n" +
+			"   - cron：五位表达式（minute hour day-of-month month day-of-week）+ 显式 IANA 时区，" +
+			'如 { "kind": "cron", "expression": "0 3 * * *", "timeZone": "Asia/Shanghai" }。' +
+			"用户说「每天 03:00」→ 0 3 * * *；「每周一、三、五 09:00」→ 0 9 * * 1,3,5；周日生成 0。 " +
+			"每日/每周预设与其生成的 cron 使用同一 timeZone（向用户确认时区）。" +
+			"不接受秒字段、@宏（如 @daily）与名称写法（JAN/MON）。\n" +
 			"3. 脚本：command 与 args（逐项传参、不经 shell）、cwd、超时（可选）；\n" +
 			"4. 判定规则：按退出码/输出匹配动作键，未命中可走 fallback；\n" +
 			"5. 动作：事件（event）、注册动作（plugin）或开会话（session）。\n" +
@@ -54,6 +60,40 @@ window.__ModuleLoader__.load({
 		const fmtTime = (iso) => (iso ? iso.replace("T", " ").replace(/(\.\d+|Z).*$/, "") : "—");
 		const fmtEvery = (seconds) =>
 			seconds % 60 === 0 ? Math.round(seconds / 60) + " 分钟" : seconds + " 秒";
+		const pad2 = (n) => String(n).padStart(2, "0");
+
+		// 每日/每周语义识别（契约 02「每日/每周面板预设」：只生成 cron；查看时语义上只是固定
+		// 一个本地时间的每日或若干星期规则可回显简单形式）。多时刻、日期/月份限制、step 等
+		// 复杂规则返回 null（只显示表达式原文）。简化档不做独立表单，仅文字摘要。
+		const DOW_CN = { 0: "日", 1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六" };
+		function expandDow(raw) {
+			const out = new Set();
+			for (const element of raw.split(",")) {
+				const m = /^(\d+)(?:-(\d+))?$/.exec(element);
+				if (!m) return null;
+				const start = Number(m[1]);
+				const end = m[2] === undefined ? start : Number(m[2]);
+				if (start > 7 || end > 7 || start > end) return null;
+				for (let v = start; v <= end; v++) out.add(v === 7 ? 0 : v);
+			}
+			return out;
+		}
+		function describeCron(expression) {
+			if (!expression || typeof expression !== "string") return null;
+			const fields = expression.trim().split(/\s+/);
+			if (fields.length !== 5) return null;
+			const [minute, hour, dom, month, dow] = fields;
+			// 时间须为单一时刻；日期/月份须为 *（受限即复杂规则）
+			if (!/^\d+$/.test(minute) || !/^\d+$/.test(hour)) return null;
+			if (dom !== "*" || month !== "*") return null;
+			if (Number(minute) > 59 || Number(hour) > 23) return null;
+			const clock = pad2(hour) + ":" + pad2(minute);
+			if (dow === "*") return "每天 " + clock;
+			const days = expandDow(dow);
+			if (days === null || days.size === 0 || days.size === 7) return null;
+			const names = [0, 1, 2, 3, 4, 5, 6].filter((d) => days.has(d)).map((d) => DOW_CN[d]);
+			return "每周" + names.join("/") + " " + clock;
+		}
 
 		function Chip({ s }) {
 			const color = STATUS_COLOR[s] || "#71717a";
@@ -61,10 +101,14 @@ window.__ModuleLoader__.load({
 				h("span", { style: { width: 6, height: 6, borderRadius: 99, background: color } }), STATUS_CN[s] || s);
 		}
 
-		// 触发配置摘要（every：间隔 + 模式；cron 属后续版本）
+		// 触发配置摘要（every：间隔 + 模式；cron：表达式 + 时区，每日/每周语义可回显摘要）
 		function TriggerSummary({ t }) {
 			if (!t) return h("span", { style: C.muted }, "—");
-			if (t.kind === "cron") return h("span", { style: C.mono }, t.expression, " @ ", t.timeZone);
+			if (t.kind === "cron") {
+				const summary = describeCron(t.expression);
+				return h("span", { style: C.mono }, t.expression, " @ ", t.timeZone,
+					summary ? h("span", { style: { ...C.muted, marginLeft: 6 } }, summary) : null);
+			}
 			return h("span", { style: C.mono },
 				"every ", fmtEvery(t.everySeconds),
 				h("span", { style: { ...C.muted, marginLeft: 6 } }, t.mode === "fixed-delay" ? "完成后再等" : "固定相位"));
