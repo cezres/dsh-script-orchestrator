@@ -12,6 +12,7 @@ import { createRunner } from './runner.js'
 import { createScheduler } from './scheduler.js'
 import { createBridgeHandler, mountBridge } from './bridge.js'
 import { registerTools } from './tools.js'
+import { createActionRegistry } from './actions.js'
 
 export const name = 'script-orchestrator'
 export { Config }
@@ -21,6 +22,9 @@ export async function* apply(ctx, config) {
   const logger = ctx.logger('script-orchestrator')
   const queue = new ServiceQueue()
   const emit = (name, payload) => ctx.emit(name, payload)
+  // 动作注册表：service.listActions 快照与 runner 执行期逐动作实时查表同源
+  //（registerAction 注册面属票 31；plugin 动作在注册前查表得 unknown_action）
+  const actionRegistry = createActionRegistry()
   // 初始化失败在 provide 之前抛出：Loader 标记条目失败，不暴露半初始化服务
   //（打开后顺带执行启动维护：非终态 run 标 interrupted + fixed-delay 恢复推进）
   const storage = await openStorage({
@@ -43,6 +47,7 @@ export async function* apply(ctx, config) {
     logger,
     hostCwd: process.cwd(),
     onOrchestrationMutated: () => rescheduleAfterMutation(),
+    registry: actionRegistry,
   })
   const scheduler = createScheduler({
     storage,
@@ -64,6 +69,7 @@ export async function* apply(ctx, config) {
     logger,
     runner,
     onMutation: reschedule,
+    actionRegistry,
   })
   // 工具：profile 根作用域各注册一次（契约 07；票 25 交付 create/list/view）
   const disposeTools = registerTools({ tools: ctx.tools, service, logger })

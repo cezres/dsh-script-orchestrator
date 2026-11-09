@@ -223,6 +223,72 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
+  it('票 30 接线：过期计划触发 → 判定命中 → event 动作发出自定义事件、plugin 查共享注册表（空表 → unknown_action）、run 按 partial 结算', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('dispatch-wire', {
+      id: 'dispatch-wire',
+      title: '派发接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['emit-ok', 'page'] }], fallback: [] },
+      actions: {
+        'emit-ok': { kind: 'event', name: 'deploy-ok', payload: { summary: '{{orchestrationTitle}} {{exitCode}}' } },
+        page: { kind: 'plugin', action: 'ops.oncall' },
+      },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'partial')
+      if (!run) throw new Error('run 未按 partial 结算')
+    })
+    const run = [...tables.runs.values()].find((r) => r.status === 'partial')
+    expect(run.matchedRule).toBe(0)
+    expect(run.actions).toEqual([
+      { name: 'emit-ok', kind: 'event', status: 'succeeded' },
+      { name: 'page', kind: 'plugin', status: 'failed', error: { code: 'unknown_action', message: expect.stringContaining('ops.oncall') } },
+    ])
+    // 自定义事件经宿主 emit 总线（全名 + 四键载荷 + payload 已渲染）
+    const custom = calls.emitted.find(([n]) => n === 'script-orchestrator/deploy-ok')
+    expect(custom[1]).toEqual({
+      name: 'deploy-ok',
+      payload: { summary: '派发接线 0' },
+      orchestration: { id: 'dispatch-wire', title: '派发接线' },
+      run: { runId: run.runId, status: 'succeeded', exitCode: 0 },
+    })
+    const names = calls.emitted.map(([n]) => n)
+    expect(names).toContain('script-orchestrator/action-settled')
+    expect(names.at(-1)).toBe('script-orchestrator/run-settled')
+    expect(calls.emitted.at(-1)[1]).toMatchObject({ runId: run.runId, status: 'partial', matchedRule: 0 })
+    await first.value()
+  })
+
   it('卸载顺序：先停调度与工具/桥（停生产者）→ runner 停机（在途清进程）→ 排干队列 → domain.close()', async () => {
     const { ctx, calls } = makeCtx()
     const it = plugin(ctx, {})

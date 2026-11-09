@@ -49,6 +49,10 @@ window.__ModuleLoader__.load({
 			succeeded: "成功", partial: "部分成功", failed: "失败", skipped: "已跳过", canceled: "已取消", interrupted: "已中断",
 		};
 		const SKIP_REASON_CN = { overlap: "重叠", disabled: "已停用", concurrency: "并发额度" };
+		// 动作三段结果（契约 05/09）：kind 与动作状态中文映射
+		const ACTION_KIND_CN = { event: "事件", plugin: "注册动作", session: "会话" };
+		const ACTION_STATUS_CN = { succeeded: "成功", failed: "失败", skipped: "已跳过" };
+		const ACTION_STATUS_COLOR = { succeeded: "#16a34a", failed: "#dc2626", skipped: "#71717a" };
 		// 活动 run 轮询周期（契约 11「刷新策略」3：面板可见且存在非终态 run 时每 5 秒 view(id)）
 		const POLL_MS = 5000;
 		const fmtTime = (iso) => (iso ? iso.replace("T", " ").replace(/(\.\d+|Z).*$/, "") : "—");
@@ -227,7 +231,7 @@ window.__ModuleLoader__.load({
 								: state.data.availableActions.map((a) => h("div", { key: a.name, style: { ...C.mono, fontSize: 11 } }, a.name, a.description ? " — " + a.description : ""))))));
 		}
 
-		// 单条 run 记录卡：三段结果中的脚本阶段（契约 01 run.script；动作阶段属票 30+）
+		// 单条 run 记录卡：三段结果（契约 11：脚本 / 判定 / 动作 + warnings）
 		function RunCard({ r }) {
 			const s = r.script || {};
 			const facts = [];
@@ -239,18 +243,37 @@ window.__ModuleLoader__.load({
 			if (s.truncated) facts.push("已截断");
 			const tail = (s.stdoutTail || "").replace(/\s+$/, "");
 			const tailPreview = tail.length > 200 ? tail.slice(-200) : tail;
+			// 判定段（契约 04 判定结果表：下标命中 / fallback / 全未命中零动作）。
+			// 不展示：skipped（未执行）与 spawn_failed 的 failed（跳过判定、无动作记录）
+			const actions = r.actions || [];
+			const judged = !r.skipReason && !(r.status === "failed" && actions.length === 0);
+			const judgeText = r.matchedRule !== null && r.matchedRule !== undefined
+				? "命中规则 " + r.matchedRule
+				: r.usedFallback ? "fallback" : "未命中（零动作）";
 			return h("div", { style: { border: "1px solid #f0f0f2", borderRadius: 8, padding: "6px 8px", marginBottom: 6 } },
 				h("div", { style: { ...C.row, fontSize: 11 } },
 					h("span", { style: { fontWeight: 700 } }, RUN_STATUS_CN[r.status] || r.status),
 					h("span", { style: { ...C.muted, ...C.mono } }, r.runId),
 					h("span", { style: { ...C.muted } }, fmtTime(r.settledAt || r.startedAt || r.scheduledAt)),
 					facts.length > 0 ? h("span", { style: { color: "#52525b" } }, facts.join(" · ")) : null),
+				judged ? h("div", { style: { ...C.row, fontSize: 11, marginTop: 2 } },
+					h("span", { ...C.muted }, "判定："),
+					h("span", null, judgeText)) : null,
 				(s.stdoutSpillPath || s.stderrSpillPath) && h("div", { style: { ...C.muted, fontSize: 10, marginTop: 2 } },
 					"完整输出：", s.stdoutSpillPath ? "stdout " : "", s.stderrSpillPath ? "stderr" : "", "（溢写文件，排障可读）"),
 				tailPreview ? h("div", { style: { ...C.mono, fontSize: 10, marginTop: 3, whiteSpace: "pre-wrap", color: "#3f3f46", background: "#fafafa", borderRadius: 6, padding: "4px 6px", maxHeight: 120, overflowY: "auto" } },
 					s.truncated ? "…" : "", tailPreview) : null,
 				s.warnings && s.warnings.length > 0 ? h("div", { style: { color: "#d97706", fontSize: 10, marginTop: 3 } },
-					s.warnings.join("；")) : null);
+					s.warnings.join("；")) : null,
+				actions.length > 0 ? h("div", { style: { marginTop: 4 } },
+					h("div", { ...C.muted, fontSize: 10 }, "动作（" + actions.length + "）"),
+					actions.map((a) => h("div", { key: a.name, style: { ...C.row, fontSize: 11, marginTop: 2, flexWrap: "wrap" } },
+						h("span", { style: { color: ACTION_STATUS_COLOR[a.status] || "#71717a", fontWeight: 600 } },
+							ACTION_STATUS_CN[a.status] || a.status),
+						h("span", { style: { ...C.mono } }, a.name),
+						h("span", { style: { ...C.muted } }, ACTION_KIND_CN[a.kind] || a.kind),
+						a.error ? h("span", { style: { ...C.mono, color: "#dc2626", fontSize: 10 } }, a.error.code, "：", a.error.message) : null,
+						a.warnings && a.warnings.length > 0 ? h("span", { style: { color: "#d97706", fontSize: 10 } }, a.warnings.join("；")) : null))) : null);
 		}
 
 		function PanelIcon() {

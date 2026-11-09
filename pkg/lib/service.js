@@ -2,9 +2,12 @@
 // 语义唯一权威：校验规则、错误码、分页过滤都在此定义一次；工具（07）与桥（11）是薄适配层。
 // 票 25 范围：create（every）/list/view/listActions；edit/run/registerAction 属票 28/26/31。
 // 一切持久写入经服务层 FIFO 整槽（契约 08「写入」）；changed 在持久写入完成后发布（契约 06）。
+// 票 30：动作注册表可与 runner 共享同一实例（index.js 装配）——listActions 取快照、
+// runner 逐动作实时查表用同一张表；registerAction 的注册面属票 31。
 import { OrchestratorError, inputInvalid } from './errors.js'
 import { validateOrchestrationInput } from './validation.js'
 import { nextOccurrence } from './triggers.js'
+import { createActionRegistry } from './actions.js'
 
 /** 由标题生成 id 基名（01：创建时可省略 id，由标题生成并保证唯一）。 */
 function slugifyTitle(title) {
@@ -27,12 +30,15 @@ function slugifyTitle(title) {
  * @param {object} [deps.logger] 内部日志（发布端兜底等）
  * @param {object} [deps.runner] 执行引擎（liveView 合并活动 run 的内存态到 view）
  * @param {() => void} [deps.onMutation] 编排集合持久变更后的回调（调度器重算 timer）
+ * @param {object} [deps.actionRegistry] 动作注册表（缺省自建；与 runner 共享同一实例时
+ *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction；注册面属票 31）
  */
-export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation }) {
+export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry }) {
   void config
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
+  const registry = actionRegistry ?? createActionRegistry()
 
   // 发布端兜底（契约 06：listener 同步抛错只记内部日志，绝不影响主流程）
   function safeEmit(name, payload) {
@@ -45,8 +51,7 @@ export function createManagementService({ storage, queue, config, now, emit, log
     }
   }
 
-  // 注册动作表（票 31 才开放 registerAction；listActions 已按契约返回排序快照）
-  const actionRegistry = new Map()
+  // 注册动作表（共享实例时与 runner 查表同源；registerAction 注册面属票 31）
   const notifyMutation = onMutation ?? (() => {})
 
   return {
@@ -149,9 +154,7 @@ export function createManagementService({ storage, queue, config, now, emit, log
 
     /** 注册动作表快照，按 name 排序（契约 06）。 */
     listActions() {
-      return [...actionRegistry.values()].sort((a, b) => a.name.localeCompare(b.name)).map(({ name, description }) =>
-        description === undefined ? { name } : { name, description },
-      )
+      return registry.snapshot()
     },
   }
 }

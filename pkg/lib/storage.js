@@ -112,7 +112,8 @@ const runActionSchema = z
   .object({
     name: z.string().min(1),
     kind: z.enum(['event', 'plugin', 'session']),
-    status: z.enum(['succeeded', 'failed']),
+    // skipped：dispatching 取消时未派发的剩余动作（契约 05 status ∈ {succeeded, failed, skipped}）
+    status: z.enum(['succeeded', 'failed', 'skipped']),
     error: z.object({ code: z.string(), message: z.string() }).strict().optional(),
     warnings: z.array(z.string()).optional(),
     sessionId: z.string().optional(),
