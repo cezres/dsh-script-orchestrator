@@ -18,6 +18,21 @@ const VIEW = {
   nextOccurrence: '2026-11-09T00:05:00.000Z',
 }
 
+const RUN_VIEW = {
+  runId: 'run-7f3c1a9e',
+  orchestrationId: 'log-rotate',
+  trigger: 'manual',
+  scheduledAt: '2026-11-09T00:00:00.000Z',
+  startedAt: '2026-11-09T00:00:01.000Z',
+  settledAt: '2026-11-09T00:00:02.000Z',
+  status: 'succeeded',
+  skipReason: null,
+  script: { command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 1000, stdoutTail: '', stderrTail: '', truncated: false },
+  matchedRule: null,
+  usedFallback: false,
+  actions: [],
+}
+
 /** 记录调用并按脚本回放的 fake 服务。 */
 function fakeService(script = {}) {
   const calls = []
@@ -35,6 +50,19 @@ function fakeService(script = {}) {
       calls.push(['view', id, options])
       return { ...VIEW, runs: [], availableActions: [] }
     }),
+    edit: script.edit ?? (async (input, actorSessionId, signal) => {
+      calls.push(['edit', input, actorSessionId, signal])
+      return { ...VIEW }
+    }),
+    run: script.run ?? (async (id, signal) => {
+      calls.push(['run', id, signal])
+      return { ...RUN_VIEW, status: 'queued', settledAt: null }
+    }),
+    waitRun: script.waitRun ?? (async (runId, id) => {
+      calls.push(['waitRun', runId, id])
+      return { ...RUN_VIEW }
+    }),
+    computeWaitBudgetMs: script.computeWaitMs ?? (() => 330_000),
   }
 }
 
@@ -54,9 +82,9 @@ const baseInput = () => ({
 })
 
 describe('createToolDefinitions（契约 docs/temp/07-tools.md 适配层约定）', () => {
-  it('产出 script_create / script_list / script_view 三个定义', () => {
+  it('产出 script_create / script_list / script_view / script_edit / script_run 五个定义', () => {
     const { definitions } = makeTools()
-    expect(definitions.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view'])
+    expect(definitions.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view', 'script_edit', 'script_run'])
     for (const definition of definitions) {
       expect(typeof definition.description).toBe('string')
       expect(definition.description.length).toBeGreaterThan(10)
@@ -251,6 +279,112 @@ describe('script_view.execute', () => {
       },
     })
     await expect(tools2.script_view.execute({ id: 'x' }, {})).resolves.toEqual({
+      code: 'script_unknown',
+      message: "编排 'x' 不存在",
+      details: { id: 'x' },
+    })
+  })
+})
+
+describe('script_edit.execute（契约 07 script_edit：四 action 透传 + 乐观并发）', () => {
+  it('合法 update/pause/resume 原样透传 service.edit（含 actorSessionId/signal/expectedUpdatedAt），返回 OrchestrationView 值', async () => {
+    const { byName, service } = makeTools()
+    const signal = new AbortController().signal
+    const exec = { agent: { session: 'session-xyz' }, signal }
+    const editInput = { id: 'log-rotate', action: 'update', patch: { title: 'new' }, expectedUpdatedAt: VIEW.updatedAt }
+    const result = await byName.script_edit.execute(editInput, exec)
+    expect(result).toEqual(VIEW)
+    expect(service.calls).toEqual([['edit', editInput, 'session-xyz', signal]])
+    await byName.script_edit.execute({ id: 'log-rotate', action: 'pause' }, {})
+    expect(service.calls[1]).toEqual(['edit', { id: 'log-rotate', action: 'pause' }, undefined, undefined])
+    await byName.script_edit.execute({ id: 'log-rotate', action: 'resume', expectedUpdatedAt: null }, {})
+    expect(service.calls[2]).toEqual(['edit', { id: 'log-rotate', action: 'resume', expectedUpdatedAt: null }, undefined, undefined])
+  })
+
+  it.each([
+    ['action 非法枚举', { id: 'x', action: 'bogus' }, 'action', 'format'],
+    ['多余字段', { id: 'x', action: 'pause', deep: 1 }, 'deep', 'unexpected'],
+    ['缺 id', { action: 'pause' }, 'id', 'missing'],
+    ['patch 类型错', { id: 'x', action: 'update', patch: 'nope' }, 'patch', 'format'],
+    ['patch 未声明字段', { id: 'x', action: 'update', patch: { bogus: 1 } }, 'patch.bogus', 'unexpected'],
+    ['expectedUpdatedAt 类型错', { id: 'x', action: 'pause', expectedUpdatedAt: 42 }, 'expectedUpdatedAt', 'format'],
+  ])('schema 校验：%s → script_input_invalid（%s/%s）', async (_label, args, field, reason) => {
+    const { byName, service } = makeTools()
+    const result = await byName.script_edit.execute(args, {})
+    expect(result).toMatchObject({ code: 'script_input_invalid', details: { field, reason } })
+    expect(service.calls).toEqual([])
+  })
+
+  it('服务契约错误原样透传：script_conflict / script_unknown / script_input_invalid', async () => {
+    const { byName } = makeTools({
+      edit: async () => {
+        throw new OrchestratorError('script_conflict', '已被其他修改', { expected: 'a', actual: 'b' })
+      },
+    })
+    await expect(byName.script_edit.execute({ id: 'x', action: 'pause' }, {})).resolves.toEqual({
+      code: 'script_conflict',
+      message: '已被其他修改',
+      details: { expected: 'a', actual: 'b' },
+    })
+    const { byName: t2 } = makeTools({
+      edit: async () => {
+        throw new OrchestratorError('script_unknown', "编排 'x' 不存在", { id: 'x' })
+      },
+    })
+    await expect(t2.script_edit.execute({ id: 'x', action: 'resume' }, {})).resolves.toMatchObject({ code: 'script_unknown' })
+    const { byName: t3 } = makeTools({
+      edit: async () => {
+        throw new OrchestratorError('script_input_invalid', 'delete 尚未实现', { field: 'action', reason: 'unsupported-part' })
+      },
+    })
+    await expect(t3.script_edit.execute({ id: 'x', action: 'delete' }, {})).resolves.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'action', reason: 'unsupported-part' },
+    })
+  })
+})
+
+describe('script_run.execute（契约 07 script_run：wait 语义）', () => {
+  it('wait 默认 true：受理后尽力等待，返回终态 RunView 值', async () => {
+    const { byName, service } = makeTools()
+    const result = await byName.script_run.execute({ id: 'log-rotate' }, {})
+    expect(result).toEqual(RUN_VIEW)
+    expect(service.calls).toEqual([['run', 'log-rotate', undefined], ['waitRun', 'run-7f3c1a9e', 'log-rotate']])
+  })
+
+  it('wait:false 立即返回简形 { runId, status }（受理即回，不等结算）', async () => {
+    const { byName, service } = makeTools()
+    const result = await byName.script_run.execute({ id: 'log-rotate', wait: false }, {})
+    expect(result).toEqual({ runId: 'run-7f3c1a9e', status: 'queued' })
+    expect(service.calls).toEqual([['run', 'log-rotate', undefined]])
+  })
+
+  it('wait:true 等待超限：返回非终态 RunView、不报错（服务 waitRun 语义透传）', async () => {
+    const { byName } = makeTools({
+      run: async () => ({ ...RUN_VIEW, status: 'queued', settledAt: null }),
+      waitRun: async () => ({ ...RUN_VIEW, status: 'queued', settledAt: null }),
+    })
+    const result = await byName.script_run.execute({ id: 'log-rotate' }, {})
+    expect(result).toMatchObject({ runId: 'run-7f3c1a9e', status: 'queued' })
+  })
+
+  it('schema 校验：wait 类型错 → format；多余字段 → unexpected；服务 script_unknown 透传', async () => {
+    const { byName, service } = makeTools()
+    await expect(byName.script_run.execute({ id: 'x', wait: 'yes' }, {})).resolves.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'wait', reason: 'format' },
+    })
+    await expect(byName.script_run.execute({ id: 'x', deep: 1 }, {})).resolves.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'deep', reason: 'unexpected' },
+    })
+    expect(service.calls).toEqual([])
+    const { byName: t2 } = makeTools({
+      run: async () => {
+        throw new OrchestratorError('script_unknown', "编排 'x' 不存在", { id: 'x' })
+      },
+    })
+    await expect(t2.script_run.execute({ id: 'x' }, {})).resolves.toEqual({
       code: 'script_unknown',
       message: "编排 'x' 不存在",
       details: { id: 'x' },

@@ -1,8 +1,9 @@
-// 工具适配层（契约 docs/temp/07-tools.md）：script_create / script_list / script_view。
-// 严格 JSON Schema 校验 + 全部映射 script_input_invalid；语义以服务为准（06），工具不自带业务规则。
-// 原始 ctx.tools.register 注册（不用 defineTool 简写——其参数校验抛宿主 INVALID_ARGS，
-// 破坏单一错误面）；execute 返回 JSON 值，output.render 单块 JSON 文本。
-// create 覆盖 every（票 25）与 cron（票 27）；list/view 属票 25；script_run/script_edit 属票 26/28。
+// 工具适配层（契约 docs/temp/07-tools.md）：script_create / script_list / script_view /
+// script_edit / script_run。严格 JSON Schema 校验 + 全部映射 script_input_invalid；
+// 语义以服务为准（06），工具不自带业务规则。原始 ctx.tools.register 注册（不用
+// defineTool 简写——其参数校验抛宿主 INVALID_ARGS，破坏单一错误面）；execute 返回
+// JSON 值，output.render 单块 JSON 文本。create 覆盖 every/cron（票 25/27）；
+// edit 的 update/pause/resume 与 run 的 wait 语义属票 28（delete 属票 29）。
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { OrchestratorError } from './errors.js'
 
@@ -143,6 +144,44 @@ const viewParameters = {
   },
 }
 
+// script_edit：patch 为 Partial<OrchestrationInput>（schema 声明字段全集拦未声明键；
+// 每 kind 判别与语义校验归服务层——与 create 的 trigger 全集同一哲学）
+const patchParameters = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    title: { type: 'string', description: '1–120 字符（长度由服务校验）' },
+    enabled: { type: 'boolean', description: '修改 enabled 走暂停/恢复规则（服务层语义）' },
+    overlap: { type: 'string', enum: ['skip', 'queue'] },
+    trigger: triggerSchema,
+    script: scriptSchema,
+    judge: judgeSchema,
+    actions: { type: 'object', description: '动作键 → 动作定义（由服务校验）' },
+  },
+}
+
+const editParameters = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['id', 'action'],
+  properties: {
+    id: { type: 'string', description: '编排 id' },
+    action: { type: 'string', enum: ['update', 'pause', 'resume', 'delete'], description: 'update 需 patch；delete 属后续版本' },
+    patch: { ...patchParameters, description: "仅 action:'update'：至少一个字段的局部更新" },
+    expectedUpdatedAt: { oneOf: [stringSchema, { type: 'null' }], description: 'ISO 时间字符串或 null（乐观并发；null = 此前没有更新时间）' },
+  },
+}
+
+const runParameters = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['id'],
+  properties: {
+    id: { type: 'string', description: '编排 id（paused/ended 均允许手动执行）' },
+    wait: { type: 'boolean', description: '默认 true：尽力等待本次结算（最长 timeoutSeconds+30s，超限返回当前视图不报错）；false 立即返回 { runId, status }' },
+  },
+}
+
 // ---------------- output schema（oneOf：成功形状 + 每个契约错误形状，分支互斥） ----------------
 
 /** OrchestrationView 顶层不变量（深层配置对象不做形状重复，事实源在服务层）。 */
@@ -229,8 +268,69 @@ const viewOutputSchema = {
   ],
 }
 
+const editOutputSchema = {
+  oneOf: [
+    {
+      // update / pause / resume → 完整 OrchestrationView
+      type: 'object',
+      additionalProperties: false,
+      required: Object.keys(orchestrationViewProperties),
+      properties: orchestrationViewProperties,
+    },
+    {
+      // delete → DeleteResult（票 29 交付；schema 面先行占位保持契约形状）
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'removedRuns'],
+      properties: { id: stringSchema, removedRuns: { type: 'integer' } },
+    },
+    errorBranch('script_input_invalid'),
+    errorBranch('script_unknown'),
+    errorBranch('script_conflict'),
+    errorBranch('internal_error'),
+  ],
+}
+
+const runOutputSchema = {
+  oneOf: [
+    {
+      // wait:true（或受理视图已终态）→ RunView（深层形状由服务层事实源保证）
+      type: 'object',
+      additionalProperties: false,
+      required: ['runId', 'orchestrationId', 'trigger', 'scheduledAt', 'status', 'skipReason', 'script', 'matchedRule', 'usedFallback', 'actions'],
+      properties: {
+        runId: stringSchema,
+        orchestrationId: stringSchema,
+        trigger: { type: 'string', enum: ['every', 'cron', 'manual'] },
+        scheduledAt: stringSchema,
+        startedAt: { oneOf: [stringSchema, { type: 'null' }] },
+        settledAt: { oneOf: [stringSchema, { type: 'null' }] },
+        status: {
+          type: 'string',
+          enum: ['queued', 'running', 'judging', 'dispatching', 'succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'],
+        },
+        skipReason: { oneOf: [{ type: 'string', enum: ['overlap', 'disabled', 'concurrency'] }, { type: 'null' }] },
+        script: { type: 'object' },
+        matchedRule: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+        usedFallback: { type: 'boolean' },
+        actions: { type: 'array', items: { type: 'object' } },
+      },
+    },
+    {
+      // wait:false → 简形 { runId, status }（与 RunView 分支经 required 互斥）
+      type: 'object',
+      additionalProperties: false,
+      required: ['runId', 'status'],
+      properties: { runId: stringSchema, status: stringSchema },
+    },
+    errorBranch('script_unknown'),
+    errorBranch('script_input_invalid'),
+    errorBranch('internal_error'),
+  ],
+}
+
 /**
- * 建三个工具定义（供 registerTools 与测试直接消费）。
+ * 建五个工具定义（供 registerTools 与测试直接消费）。
  * @param {object} deps
  * @param {object} deps.service 管理服务（ctx.scriptOrchestrator 实现面）
  * @param {object} [deps.logger] 内部日志
@@ -273,6 +373,44 @@ export function createToolDefinitions({ service, logger }) {
         parameters: viewParameters,
         logger,
         invoke: (args) => service.view(args.id, 'runs' in args ? { runs: args.runs } : {}),
+      }),
+    },
+    {
+      name: 'script_edit',
+      description:
+        "更新 / 暂停 / 恢复 / 删除编排。update 给 patch（至少一个字段；仅调度字段修改重建下次触发，非调度编辑不重锚）；pause 仅从 active 生效、resume 仅从 paused 生效（其余状态幂等 no-op）；expectedUpdatedAt 可选乐观并发（不匹配返回 script_conflict）。",
+      parameters: editParameters,
+      output: { schema: editOutputSchema, render },
+      execute: wrapExecute({
+        name: 'script_edit',
+        parameters: editParameters,
+        logger,
+        invoke: (args, exec) => {
+          const actorSessionId = typeof exec?.agent?.session === 'string' ? exec.agent.session : undefined
+          return service.edit(args, actorSessionId, exec?.signal)
+        },
+      }),
+    },
+    {
+      name: 'script_run',
+      description:
+        '立即手动执行一次编排（trigger=manual，不改变下次自动触发；paused/ended 均允许）。wait 默认 true：尽力等待本次结算（最长 timeoutSeconds+30 秒，超限返回当前视图不报错）；wait:false 立即返回 { runId, status }。',
+      parameters: runParameters,
+      output: { schema: runOutputSchema, render },
+      execute: wrapExecute({
+        name: 'script_run',
+        parameters: runParameters,
+        logger,
+        invoke: async (args, exec) => {
+          const accepted = await service.run(args.id, exec?.signal)
+          if (accepted === null || accepted === undefined) {
+            return { code: 'internal_error', message: `run 受理未返回视图（编排 '${args.id}' 可能在受理瞬间被删除）` }
+          }
+          if (args.wait === false) {
+            return { runId: accepted.runId, status: accepted.status }
+          }
+          return await service.waitRun(accepted.runId, args.id)
+        },
       }),
     },
   ]
