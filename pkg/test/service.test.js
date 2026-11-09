@@ -442,6 +442,68 @@ describe('create 校验矩阵（契约 01–05；失败不产生任何记录、�
   })
 })
 
+describe('registerAction / listActions（契约 06 注册动作：票 31）', () => {
+  it('registerAction 是同步方法：返回 disposer 函数（非 Promise）', () => {
+    const { service } = makeService()
+    const dispose = service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(typeof dispose).toBe('function')
+    expect(dispose).not.toBeInstanceOf(Promise)
+  })
+
+  it('注册后 listActions() 按 name 排序返回 { name, description? }；view 的 availableActions 与服务一致', async () => {
+    const { service } = makeService()
+    service.registerAction({ name: 'ops.oncall', description: '按 severity 呼叫值班', run: async () => {} })
+    service.registerAction({ name: 'alpha.ping', run: async () => {} })
+    const expected = [
+      { name: 'alpha.ping' },
+      { name: 'ops.oncall', description: '按 severity 呼叫值班' },
+    ]
+    expect(service.listActions()).toEqual(expected)
+    const created = await service.create(baseInput())
+    const detail = await service.view(created.id)
+    expect(detail.availableActions).toEqual(expected)
+    expect(detail.availableActions).toEqual(service.listActions())
+  })
+
+  it('不合规名字 / 保留前缀 / definition 形状错误 → 同步抛 Error（非 rejected Promise）', () => {
+    const { service } = makeService()
+    expect(() => service.registerAction({ name: 'oncall', run: async () => {} })).toThrow()
+    expect(() => service.registerAction({ name: 'a.b.c', run: async () => {} })).toThrow()
+    expect(() => service.registerAction({ name: 'script-orchestrator.echo', run: async () => {} })).toThrow(/script-orchestrator/)
+    expect(() => service.registerAction({ name: 'ops.oncall' })).toThrow() // 缺 run
+  })
+
+  it('重名注册同步抛 Error（消息含冲突名），既有注册不受影响', () => {
+    const { service } = makeService()
+    service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(() => service.registerAction({ name: 'ops.oncall', run: async () => {} })).toThrow(/ops\.oncall/)
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall' }])
+  })
+
+  it('disposer 摘除后 listActions 与 view.availableActions 同步反映（幂等、可重注册）', async () => {
+    const { service } = makeService()
+    const dispose = service.registerAction({ name: 'ops.oncall', description: 'v1', run: async () => {} })
+    dispose()
+    dispose() // 幂等
+    expect(service.listActions()).toEqual([])
+    // 同步紧随的重注册不误冲突（disposer 同步完成摘除）
+    const dispose2 = service.registerAction({ name: 'ops.oncall', description: 'v2', run: async () => {} })
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall', description: 'v2' }])
+    const created = await service.create(baseInput())
+    expect((await service.view(created.id)).availableActions).toEqual([{ name: 'ops.oncall', description: 'v2' }])
+    dispose2()
+    expect((await service.view(created.id)).availableActions).toEqual([])
+  })
+
+  it('缺省自建注册表（未注入 actionRegistry）与注入共享实例行为一致：注册 → 快照 → 摘除', () => {
+    const { service } = makeService() // 未注入 actionRegistry
+    const dispose = service.registerAction({ name: 'ops.oncall', run: async () => {} })
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall' }])
+    dispose()
+    expect(service.listActions()).toEqual([])
+  })
+})
+
 describe('create cron 校验（契约 02「cron 子集」「时区与夏令时」「校验错误」；票 27）', () => {
   /** 基线合法 cron 输入。 */
   const cronInput = (over = {}) => ({

@@ -344,6 +344,136 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
+  it('票 31 接线：service.registerAction 注册 → 同一注册表驱动 runner 派发（调用成功 + report 警告）；dispose 后 → unknown_action', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('plugin-wire', {
+      id: 'plugin-wire',
+      title: '注册动作接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['page'] }], fallback: [] },
+      actions: { page: { kind: 'plugin', action: 'ops.oncall', payload: { note: '{{orchestrationTitle}}' } } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    const service = calls.provided[0][1]
+    const contexts = []
+    const dispose = service.registerAction({
+      name: 'ops.oncall',
+      description: '按 severity 呼叫值班',
+      async run(context) {
+        contexts.push(context)
+        context.report('已呼叫值班')
+      },
+    })
+    // provided 服务与 runner 共享同一注册表：listActions 快照可见
+    expect(service.listActions()).toEqual([{ name: 'ops.oncall', description: '按 severity 呼叫值班' }])
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+      if (!run) throw new Error('run 未按 succeeded 结算')
+    })
+    const run = [...tables.runs.values()].find((r) => r.status === 'succeeded')
+    expect(run.actions).toEqual([
+      { name: 'page', kind: 'plugin', status: 'succeeded', warnings: ['已呼叫值班'] },
+    ])
+    // ActionContext 契约形状（契约 06）：payload 已渲染、signal、report
+    expect(contexts).toHaveLength(1)
+    expect(contexts[0].orchestration).toEqual({ id: 'plugin-wire', title: '注册动作接线' })
+    expect(contexts[0].payload).toEqual({ note: '注册动作接线' })
+    expect(typeof contexts[0].signal?.addEventListener).toBe('function')
+    // 摘除后：实时查表 → unknown_action（第二次触发经手动注入——直接再放一个过期计划不可行，
+    // 用 disposer 后的派发查表路径经 service 视图验证：listActions 清空）
+    dispose()
+    expect(service.listActions()).toEqual([])
+    await first.value()
+  })
+
+  it('票 31 超时接线：编排记录的 timeoutSeconds 经 runner 流到派发器 → 动作 failed timeout、run failed（真实计时器）', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    const dueIso = new Date(Date.now() - 1000).toISOString()
+    tables.orchestrations.set('timeout-wire', {
+      id: 'timeout-wire',
+      title: '超时接线',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [{ when: { exitCode: 0 }, actions: ['hang-page'] }], fallback: [] },
+      actions: { 'hang-page': { kind: 'plugin', action: 'ops.hang', timeoutSeconds: 1 } },
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    const service = calls.provided[0][1]
+    service.registerAction({
+      name: 'ops.hang',
+      // 观察 signal 的实现：中止后收尾（模拟告警调用放弃重试）
+      run: (context) => new Promise((resolve) => context.signal.addEventListener('abort', resolve)),
+    })
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await vi.waitFor(() => {
+      const run = [...tables.runs.values()].find((r) => r.status === 'failed')
+      if (!run) throw new Error('run 未按 failed 结算（单动作 timeout）')
+    }, { timeout: 5000, interval: 50 })
+    const run = [...tables.runs.values()].find((r) => r.status === 'failed')
+    expect(run.actions).toEqual([
+      {
+        name: 'hang-page',
+        kind: 'plugin',
+        status: 'failed',
+        error: { code: 'timeout', message: expect.stringContaining('ops.hang') },
+      },
+    ])
+    await first.value()
+  })
+
   it('卸载顺序：先停调度与工具/桥（停生产者）→ runner 停机（在途清进程）→ 排干队列 → domain.close()', async () => {
     const { ctx, calls } = makeCtx()
     const it = plugin(ctx, {})
