@@ -301,6 +301,25 @@ window.__ModuleLoader__.load({
 		function DetailModal({ call, id, onClose }) {
 			const [state, setState] = useState({ phase: "loading" });
 
+			// 完整溢写输出读取（票 34）：RunCard 的「全量」按钮 → spill 端点（排障读面）。
+			// 文件已不存在/不可读时以契约错误呈现（服务返回 script_storage_unavailable）。
+			const [spill, setSpill] = useState(null);
+			async function openSpill(runId, stream) {
+				setSpill({ phase: "loading", runId, stream });
+				let res;
+				try {
+					res = await call("spill", { runId, stream });
+				} catch (e) {
+					setSpill({ phase: "error", runId, stream, code: "transport", message: String((e && e.message) || e) });
+					return;
+				}
+				if (res && res.ok) setSpill({ phase: "ready", runId, stream, value: res.value });
+				else {
+					const error = (res && res.error) || {};
+					setSpill({ phase: "error", runId, stream, code: error.code || "internal_error", message: error.message || "未知错误" });
+				}
+			}
+
 			async function load(opts) {
 				if (!opts || !opts.silent) setState({ phase: "loading" });
 				try {
@@ -361,15 +380,16 @@ window.__ModuleLoader__.load({
 						section("执行记录（" + state.data.runs.length + "）",
 							state.data.runs.length === 0
 								? h("div", { style: { ...C.muted, fontSize: 12 } }, "还没有执行记录（创建不会立即执行脚本）")
-								: state.data.runs.map((r) => h(RunCard, { key: r.runId, r }))),
+								: state.data.runs.map((r) => h(RunCard, { key: r.runId, r, onReadSpill: (runId, stream) => void openSpill(runId, stream) }))),
 						section("可用注册动作（availableActions）",
 							state.data.availableActions.length === 0
 								? h("div", { style: { ...C.muted, fontSize: 12 } }, "暂无注册动作（其他插件可通过 ctx.scriptOrchestrator.registerAction 注册）")
-								: state.data.availableActions.map((a) => h("div", { key: a.name, style: { ...C.mono, fontSize: 11 } }, a.name, a.description ? " — " + a.description : ""))))));
+								: state.data.availableActions.map((a) => h("div", { key: a.name, style: { ...C.mono, fontSize: 11 } }, a.name, a.description ? " — " + a.description : ""))))),
+				spill ? h(SpillModal, { spill, onClose: () => setSpill(null) }) : null);
 		}
 
 		// 单条 run 记录卡：三段结果（契约 11：脚本 / 判定 / 动作 + warnings）
-		function RunCard({ r }) {
+		function RunCard({ r, onReadSpill }) {
 			const s = r.script || {};
 			const facts = [];
 			if (r.skipReason) facts.push("跳过（" + (SKIP_REASON_CN[r.skipReason] || r.skipReason) + "）");
@@ -396,8 +416,11 @@ window.__ModuleLoader__.load({
 				judged ? h("div", { style: { ...C.row, fontSize: 11, marginTop: 2 } },
 					h("span", { ...C.muted }, "判定："),
 					h("span", null, judgeText)) : null,
-				(s.stdoutSpillPath || s.stderrSpillPath) && h("div", { style: { ...C.muted, fontSize: 10, marginTop: 2 } },
-					"完整输出：", s.stdoutSpillPath ? "stdout " : "", s.stderrSpillPath ? "stderr" : "", "（溢写文件，排障可读）"),
+				(s.stdoutSpillPath || s.stderrSpillPath) && h("div", { style: { ...C.row, fontSize: 10, marginTop: 2, flexWrap: "wrap" } },
+					h("span", { ...C.muted }, "完整输出："),
+					s.stdoutSpillPath ? h("button", { style: { ...C.btn, padding: "1px 6px", fontSize: 10 }, onClick: () => onReadSpill && onReadSpill(r.runId, "stdout") }, "stdout 全量") : null,
+					s.stderrSpillPath ? h("button", { style: { ...C.btn, padding: "1px 6px", fontSize: 10 }, onClick: () => onReadSpill && onReadSpill(r.runId, "stderr") }, "stderr 全量") : null,
+					h("span", { ...C.muted }, "（溢写文件，排障可读）")),
 				tailPreview ? h("div", { style: { ...C.mono, fontSize: 10, marginTop: 3, whiteSpace: "pre-wrap", color: "#3f3f46", background: "#fafafa", borderRadius: 6, padding: "4px 6px", maxHeight: 120, overflowY: "auto" } },
 					s.truncated ? "…" : "", tailPreview) : null,
 				s.warnings && s.warnings.length > 0 ? h("div", { style: { color: "#d97706", fontSize: 10, marginTop: 3 } },
@@ -415,6 +438,29 @@ window.__ModuleLoader__.load({
 							a.sessionId, a.kind === "session" && a.status === "succeeded" ? "（可接管）" : "") : null,
 						a.error ? h("span", { style: { ...C.mono, color: "#dc2626", fontSize: 10 } }, a.error.code, "：", a.error.message) : null,
 						a.warnings && a.warnings.length > 0 ? h("span", { style: { color: "#d97706", fontSize: 10 } }, a.warnings.join("；")) : null))) : null);
+		}
+
+		// 完整溢写输出模态（票 34；契约 03「UI 读取 spill 失败时显示『文件已不存在』」）：
+		// 加载态 / 成功全文（只读 pre，可滚动）/ 失败排障态（code + message）。
+		function SpillModal({ spill, onClose }) {
+			const label = spill.stream === "stdout" ? "stdout" : "stderr";
+			return h("div", {
+				style: { position: "fixed", inset: 0, background: "#0007", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 80 },
+				onClick: (e) => { if (e.target === e.currentTarget) onClose(); },
+			},
+				h("div", { style: { ...C.card, width: 720, maxWidth: "94vw", maxHeight: "88vh", display: "flex", flexDirection: "column", boxShadow: "0 12px 40px #0004" } },
+					h("div", { style: { ...C.row, marginBottom: 8 } },
+						h("b", { style: { fontSize: 14 } }, "完整输出 · ", label),
+						h("span", { style: { ...C.muted, ...C.mono, fontSize: 10 } }, spill.runId),
+						spill.phase === "ready" ? h("span", { style: { ...C.muted, fontSize: 10 } }, "（", spill.value.bytes, " 字节）") : null,
+						h("button", { style: { ...C.btn, marginLeft: "auto" }, onClick: onClose }, "关闭")),
+					spill.phase === "loading" ? h("div", { style: { padding: 24, textAlign: "center", ...C.muted } }, "读取溢写文件…")
+					: spill.phase === "error" ? h("div", { style: { color: "#dc2626", padding: "8px 0" } },
+						h("div", null, "无法读取完整输出（", spill.code, "）"),
+						h("div", { style: { ...C.mono, fontSize: 11, marginTop: 6, whiteSpace: "pre-wrap" } }, spill.message),
+						h("div", { style: { ...C.muted, fontSize: 11, marginTop: 6 } }, "溢写文件已不存在时属正常现象（系统 temp 清理或超 cap 撤回）；输出尾部仍可在 run 记录中查看。"))
+					: h("pre", { style: { ...C.mono, fontSize: 11, margin: 0, padding: 10, background: "#fafafa", border: "1px solid #e4e4e7", borderRadius: 8, overflow: "auto", flex: 1, whiteSpace: "pre-wrap" } },
+						spill.value.content || "（空输出）")));
 		}
 
 		function PanelIcon() {

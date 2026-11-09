@@ -14,6 +14,8 @@ import { createBridgeHandler, mountBridge } from './bridge.js'
 import { registerTools } from './tools.js'
 import { createActionRegistry } from './actions.js'
 import { createEphemeralRegistry } from './ephemeral-lifecycle.js'
+import { createRetentionPolicy } from './retention.js'
+import { promises as nodeFs } from 'node:fs'
 
 export const name = 'script-orchestrator'
 export { Config }
@@ -51,6 +53,9 @@ export async function* apply(ctx, config) {
   // ephemeral 会话生命周期登记器（票 33）：投递成功 adopt（whenIdle → idleDisposeSeconds
   // → dispose）、失败 retain 保留现场；卸载序列在 runner 停机后 disposeAll 收口
   const ephemeralRegistry = createEphemeralRegistry({ logger })
+  // 保留裁剪（票 34；契约 08「保留与裁剪」）：run 结算写入后在 runner 的同一 FIFO 槽内
+  // 顺带执行；被裁 run 的溢写文件 best-effort unlink
+  const retention = createRetentionPolicy({ storage, config, fs: nodeFs, logger })
   const runner = createRunner({
     storage,
     queue,
@@ -75,6 +80,7 @@ export async function* apply(ctx, config) {
       getAgentPresets: () => ctx.get('agentPresets'),
     },
     ephemeralRegistry,
+    retention,
   })
   const scheduler = createScheduler({
     storage,
@@ -97,6 +103,7 @@ export async function* apply(ctx, config) {
     runner,
     onMutation: reschedule,
     actionRegistry,
+    fs: nodeFs, // 票 34：delete 级联的 spill 清理与 readSpill 读文件
   })
   // 工具：profile 根作用域各注册一次（契约 07；票 25 交付 create/list/view）
   const disposeTools = registerTools({ tools: ctx.tools, service, logger })

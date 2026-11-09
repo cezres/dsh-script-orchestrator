@@ -107,8 +107,10 @@ export function buildSettledPayload(run) {
  *   session 动作 failed internal_error）
  * @param {object} [deps.ephemeralRegistry] ephemeral 生命周期登记器（票 33；
  *   createEphemeralRegistry 或结构等同物；缺省时 ephemeral 动作 failed internal_error）
+ * @param {object} [deps.retention] 保留裁剪策略（票 34：createRetentionPolicy 或
+ *   { enforce() } 结构等同物；run 结算写入后在同一 FIFO 槽内顺带执行，缺省不裁剪）
  */
-export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry, sessionHost, ephemeralRegistry }) {
+export function createRunner({ storage, queue, subprocess, config, emit, now, logger, fs, hostCwd, onOrchestrationMutated, registry, sessionHost, ephemeralRegistry, retention }) {
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
@@ -250,6 +252,20 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     })
   }
 
+  /**
+   * 保留裁剪（票 34）：结算写入后在同一 FIFO 槽内顺带执行；异常只记内部日志
+   *（契约 08「失败容忍暂时超限」——绝不因裁剪失败影响结算与事件发布）。
+   */
+  async function enforceRetention() {
+    try {
+      await retention?.enforce?.()
+    } catch (error) {
+      log.error?.(
+        `script-orchestrator: 保留裁剪异常（容忍暂时超限）: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
   /** 写 2 结算 skipped（与写 1 几乎同时，同一 FIFO 槽内完成）。 */
   async function settleSkip(runId, skipReason) {
     const settledMs = currentTime()
@@ -265,6 +281,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     }
     await storage.table('runs').put(runId, settled)
     live.delete(runId)
+    // 保留裁剪（票 34；契约 08「结算写入后同一服务槽位内顺带执行」，失败容忍）
+    await enforceRetention()
     // fixed-delay：自动 run 进入任何终态都推进序列（含 skipped；契约 02「fixed-delay」）
     await advanceFixedDelayIfDue(settled, settledMs)
     wakeIdleWaiters()
@@ -604,6 +622,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
 
       await storage.table('runs').put(runId, structuredCloneSafe(run))
       live.delete(runId)
+      // 保留裁剪（票 34；契约 08「结算写入后同一服务槽位内顺带执行」，失败容忍）
+      await enforceRetention()
       wakeIdleWaiters()
       for (const action of run.actions ?? []) {
         safeEmit('script-orchestrator/action-settled', {

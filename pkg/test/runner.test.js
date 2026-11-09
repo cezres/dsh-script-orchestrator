@@ -138,6 +138,7 @@ function makeRunner(over = {}) {
     hostCwd: over.hostCwd ?? 'D:\\work\\proj',
     registry: over.registry,
     sessionHost: over.sessionHost,
+    retention: over.retention,
   })
   return { runner, storage, subprocess, emitted, logs, advance: (ms) => { clock += ms } }
 }
@@ -1239,5 +1240,71 @@ describe('卸载取消与删除中标记（契约 03 取消矩阵来源含插件
     const again = await requestAuto(ctx.runner)
     expect(again?.status).toMatch(/queued|running/)
     await ctx.runner.waitIdle()
+  })
+})
+
+describe('保留裁剪接线（票 34；契约 08「结算写入后同一服务槽位内顺带执行」）', () => {
+  it('结算：写 2 之后调用 retention.enforce，run-settled 照常发布', async () => {
+    const order = []
+    const ctx = makeRunner({
+      retention: {
+        enforce: async () => {
+          order.push('retention')
+        },
+      },
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    expect(order).toEqual(['retention'])
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    // 裁剪在写 2 之后（同一槽位内顺带执行）
+    expect(ctx.storage.puts.some(([table, , status]) => table === 'runs' && status === 'succeeded')).toBe(true)
+    expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/run-settled')).toBe(true)
+  })
+
+  it('裁剪异常不影响结算与事件发布（契约 08：失败容忍暂时超限）', async () => {
+    const ctx = makeRunner({
+      retention: {
+        enforce: async () => {
+          throw new Error('domain write rejected')
+        },
+      },
+    })
+    const view = await requestAuto(ctx.runner)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('succeeded')
+    expect(ctx.logs.some((m) => m.includes('保留裁剪异常'))).toBe(true)
+    expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/run-settled')).toBe(true)
+  })
+
+  it('skipped 结算同样触发裁剪', async () => {
+    const calls = []
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      retention: {
+        enforce: async () => {
+          calls.push('retention')
+        },
+      },
+    })
+    const first = await requestAuto(ctx.runner)
+    expect(['queued', 'running']).toContain(first.status)
+    const second = await requestAuto(ctx.runner) // 单飞占用中自动触发 → overlap skip
+    expect(second.status).toBe('skipped')
+    expect(calls).toEqual(['retention'])
+    // 收尾：让首 run 正常结算，不遗留挂起执行
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+  })
+
+  it('tailText：取解码后末 2048 code point，U+FFFD 如实保留并计入', async () => {
+    const { tailText } = await import('../lib/execution-utils.js')
+    const text = 'x'.repeat(3000) + '\uFFFD中'
+    const tail = tailText(text, 2048)
+    expect(Array.from(tail).length).toBe(2048)
+    expect(tail.endsWith('\uFFFD中')).toBe(true) // 替换字符保留（契约 03：U+FFFD 如实保留并计入）
   })
 })

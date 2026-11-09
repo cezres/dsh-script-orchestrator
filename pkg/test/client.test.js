@@ -933,3 +933,99 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     view.unmount()
   })
 })
+
+describe('完整溢写输出读取（票 34：spill 端点；文件不存在排障态）', () => {
+  const spillRunView = (over = {}) => ({
+    runId: 'run-spill',
+    orchestrationId: 'log-rotate',
+    trigger: 'every',
+    scheduledAt: '2026-11-09T00:05:00.000Z',
+    startedAt: '2026-11-09T00:05:00.100Z',
+    settledAt: '2026-11-09T00:05:02.300Z',
+    status: 'succeeded',
+    skipReason: null,
+    script: {
+      command: 'pwsh',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      durationMs: 2200,
+      stdoutTail: 'tail',
+      stderrTail: '',
+      truncated: true,
+      stdoutSpillPath: 'C:/tmp/dsh-subprocess-x/out.log',
+      stderrSpillPath: 'C:/tmp/dsh-subprocess-x/err.log',
+    },
+    matchedRule: 0,
+    usedFallback: false,
+    actions: [],
+    ...over,
+  })
+
+  const makeCall = (spillResponse) => {
+    const calls = []
+    const call = (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return Promise.resolve({ ok: true, value: { items: [ORCH], total: 1, nextOffset: null } })
+      if (endpoint === 'view') return Promise.resolve({ ok: true, value: { ...ORCH, availableActions: [], runs: [spillRunView()] } })
+      if (endpoint === 'spill') return Promise.resolve(spillResponse)
+      return Promise.resolve({ ok: true, value: {} })
+    }
+    return { call, calls }
+  }
+
+  it('有溢写路径的 run 显示「stdout 全量」：点击 → call spill → 模态展示全文与字节数', async () => {
+    const { call, calls } = makeCall({
+      ok: true,
+      value: { runId: 'run-spill', stream: 'stdout', path: 'C:/tmp/dsh-subprocess-x/out.log', content: 'line-0000\nline-0199\n', bytes: 20 },
+    })
+    const view = await renderPanel({ call })
+    await view.clickRow('log rotate')
+    expect(view.text()).toContain('stdout 全量')
+    expect(view.text()).toContain('stderr 全量')
+    await view.click('stdout 全量')
+    expect(calls).toContainEqual(['spill', { runId: 'run-spill', stream: 'stdout' }])
+    expect(view.text()).toContain('完整输出 · stdout')
+    expect(view.text()).toContain('line-0000')
+    expect(view.text()).toContain('line-0199')
+    expect(view.text()).toContain('20 字节')
+    view.unmount()
+  })
+
+  it('文件已不存在：spill 返回 script_storage_unavailable → 模态显示排障态（code + message），可关闭', async () => {
+    const { call } = makeCall({
+      ok: false,
+      error: { code: 'script_storage_unavailable', message: '溢写文件已不存在或不可读（ENOENT）', details: { cause: 'ENOENT' } },
+    })
+    const view = await renderPanel({ call })
+    await view.clickRow('log rotate')
+    await view.click('stderr 全量')
+    expect(view.text()).toContain('无法读取完整输出')
+    expect(view.text()).toContain('script_storage_unavailable')
+    expect(view.text()).toContain('溢写文件已不存在或不可读（ENOENT）')
+    await view.click('关闭')
+    expect(view.text()).not.toContain('无法读取完整输出')
+    view.unmount()
+  })
+
+  it('无溢写路径的 run（未超上限/撤回）不显示全量按钮', async () => {
+    const { call } = makeCall({ ok: true, value: {} })
+    const callWithoutSpill = (endpoint, payload) => {
+      if (endpoint === 'view') {
+        return Promise.resolve({
+          ok: true,
+          value: {
+            ...ORCH,
+            availableActions: [],
+            runs: [spillRunView({ script: { command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 1, stdoutTail: 'ok', stderrTail: '', truncated: false } })],
+          },
+        })
+      }
+      return call(endpoint, payload)
+    }
+    const view = await renderPanel({ call: callWithoutSpill })
+    await view.clickRow('log rotate')
+    expect(view.text()).not.toContain('stdout 全量')
+    view.unmount()
+  })
+})

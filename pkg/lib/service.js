@@ -46,8 +46,8 @@ function slugifyTitle(title) {
  * @param {() => void} [deps.onMutation] 编排集合持久变更后的回调（调度器重算 timer）
  * @param {object} [deps.actionRegistry] 动作注册表（缺省自建；与 runner 共享同一实例时
  *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction）
- * @param {object} [deps.fs] { unlink }（delete 级联时对被删 run 的溢写文件 best-effort
- *   清理；契约 03「输出收集」spill 注记。缺省不清理——票 34 深验收接管）
+ * @param {object} [deps.fs] { unlink, readFile }（delete 级联时对被删 run 的溢写文件
+ *   best-effort 清理；readSpill 读取完整溢写输出。缺省时对应操作如实失败——index.js 接线）
  */
 export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry, fs }) {
   const currentTime = now ?? (() => Date.now())
@@ -180,6 +180,56 @@ export function createManagementService({ storage, queue, config, now, emit, log
     /** 注册动作表快照，按 name 排序（契约 06）。 */
     listActions() {
       return registry.snapshot()
+    },
+
+    /**
+     * 读取指定 run 的完整溢写输出（票 34；契约 03「输出收集」spill 注记）。
+     * 只读、不占 FIFO 槽；文件存在性在调用期判定（不启动扫描）。
+     * 溢写缺失（未超内存上限 / 已禁用 / 超 cap 撤回）或文件不可读 →
+     * `script_storage_unavailable`（details.cause 供排障）；未知 runId → `script_unknown`。
+     * @param {{ runId: string, stream: 'stdout'|'stderr' }} input
+     * @returns {Promise<{ runId: string, stream: string, path: string, content: string, bytes: number }>}
+     */
+    async readSpill(input) {
+      const payload = isPlainObject(input) ? input : {}
+      if (typeof payload.runId !== 'string' || payload.runId.length === 0) {
+        throw inputInvalid('runId', 'missing', 'readSpill 需要非空的 runId')
+      }
+      if (payload.stream !== 'stdout' && payload.stream !== 'stderr') {
+        throw inputInvalid('stream', 'invalid', "readSpill 的 stream 必须是 'stdout' 或 'stderr'")
+      }
+      const run = storage.table('runs').get(payload.runId)
+      if (run === undefined) {
+        throw new OrchestratorError('script_unknown', `run '${payload.runId}' 不存在或已删除`, { id: payload.runId })
+      }
+      const script = run.script ?? {}
+      const path = payload.stream === 'stdout' ? script.stdoutSpillPath : script.stderrSpillPath
+      if (typeof path !== 'string' || path.length === 0) {
+        throw new OrchestratorError(
+          'script_storage_unavailable',
+          `run '${payload.runId}' 的 ${payload.stream} 无完整溢出文件（未超内存上限、溢写被禁用或超 cap 撤回）`,
+          { cause: 'spill-unavailable' },
+        )
+      }
+      let content
+      try {
+        content = await fs?.readFile?.(path, 'utf8')
+      } catch (error) {
+        const cause = error?.code !== undefined ? String(error.code) : error instanceof Error ? error.message : String(error)
+        throw new OrchestratorError(
+          'script_storage_unavailable',
+          `run '${payload.runId}' 的 ${payload.stream} 溢写文件已不存在或不可读（${cause}）`,
+          { cause },
+        )
+      }
+      if (typeof content !== 'string') {
+        throw new OrchestratorError(
+          'script_storage_unavailable',
+          `run '${payload.runId}' 的 ${payload.stream} 溢写文件不可读（宿主 fs 未接线）`,
+          { cause: 'spill-unavailable' },
+        )
+      }
+      return { runId: payload.runId, stream: payload.stream, path, content, bytes: Buffer.byteLength(content, 'utf8') }
     },
 
     /**
