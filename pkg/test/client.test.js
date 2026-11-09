@@ -744,7 +744,7 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
     }
   }
 
-  it('按状态渲染行内操作：active → 暂停+执行；paused → 恢复+执行；ended → 执行', async () => {
+  it('按状态渲染行内操作：active → 暂停+执行+删除；paused → 恢复+执行+删除；ended → 执行+删除（删除全状态，票 29）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -752,11 +752,11 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
     const view = await renderPanel({ call: actionsCall([], items), subscribeReset: () => () => {} })
     await view.clickInRow('log rotate', '暂停')
     const activeRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('log rotate'))
-    expect([...activeRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['暂停', '执行'])
+    expect([...activeRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['暂停', '执行', '删除'])
     const pausedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('paused orchestration'))
-    expect([...pausedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['恢复', '执行'])
+    expect([...pausedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['恢复', '执行', '删除'])
     const endedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('ended orchestration'))
-    expect([...endedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['执行'])
+    expect([...endedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['执行', '删除'])
     view.unmount()
   })
 
@@ -806,6 +806,130 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
     await view.clickInRow('log rotate', '暂停')
     expect(view.text()).toContain('script_conflict')
     expect(view.text()).toContain('已被其他修改')
+    view.unmount()
+  })
+})
+
+describe('删除编排 · 二次确认与级联提示（契约 11「行内操作 + 删除二次确认」；票 29）', () => {
+  function deleteCall(calls, { editResult } = {}) {
+    return async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+      if (endpoint === 'edit') {
+        return editResult ?? { ok: true, value: { id: payload.id, removedRuns: 0 } }
+      }
+      throw new Error(`unexpected endpoint ${endpoint}`)
+    }
+  }
+
+  it('每行都有「删除」按钮（全状态）；点击后居中确认模态：标题、级联取消与不可恢复提示，未发任何 edit', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const view = await renderPanel({ call: deleteCall(calls), subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '删除')
+    const modal = view.modal()
+    expect(modal).toBeTruthy()
+    const text = modal.textContent
+    expect(text).toContain('删除编排')
+    expect(text).toContain('log rotate')
+    expect(text).toContain('取消在途 run')
+    expect(text).toContain('不可恢复')
+    expect(calls).toEqual([['list', {}]]) // 确认前不发 edit
+    view.unmount()
+  })
+
+  it('确认删除 → call edit {id, action:"delete"} → 成功后关闭确认并回读列表（写后权威回读）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const view = await renderPanel({ call: deleteCall(calls), subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '删除')
+    await act(async () => {
+      const confirm = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '确认删除')
+      confirm.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(calls).toEqual([
+      ['list', {}],
+      ['edit', { id: 'log-rotate', action: 'delete' }],
+      ['list', {}],
+    ])
+    expect(view.modal()).toBeFalsy() // 确认模态已关闭
+    view.unmount()
+  })
+
+  it('取消确认 → 不发 edit、模态关闭', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const view = await renderPanel({ call: deleteCall(calls), subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '删除')
+    await act(async () => {
+      const cancel = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '取消')
+      cancel.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(calls).toEqual([['list', {}]])
+    expect(view.modal()).toBeFalsy()
+    view.unmount()
+  })
+
+  it('删除期间状态清晰：确认按钮禁用并显示「删除中…」；失败显示契约错误条（可重试）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    let resolveEdit
+    const call = async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+      if (endpoint === 'edit') {
+        return new Promise((resolve) => { resolveEdit = resolve })
+      }
+      throw new Error('unexpected')
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    await view.clickInRow('log rotate', '删除')
+    await act(async () => {
+      const confirm = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '确认删除')
+      confirm.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    // 删除进行中：模态仍在、按钮显示删除中且禁用（UI abort 不取消已受理删除——无取消按钮）
+    const modalText = view.modal().textContent
+    expect(modalText).toContain('删除中')
+    const inFlightButtons = [...view.modal().querySelectorAll('button')]
+    expect(inFlightButtons.every((b) => b.disabled || b.textContent.includes('删除中'))).toBe(true)
+    await act(async () => {
+      resolveEdit({ ok: false, error: { code: 'script_conflict', message: '已被其他修改' } })
+    })
+    expect(view.modal()).toBeFalsy() // 确认模态关闭
+    expect(view.text()).toContain('script_conflict') // 错误条呈现
+    view.unmount()
+  })
+
+  it('删除成功后若详情模态正开着该编排则一并关闭（记录已不存在）', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const calls = []
+    const call = async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+      if (endpoint === 'view') return { ok: true, value: { ...ORCH, runs: [], availableActions: [] } }
+      if (endpoint === 'edit') return { ok: true, value: { id: payload.id, removedRuns: 2 } }
+      throw new Error('unexpected')
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    await view.clickRow('log rotate')
+    expect(view.modal()).toBeTruthy() // 详情模态开着
+    await view.clickInRow('log rotate', '删除')
+    await act(async () => {
+      const confirm = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '确认删除')
+      confirm.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(view.modal()).toBeFalsy() // 确认与详情一并关闭
     view.unmount()
   })
 })
