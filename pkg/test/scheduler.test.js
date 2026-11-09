@@ -110,7 +110,7 @@ function makeWorld(over = {}) {
     logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
     emit: (name, payload) => emitted.push([name, payload]),
   })
-  return { scheduler, runner, storage, subprocess, emitted, logs }
+  return { scheduler, runner, storage, queue, subprocess, emitted, logs }
 }
 
 beforeEach(() => {
@@ -251,16 +251,116 @@ describe('timer 纪律（契约 02「下次触发计算」：全插件一个 tim
     expect(world.storage.snapshot().runs).toEqual({})
   })
 
-  it('cron kind 编排（存储读侧接受的防御形状）不触发、不崩（实现属票 27）', async () => {
+  it('cron 编排进入 timer：与 every 编排取最早者', async () => {
     const world = makeWorld({ skipSeed: true })
+    // every 100s 后；cron 在 40s 后（14:14:00，T0+40s）
+    world.storage.table('orchestrations').put('every-o', makeOrchestration({ id: 'every-o', nextOccurrence: iso(T0 + 100_000) }))
     world.storage.table('orchestrations').put('cron-o', makeOrchestration({
       id: 'cron-o',
-      trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' },
-      nextOccurrence: iso(T0 + 60_000),
+      trigger: { kind: 'cron', expression: '*/2 * * * *', timeZone: 'UTC' },
+      nextOccurrence: iso(Date.parse('2026-09-21T14:14:00.000Z')),
     }))
+    world.scheduler.start()
+    await vi.advanceTimersByTimeAsync(40_000)
+    await vi.waitFor(() => expect(Object.values(world.storage.snapshot().runs).some((r) => r.orchestrationId === 'cron-o')).toBe(true))
+    expect(Object.values(world.storage.snapshot().runs).some((r) => r.orchestrationId === 'every-o')).toBe(false)
+    world.scheduler.stop()
+  })
+})
+
+describe('cron 到点触发与错过合并（契约 02「cron 子集」「重启与错过的触发」；票 27）', () => {
+  // T0 = 2026-09-21T14:13:20Z；D0 = T0+40s = 14:14:00（UTC 分钟边界，*/2 匹配）
+  const D0 = Date.parse('2026-09-21T14:14:00.000Z')
+
+  function cronWorld({ now = D0, expression = '*/2 * * * *', timeZone = 'UTC', nextOccurrence, over = {} } = {}) {
+    const world = makeWorld({ skipSeed: true, ...over })
+    world.storage.table('orchestrations').put('cron-o', makeOrchestration({
+      id: 'cron-o',
+      trigger: { kind: 'cron', expression, timeZone },
+      nextOccurrence: nextOccurrence ?? iso(D0),
+    }))
+    vi.setSystemTime(now)
+    return world
+  }
+
+  it('到点触发：run.trigger = cron、scheduledAt = 计划时刻、nextOccurrence 推进到下一匹配', async () => {
+    const world = cronWorld({ now: D0 - 60_000, nextOccurrence: iso(D0) })
+    world.scheduler.start()
+    await vi.advanceTimersByTimeAsync(60_000)
+    await vi.waitFor(() => expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1))
+    const [run] = Object.values(world.storage.snapshot().runs)
+    expect(run.trigger).toBe('cron')
+    expect(run.scheduledAt).toBe(iso(D0))
+    expect(world.storage.snapshot().orchestrations['cron-o'].nextOccurrence).toBe(iso(D0 + 120_000)) // 14:16:00
+    world.scheduler.stop()
+  })
+
+  it('重启/停机错过多次合并为一次：scheduledAt = 最近一次错过的匹配时刻，只 1 条 run，推进到未来', async () => {
+    // 保留计划 14:14:00；宿主在 14:22:20（错过 14:14/16/18/20/22 共五次）重启
+    const world = cronWorld({ now: Date.parse('2026-09-21T14:22:20.000Z') })
+    world.scheduler.start()
+    await vi.waitFor(() => expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1))
+    const runs = Object.values(world.storage.snapshot().runs)
+    expect(runs[0].scheduledAt).toBe(iso(Date.parse('2026-09-21T14:22:00.000Z'))) // 最近一次错过的匹配
+    expect(world.storage.snapshot().orchestrations['cron-o'].nextOccurrence).toBe(iso(Date.parse('2026-09-21T14:24:00.000Z')))
+    expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1) // 被合并的中间触发不逐条生成记录
+    world.scheduler.stop()
+  })
+
+  it('运行期迟到同样合并：FIFO 槽被慢任务占用到 14:18:30 才受理，只补最近一次', async () => {
+    const world = cronWorld({ now: D0 - 60_000 }) // now = 14:13:00
+    world.scheduler.start()
+    // 先占 FIFO：14:14:00 到点的 fire 槽排在慢任务之后，14:18:30 才受理（受理时刻 = now 取值点）
+    const slow = world.queue.enqueue(() => new Promise((resolve) => setTimeout(resolve, 330_000)))
+    await vi.advanceTimersByTimeAsync(390_000) // 推到 14:19:30
+    await slow
+    await vi.waitFor(() => expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1))
+    const [run] = Object.values(world.storage.snapshot().runs)
+    expect(run.scheduledAt).toBe(iso(Date.parse('2026-09-21T14:18:00.000Z'))) // ≤14:18:30 的最近匹配
+    expect(world.storage.snapshot().orchestrations['cron-o'].nextOccurrence).toBe(iso(Date.parse('2026-09-21T14:20:00.000Z')))
+    expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1)
+    world.scheduler.stop()
+  })
+
+  it('推进后五年窗口无解 → 编排转 ended（防御性终态），本次 run 照常执行', async () => {
+    // 2/29 规则的最后一次匹配 2096-02-29T03:00Z：其后下一个 2/29 是 2104（超 5 年窗口）
+    const world = cronWorld({
+      now: Date.parse('2096-02-29T03:00:00.000Z'),
+      expression: '0 3 29 2 *',
+      nextOccurrence: iso(Date.parse('2096-02-29T03:00:00.000Z')),
+    })
+    world.scheduler.start()
+    await vi.waitFor(() => expect(Object.keys(world.storage.snapshot().runs)).toHaveLength(1))
+    const [run] = Object.values(world.storage.snapshot().runs)
+    expect(run.scheduledAt).toBe('2096-02-29T03:00:00.000Z')
+    const orch = world.storage.snapshot().orchestrations['cron-o']
+    expect(orch.status).toBe('ended')
+    expect(orch.nextOccurrence).toBeNull()
+    world.scheduler.stop()
+  })
+
+  it('paused 的 cron 编排不进 timer（暂停期间不补跑）', async () => {
+    const world = cronWorld({ now: D0 - 60_000 })
+    world.storage.table('orchestrations').put('cron-o', {
+      ...world.storage.snapshot().orchestrations['cron-o'],
+      status: 'paused',
+      nextOccurrence: null,
+    })
+    world.scheduler.start()
+    await vi.advanceTimersByTimeAsync(600_000)
+    expect(world.storage.snapshot().runs).toEqual({})
+    world.scheduler.stop()
+  })
+
+  it('防御面：存储里形状非法的 cron（绕过创建校验）到点转 ended、不触发、不崩（防 timer 死循环）', async () => {
+    const world = cronWorld({ now: D0 - 60_000, expression: 'not-a-cron' })
     world.scheduler.start()
     await vi.advanceTimersByTimeAsync(120_000)
     expect(world.storage.snapshot().runs).toEqual({})
+    const orch = world.storage.snapshot().orchestrations['cron-o']
+    expect(orch.status).toBe('ended')
+    expect(orch.nextOccurrence).toBeNull()
+    expect(world.logs.some((m) => m.includes('cron-o'))).toBe(true) // 记内部日志可排障
     world.scheduler.stop()
   })
 })

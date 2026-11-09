@@ -58,3 +58,33 @@ export function nextOccurrence(trigger, fromMs) {
   // 未知 kind 在创建校验阶段已被拒绝，此处的 null 只是纯函数的全函数兜底。
   return null
 }
+
+/**
+ * cron 错过合并（契约 02「重启与错过的触发」）：多次错过只取最近一次到期的匹配时刻，
+ * 并给出受理时刻之后的下一计划。纯计算，不判断暂停/编辑/手动 run（调度器职责）。
+ *
+ * 库 Cron.resolve 的语义与契约一致（不重放积压，取最近到期）；nextScheduledAt 再套
+ * 本层 5 年窗口（与 nextOccurrence 同一判定：超窗即视为无解，调度器据此转 ended）。
+ *
+ * @param {object} trigger cron 触发配置（expression/timeZone）
+ * @param {string} plannedIso 保留的计划时刻（ISO，RFC 3339 毫秒）
+ * @param {number} acceptedMs 受理时刻（≥ 计划时刻；FIFO 槽内取值，迟到即真实受理时刻）
+ * @returns {{ occurrenceMs: number, nextMs: number | null } | { defer: true } | null}
+ *   null = 触发配置形状非法（防御面，创建校验已拒；调用方记日志并转 ended 防死循环）；
+ *   { defer } = 暂态不可解（受理时刻早于计划时刻的时钟回拨）：保持计划、重排 timer。
+ */
+export function resolveCronMiss(trigger, plannedIso, acceptedMs) {
+  const rule = parseCron(trigger)
+  if (rule === undefined || !Number.isFinite(acceptedMs)) return null
+  try {
+    const resolved = rule.resolve(plannedIso, acceptedMs)
+    const nextMs =
+      resolved.nextScheduledAt === undefined ? null : Date.parse(resolved.nextScheduledAt)
+    if (nextMs !== null && (Number.isNaN(nextMs) || nextMs > acceptedMs + CRON_WINDOW_MS)) {
+      return { occurrenceMs: Date.parse(resolved.occurrenceAt), nextMs: null }
+    }
+    return { occurrenceMs: Date.parse(resolved.occurrenceAt), nextMs }
+  } catch {
+    return { defer: true }
+  }
+}
