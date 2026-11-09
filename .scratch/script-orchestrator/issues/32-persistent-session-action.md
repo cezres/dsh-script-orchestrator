@@ -4,7 +4,7 @@
 
 **Blocked by:** 30 — 按判定结果发出 event 动作
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] session 动作支持 persistent 默认模式、prompt 模板、banner/plain、缺省标题、cwd/preset/model 校验；session cwd 同受 allowedRoots 限制。
 - [ ] 经 `sessionController.create()` 创建宿主语义 root，每次 run 新建会话，不伪造 child、不复用旧会话、不做独立 Workspace attach。
