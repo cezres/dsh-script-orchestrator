@@ -21,7 +21,8 @@ Web 面板是 renderer 进程的 client 插件，不能直接取得 Host Context
 | `listActions` | `{}` | `Array<{ name, description? }>` | 编辑器的注册动作提示 |
 | `spill` | `{ runId, stream: 'stdout' \| 'stderr' }` | `{ runId, stream, path, content, bytes }` | run 的完整溢写输出（排障读面，v0.1r）；溢写缺失/文件不存在/不可读 → `script_storage_unavailable`（`details.cause` 区分），面板显示「文件已不存在」 |
 
-- 参数与返回**原样复用服务契约形状**（零翻译 DTO，全部无损 JSON）；动作提示按需另调 `listActions`，不混入 `view` 返回。
+- 参数与返回**原样复用服务契约形状**（零翻译 DTO，全部无损 JSON）。
+- 动作提示的读面（v0.1r 更正）：`view` 原样返回服务 `OrchestrationView`，其中 `availableActions` 即注册动作表快照（按 `name` 排序），面板详情直接展示；`listActions` 端点保留供按需刷新/单独取表（例如编辑器只要动作表、不取整条记录）。原「动作提示按需另调 `listActions`，不混入 `view` 返回」的表述与实现不符，以本条为准；两个读面同源（同一注册表快照），不是两套数据面。
 - run 的进度与结果一律经 `view` 回读，`view()` 的 run 记录是最终事实。
 
 ## 创建/编辑的对话路径（胜选 UX，2026-11-08 原型定案）
