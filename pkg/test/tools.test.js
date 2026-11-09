@@ -119,9 +119,11 @@ describe('script_create.execute', () => {
     ['多余顶层字段', { ...baseInput(), extra: 1 }, 'extra', 'unexpected'],
     ['缺 title', (() => { const i = baseInput(); delete i.title; return i })(), 'title', 'missing'],
     ['title 类型错', { ...baseInput(), title: 5 }, 'title', 'format'],
-    ['trigger 多余字段', { ...baseInput(), trigger: { kind: 'every', everySeconds: 300, expression: '0 3 * * *' } }, 'trigger.expression', 'unexpected'],
+    ['trigger 未声明的多余字段', { ...baseInput(), trigger: { kind: 'every', everySeconds: 300, foo: 1 } }, 'trigger.foo', 'unexpected'],
+    ['trigger.kind 非法枚举', { ...baseInput(), trigger: { kind: 'daily' } }, 'trigger.kind', 'format'],
     ['everySeconds 类型错', { ...baseInput(), trigger: { kind: 'every', everySeconds: '300' } }, 'trigger.everySeconds', 'format'],
     ['mode 越枚举', { ...baseInput(), trigger: { kind: 'every', everySeconds: 300, mode: 'bogus' } }, 'trigger.mode', 'format'],
+    ['expression 类型错', { ...baseInput(), trigger: { kind: 'cron', expression: 42, timeZone: 'UTC' } }, 'trigger.expression', 'format'],
     ['args 元素类型错', { ...baseInput(), script: { command: 'pwsh', args: [1] } }, 'script.args[0]', 'format'],
     ['actions 非对象', { ...baseInput(), actions: [] }, 'actions', 'format'],
     ['缺 actions', (() => { const i = baseInput(); delete i.actions; return i })(), 'actions', 'missing'],
@@ -129,6 +131,35 @@ describe('script_create.execute', () => {
     const { byName, service } = makeTools()
     const result = await byName.script_create.execute(args, {})
     expect(result).toMatchObject({ code: 'script_input_invalid', details: { field, reason } })
+    expect(service.calls).toEqual([])
+  })
+
+  it('schema 声明 trigger 字段全集：合法 cron 输入放行（每 kind 判别与语义校验归服务层）', async () => {
+    const { byName, service } = makeTools()
+    const cronArgs = { ...baseInput(), trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' } }
+    const result = await byName.script_create.execute(cronArgs, {})
+    expect(result).toEqual({ ...VIEW })
+    expect(service.calls).toEqual([['create', cronArgs, undefined, undefined]])
+  })
+
+  it('every 混入 cron 字段：schema 放行、服务判别拒绝（trigger.expression unexpected）原样透传', async () => {
+    const { byName, service } = makeTools({
+      create: async () => {
+        throw new OrchestratorError('script_input_invalid', "kind: 'every' 不接受 trigger.expression", {
+          field: 'trigger.expression',
+          reason: 'unexpected',
+        })
+      },
+    })
+    const result = await byName.script_create.execute(
+      { ...baseInput(), trigger: { kind: 'every', everySeconds: 300, expression: '0 3 * * *' } },
+      {},
+    )
+    expect(result).toEqual({
+      code: 'script_input_invalid',
+      message: "kind: 'every' 不接受 trigger.expression",
+      details: { field: 'trigger.expression', reason: 'unexpected' },
+    })
     expect(service.calls).toEqual([])
   })
 

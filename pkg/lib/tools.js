@@ -2,7 +2,7 @@
 // 严格 JSON Schema 校验 + 全部映射 script_input_invalid；语义以服务为准（06），工具不自带业务规则。
 // 原始 ctx.tools.register 注册（不用 defineTool 简写——其参数校验抛宿主 INVALID_ARGS，
 // 破坏单一错误面）；execute 返回 JSON 值，output.render 单块 JSON 文本。
-// 票 25 范围：create(every)/list/view；script_run/script_edit 属票 26/28。
+// create 覆盖 every（票 25）与 cron（票 27）；list/view 属票 25；script_run/script_edit 属票 26/28。
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { OrchestratorError } from './errors.js'
 
@@ -55,14 +55,19 @@ const render = (_args, value) => [{ type: 'text', text: JSON.stringify(value) }]
 
 const stringSchema = { type: 'string' }
 
-const everyTriggerSchema = {
+// trigger 声明 every/cron 两种 kind 的字段全集（additionalProperties:false 拦未声明字段）；
+// 每 kind 的判别（kind=cron 时 everySeconds/mode 多余、反之 expression/timeZone 多余）、
+// 数值范围与 cron 子集语义全部由服务层校验兜底并给出准确 field/reason/part。
+const triggerSchema = {
   type: 'object',
   additionalProperties: false,
   required: ['kind'],
   properties: {
-    kind: { type: 'string', description: "触发类型；当前实现支持 'every'（cron 属后续版本）" },
-    everySeconds: { type: 'integer', description: '间隔秒数，整数且 ≥ 60（下限由服务校验）' },
-    mode: { type: 'string', enum: ['fixed-rate', 'fixed-delay'], description: '省略默认 fixed-rate' },
+    kind: { type: 'string', enum: ['every', 'cron'], description: "触发类型：'every' 间隔或 'cron' 五位表达式" },
+    everySeconds: { type: 'integer', description: 'every 专用：间隔秒数，整数且 ≥ 60（下限由服务校验）' },
+    mode: { type: 'string', enum: ['fixed-rate', 'fixed-delay'], description: 'every 专用：省略默认 fixed-rate' },
+    expression: { type: 'string', description: 'cron 专用：五位表达式 minute hour day-of-month month day-of-week（子集由服务校验）' },
+    timeZone: { type: 'string', description: 'cron 专用：显式 IANA 时区名（如 Asia/Shanghai）' },
   },
 }
 
@@ -111,7 +116,7 @@ const createParameters = {
     title: { type: 'string', description: '1–120 字符（去首尾空白后，长度由服务校验）' },
     enabled: { type: 'boolean', description: '默认 true；false 等同暂停' },
     overlap: { type: 'string', enum: ['skip', 'queue'], description: '默认 skip' },
-    trigger: everyTriggerSchema,
+    trigger: triggerSchema,
     script: scriptSchema,
     judge: judgeSchema,
     actions: { type: 'object', description: '动作键 → 动作定义（event/plugin/session；键与定义由服务校验）' },
@@ -235,7 +240,7 @@ export function createToolDefinitions({ service, logger }) {
     {
       name: 'script_create',
       description:
-        '新建脚本编排：定时运行脚本，按判定规则执行动作（event/plugin/session）。触发当前支持 every（everySeconds ≥ 60，fixed-rate/fixed-delay）。返回完整 OrchestrationView。',
+        '新建脚本编排：定时运行脚本，按判定规则执行动作（event/plugin/session）。触发支持 every（everySeconds ≥ 60，fixed-rate/fixed-delay）或 cron（五位表达式 + 显式 IANA 时区，如 { "kind": "cron", "expression": "0 3 * * *", "timeZone": "Asia/Shanghai" }；每日/每周等预设也生成 cron）。返回完整 OrchestrationView。',
       parameters: createParameters,
       output: { schema: createOutputSchema, render },
       execute: wrapExecute({

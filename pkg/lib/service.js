@@ -81,6 +81,15 @@ export function createManagementService({ storage, queue, config, now, emit, log
 
         const createdAtMs = currentTime()
         const createdAt = new Date(createdAtMs).toISOString()
+        // 契约 02「cron 子集」：创建/更新时从校验参考时刻起 5 年内无任何有效计划时刻 → 拒绝，
+        // 不写入立即 ended 的编排（错误 reason: no-occurrence）；与 enabled 无关（配置永不有效）。
+        if (normalized.trigger.kind === 'cron' && nextOccurrence(normalized.trigger, createdAtMs) === null) {
+          throw inputInvalid(
+            'trigger.expression',
+            'no-occurrence',
+            'cron 表达式在创建时刻起的 5 年内没有任何有效计划时刻',
+          )
+        }
         // 契约 02「创建」：enabled:false → paused、nextOccurrence = null；
         // 两种 every 模式首次计划均为 createdAt + everySeconds，不立即执行。
         const status = normalized.enabled ? 'active' : 'paused'
