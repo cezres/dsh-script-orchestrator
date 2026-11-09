@@ -1018,3 +1018,161 @@ describe('edit · update 调度重锚与编辑代际（契约 02「编辑」表�
     expect(storage.snapshot().orchestrations['log-rotate'].nextOccurrence).toBe(iso(NOW + 100_000 + 900_000))
   })
 })
+
+/** service+runner 共享存储/队列的执行世界（run 服务契约测试用）。
+ * auto=true：脚本自动成功；false：挂起等待 spawns[i].release(...) 手动放行。 */
+async function makeRunnerWorld(over = {}) {
+  let t = over.t0 ?? NOW
+  const storage = makeStorage()
+  const emitted = []
+  const queue = new ServiceQueue()
+  const { createRunner } = await import('../lib/runner.js')
+  const spawns = []
+  const subprocess = {
+    spawn: () => {
+      const entry = { finish: null }
+      entry.release = (result) => entry.finish(result ?? { exitCode: 0, signal: null })
+      entry.handle = {
+        done: new Promise((resolve) => { entry.finish = resolve }),
+        terminate: () => entry.release({ exitCode: 1, signal: null }),
+        waitForExit: () => Promise.resolve(true),
+        collected: {
+          stdout: { readFrom: () => ({ text: 'MANUAL-OK', lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', lossy: false }) },
+        },
+      }
+      if (over.auto !== false) queueMicrotask(() => entry.release())
+      spawns.push(entry)
+      return entry.handle
+    },
+  }
+  const runner = createRunner({
+    storage,
+    queue,
+    subprocess,
+    config: { maxConcurrentRuns: over.maxConcurrentRuns ?? 2, defaultTimeoutSeconds: 300, maxOutputBytes: 262144, maxSpillBytes: 8388608, allowedRoots: [] },
+    emit: (name, payload) => emitted.push([name, payload]),
+    now: () => t,
+    logger: { error: () => {}, warn: () => {} },
+    fs: { stat: async () => ({ isDirectory: () => true }) },
+  })
+  const service = createManagementService({
+    storage,
+    queue,
+    config: { maxRunsPerOrchestration: 100, defaultTimeoutSeconds: 300, maxConcurrentRuns: over.maxConcurrentRuns ?? 2 },
+    now: () => t,
+    emit: (name, payload) => emitted.push([name, payload]),
+    logger: { error: () => {}, warn: () => {} },
+    runner,
+  })
+  return { service, runner, storage, emitted, spawns, setTime: (ms) => { t = ms }, getTime: () => t }
+}
+
+describe('run 服务契约（契约 06/07 script_run：手动执行、尽力等待；票 28）', () => {
+  it('手动 run：受理即触发（trigger=manual），等结算成功；不改下次自动触发时刻', async () => {
+    const world = await makeRunnerWorld()
+    await world.service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' } })
+    const auto = world.storage.snapshot().orchestrations['log-rotate'].nextOccurrence
+    const accepted = await world.service.run('log-rotate')
+    expect(accepted.trigger).toBe('manual')
+    expect(['queued', 'running', 'succeeded']).toContain(accepted.status)
+    const final = await world.service.waitRun(accepted.runId, 'log-rotate')
+    expect(final.status).toBe('succeeded')
+    expect(final.script.exitCode).toBe(0)
+    expect(final.script.stdoutTail).toContain('MANUAL-OK')
+    // 手动 run 不移动自动计划（契约 07）
+    expect(world.storage.snapshot().orchestrations['log-rotate'].nextOccurrence).toBe(auto)
+  })
+
+  it('paused / ended 编排均允许手动执行（拒绝仅 id 不存在）', async () => {
+    const world = await makeRunnerWorld()
+    await world.service.create({ ...baseInput(), enabled: false }) // paused
+    const pausedRun = await world.service.run('log-rotate')
+    expect(['queued', 'running', 'succeeded']).toContain(pausedRun.status)
+    await world.service.waitRun(pausedRun.runId, 'log-rotate')
+    world.storage.table('orchestrations').put('log-rotate', {
+      ...world.storage.snapshot().orchestrations['log-rotate'],
+      status: 'ended',
+    })
+    const endedRun = await world.service.run('log-rotate')
+    expect(['queued', 'running', 'succeeded']).toContain(endedRun.status)
+    await world.service.waitRun(endedRun.runId, 'log-rotate')
+    await expect(world.service.run('nope')).rejects.toMatchObject({ code: 'script_unknown', details: { id: 'nope' } })
+  })
+
+  it('手动 run 不被 overlap:skip 淘汰：自动 run 在跑时显式排队等上次结算', async () => {
+    const world = await makeRunnerWorld({ auto: false })
+    await world.service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 3600 } }) // overlap 默认 skip
+    const auto = await world.runner.requestRun({ orchestrationId: 'log-rotate', trigger: 'every', scheduledAtMs: NOW })
+    expect(auto.status).toBe('running') // 占住单飞
+    const manual = await world.service.run('log-rotate')
+    expect(manual.status).toBe('queued') // 不被 skip（显式意图排队）
+    expect(manual.skipReason).toBeNull()
+    // 自动结算后手动才开始，其脚本也需放行（auto:false），最终成功
+    world.spawns[0].release({ exitCode: 0, signal: null })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    world.spawns[1]?.release({ exitCode: 0, signal: null })
+    const final = await world.service.waitRun(manual.runId, 'log-rotate')
+    expect(final.status).toBe('succeeded')
+  })
+
+  it('全局队列溢出丢最旧不豁免手动：被丢时返回可见 skipped RunView（skipReason: concurrency）', async () => {
+    // maxConcurrentRuns=1 → 全局排队上限 4；先占槽 + 手动最先入队，随后 4 个自动挤满 → 手动被丢
+    const world = await makeRunnerWorld({ maxConcurrentRuns: 1, auto: false })
+    await world.service.create(baseInput())
+    // 编排 A 的自动 run 占住唯一并发槽（挂起）
+    await world.service.create({ ...baseInput(), id: 'blocker', title: 'blocker', trigger: { kind: 'every', everySeconds: 3600 } })
+    await world.runner.requestRun({ orchestrationId: 'blocker', trigger: 'every', scheduledAtMs: NOW })
+    // log-rotate 手动 run 最先排队（最旧）
+    const manual = await world.service.run('log-rotate')
+    expect(manual.status).toBe('queued')
+    // 再塞 4 个不同编排的 run 挤满全局队列（上限 4：blocker 占槽 + pending 4）
+    for (let n = 0; n < 4; n++) {
+      const id = `fill-${n}`
+      await world.service.create({ ...baseInput(), id, title: id, trigger: { kind: 'every', everySeconds: 3600 } })
+      await world.runner.requestRun({ orchestrationId: id, trigger: 'every', scheduledAtMs: NOW })
+    }
+    // 手动（最旧 pending）被丢为 skipped(concurrency)，可见非静默
+    expect(manual.status).toBe('queued') // 受理视图仍是当时快照
+    const dropped = world.storage.snapshot().runs[manual.runId]
+    expect(dropped.status).toBe('skipped')
+    expect(dropped.skipReason).toBe('concurrency')
+    // 放行占槽脚本；fills 依次领槽，逐个放行直至排干
+    world.spawns[0].release({ exitCode: 0, signal: null })
+    for (let round = 0; round < 20 && world.runner.hasInflight(); round += 1) {
+      for (const spawnEntry of world.spawns) spawnEntry.release({ exitCode: 0, signal: null })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    await world.runner.waitIdle()
+  })
+
+  it('waitRun 尽力等待：上限内结算返回终态；超限不报错、返回当前（可能非终态的）视图', async () => {
+    const world = await makeRunnerWorld({ auto: false, maxConcurrentRuns: 1 })
+    await world.service.create({ ...baseInput(), trigger: { kind: 'every', everySeconds: 3600 } })
+    // 占槽挂起脚本 → 手动 run 排队（非终态）
+    await world.service.create({ ...baseInput(), id: 'blocker2', title: 'blocker2', trigger: { kind: 'every', everySeconds: 3600 } })
+    await world.runner.requestRun({ orchestrationId: 'blocker2', trigger: 'every', scheduledAtMs: NOW })
+    const manual = await world.service.run('log-rotate')
+    expect(manual.status).toBe('queued')
+    // 等待上限 50ms（注入）：超限返回非终态视图、不报错（契约 07 wait 语义）
+    const timedOut = await world.service.waitRun(manual.runId, 'log-rotate', { maxWaitMs: 50 })
+    expect(timedOut.status).toBe('queued')
+    // 放行后等待立即拿到终态
+    world.spawns[0].release({ exitCode: 0, signal: null })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    world.spawns[1]?.release({ exitCode: 0, signal: null })
+    const final = await world.service.waitRun(manual.runId, 'log-rotate')
+    expect(final.status).toBe('succeeded')
+  })
+
+  it('waitRun 默认等待上限 = script.timeoutSeconds + 30 秒（公式锚定）', async () => {
+    const world = await makeRunnerWorld()
+    await world.service.create({ ...baseInput(), script: { command: 'pwsh', timeoutSeconds: 90 } })
+    const manual = await world.service.run('log-rotate')
+    // 直接受理并结算（无阻塞），公式只影响上限——此处锚定 service 暴露的公式函数
+    expect(typeof world.service.computeWaitBudgetMs).toBe('function')
+    const budget = world.service.computeWaitBudgetMs('log-rotate')
+    expect(budget).toBe(90_000 + 30_000)
+    await world.service.waitRun(manual.runId, 'log-rotate')
+  })
+})

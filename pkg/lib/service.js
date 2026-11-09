@@ -46,11 +46,12 @@ function slugifyTitle(title) {
  *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction；注册面属票 31）
  */
 export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry }) {
-  void config
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
   const registry = actionRegistry ?? createActionRegistry()
+  const defaultTimeoutSeconds = config?.defaultTimeoutSeconds ?? 300
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
   // 发布端兜底（契约 06：listener 同步抛错只记内部日志，绝不影响主流程）
   function safeEmit(name, payload) {
@@ -253,8 +254,50 @@ export function createManagementService({ storage, queue, config, now, emit, log
         })
       })
     },
+
+    /**
+     * 手动执行一次（契约 06/07 script_run）：trigger='manual'，不改变下次自动触发；
+     * paused/ended 均允许，拒绝仅 id 不存在；共用排队体系但不被 overlap:skip 淘汰
+     *（单飞/并发/溢出判定全在 runner，见 lib/runner.js requestRun）。受理即返回 RunView。
+     * signal 的取消贯穿（abort → 结算 canceled 后工具才静止）属票 29。
+     */
+    async run(id, signal) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw inputInvalid('id', 'format', 'id 必须是非空字符串')
+      }
+      signal?.throwIfAborted()
+      if (storage.table('orchestrations').get(id) === undefined) {
+        throw new OrchestratorError('script_unknown', `编排 '${id}' 不存在`, { id })
+      }
+      const view = await runner.requestRun({ orchestrationId: id, trigger: 'manual', scheduledAtMs: currentTime() })
+      return view ?? null
+    },
+
+    /** 尽力等待的预算（契约 07：最长 script.timeoutSeconds + 30 秒；工具 wait:true 用）。 */
+    computeWaitBudgetMs(id) {
+      const record = storage.table('orchestrations').get(id)
+      const timeoutSeconds = record?.script?.timeoutSeconds ?? defaultTimeoutSeconds
+      return timeoutSeconds * 1000 + 30_000
+    },
+
+    /**
+     * 等待单个 run 结算（工具 script_run 的 wait:true 尽力等待）：
+     * 上限内结算 → 终态 RunView；超限不报错，返回当前（可能非终态的）视图（契约 07）。
+     * maxWaitMs 可注入（测试用）；缺省 = computeWaitBudgetMs(id)。
+     */
+    async waitRun(runId, id, options = {}) {
+      const maxWaitMs = options.maxWaitMs ?? this.computeWaitBudgetMs(id)
+      const outcome = await Promise.race([
+        runner.waitForRun(runId),
+        delay(maxWaitMs).then(() => TIMEOUT_SENTINEL),
+      ])
+      if (outcome !== TIMEOUT_SENTINEL) return outcome
+      return runner.liveView?.(runId) ?? storage.table('runs').get(runId) ?? null
+    },
   }
 }
+
+const TIMEOUT_SENTINEL = Symbol('wait-timeout')
 
 /**
  * update 的合并校验与持久化（契约 02「编辑」+ 07）。非调度编辑不重锚；调度字段变化按

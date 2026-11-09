@@ -118,8 +118,18 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   const pending = []
   const active = new Map() // runId → handle（shutdown 清理进程范围用）
   const activeHandles = new Map()
+  // 单 run 等待者：runId → Set<resolve>（service.waitRun 的尽力等待；结算时唤醒）
+  const runWaiters = new Map()
   let shuttingDown = false
   const idleWaiters = new Set()
+
+  /** run 终态结算后唤醒全部等待者（settle / settleSkip 末尾调用）。 */
+  function notifyRunSettled(runId) {
+    const waiters = runWaiters.get(runId)
+    if (waiters === undefined) return
+    runWaiters.delete(runId)
+    for (const resolve of waiters) resolve()
+  }
 
   function safeEmit(name, payload) {
     try {
@@ -242,6 +252,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     // fixed-delay：自动 run 进入任何终态都推进序列（含 skipped；契约 02「fixed-delay」）
     await advanceFixedDelayIfDue(settled, settledMs)
     wakeIdleWaiters()
+    notifyRunSettled(runId)
     safeEmit('script-orchestrator/run-settled', buildSettledPayload(settled))
     pump()
     return settled
@@ -555,6 +566,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
         })
       }
       await advanceFixedDelayIfDue(run, settledMs)
+      notifyRunSettled(runId)
       safeEmit('script-orchestrator/run-settled', buildSettledPayload(run))
       return run
     })
@@ -615,6 +627,21 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
     requestRun,
     /** 等 active 与 pending 清空（测试/停机用）。 */
     waitIdle: waitForIdle,
+    /**
+     * 等待单个 run 进入终态（service.waitRun 尽力等待的底层原语）：
+     * 已终态立即返回终态视图；未终态挂起直到该 run 结算（settle/settleSkip 唤醒）。
+     * run 不存在返回 null。
+     */
+    waitForRun: (runId) => {
+      const persisted = storage.table('runs').get(runId)
+      if (persisted === undefined) return Promise.resolve(null)
+      if (TERMINAL_STATUSES.has(persisted.status)) return Promise.resolve(currentRun(runId))
+      return new Promise((resolve) => {
+        const set = runWaiters.get(runId) ?? new Set()
+        set.add(() => resolve(currentRun(runId)))
+        runWaiters.set(runId, set)
+      })
+    },
     /**
      * 外部结算入口（取消矩阵的防御面，票 29 的 cancel/delete 接线点）：
      * 与自然结算同一 FIFO 槽位竞争，first-write-wins——已终态的 run 迟到结算为
