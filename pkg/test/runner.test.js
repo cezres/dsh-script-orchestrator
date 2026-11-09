@@ -657,18 +657,20 @@ describe('终态唯一与停机（first-write-wins；进程树生命周期以 ru
     expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').length).toBe(before)
   })
 
-  it('shutdown：停新触发；在途 run 有界等待后 terminate 清进程范围，记录保持非终态', async () => {
+  it('shutdown：停新触发；在途 run 有界等待后取消结算 canceled（卸载=取消来源，票 29 语义）', async () => {
     const ctx = makeRunner({ autoSubprocess: false })
     await requestAuto(ctx.runner)
     const spawn = await waitForSpawn(ctx)
     const shutdownPromise = ctx.runner.shutdown()
-    // shutdown 的 2 秒有界等待内 run 仍未结算 → terminate 清进程范围
+    // shutdown 的 2 秒有界等待内 run 仍未结算 → 取消（terminate）→ 结算 canceled
     await ctx.runner.waitIdle().catch(() => {})
     await shutdownPromise
-    expect(spawn.terminated).toBeGreaterThanOrEqual(0) // 有界清理尽力而为
+    const run = Object.values(ctx.storage.snapshot().runs)[0]
+    expect(run.status).toBe('canceled')
+    expect(spawn.terminated).toBeGreaterThanOrEqual(1)
     // 停机后拒绝新触发
     await expect(ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })).rejects.toThrow(/shutting down/)
-  })
+  }, 15000)
 })
 
 // ---------------- 判定与动作派发（契约 04/05/09；票 30） ----------------
@@ -1027,7 +1029,7 @@ describe('dispatching 取消（契约 03/09：停止派发剩余动作、已执�
     await vi.waitFor(() => {
       if (ctx.runner.liveView(view.runId)?.status !== 'dispatching') throw new Error('not dispatching')
     })
-    expect(ctx.runner.requestCancel(view.runId)).toBe(true)
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
     await ctx.runner.waitIdle()
     const run = ctx.storage.snapshot().runs[view.runId]
     expect(run.status).toBe('canceled') // 终态优先于动作汇总（已有一个成功动作也不改 partial）
@@ -1052,13 +1054,190 @@ describe('dispatching 取消（契约 03/09：停止派发剩余动作、已执�
     expect(ctx.emitted.some(([name]) => name === 'script-orchestrator/never')).toBe(false)
   })
 
-  it('requestCancel 对非派发中的 run 返回 false（queued/running 取消矩阵属票 29）', async () => {
+  it('cancelRun 对终态或未知 run 返回 false（幂等）', async () => {
     const ctx = makeRunner({ autoSubprocess: false })
     const view = await requestAuto(ctx.runner)
     await waitForSpawn(ctx)
-    expect(ctx.runner.requestCancel(view.runId)).toBe(false) // running 阶段
-    expect(ctx.runner.requestCancel('run-00000000')).toBe(false) // 未知 run
     await ctx.subprocess.spawns[0].finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+    expect(ctx.runner.cancelRun(view.runId)).toBe(false) // 自然结算先到（first-write-wins）
+    expect(ctx.runner.cancelRun('run-00000000')).toBe(false) // 未知 run
+  })
+})
+
+// ---------------- 完整取消矩阵与卸载取消（契约 03「取消与等待」；票 29） ----------------
+
+describe('cancelRun · 取消矩阵四阶段（契约 03：queued/running/judging/dispatching）', () => {
+  it('queued（pending 中）：直接结算 canceled 不 spawn，两写完整、run-settled(canceled) 发布', async () => {
+    // maxConcurrentRuns=1 + 一个 running 占槽 → 第二个编排的 run 排队
+    const storage = makeStorage()
+    storage.table('orchestrations').put('nightly', makeOrchestration())
+    storage.table('orchestrations').put('other', makeOrchestration({ id: 'other' }))
+    const ctx = makeRunner({ storage, autoSubprocess: false, config: { ...BASE_CONFIG, maxConcurrentRuns: 1 } })
+    await ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })
+    await waitForSpawn(ctx) // 占住唯一槽
+    const queued = await ctx.runner.requestRun({ orchestrationId: 'other', trigger: 'manual', scheduledAtMs: NOW + 1 })
+    expect(queued.status).toBe('queued')
+
+    expect(ctx.runner.cancelRun(queued.runId)).toBe(true)
+    await vi.waitFor(() => {
+      const run = ctx.storage.snapshot().runs[queued.runId]
+      if (run?.status !== 'canceled') throw new Error('not canceled yet')
+    })
+    const run = ctx.storage.snapshot().runs[queued.runId]
+    expect(run.skipReason).toBeNull()
+    expect(run.startedAt).toBeNull() // 未启动
+    const puts = ctx.storage.puts.filter(([table, key]) => table === 'runs' && key === queued.runId)
+    expect(puts.map((p) => p[2])).toEqual(['queued', 'canceled']) // 两写完整
+    const canceledEvent = ctx.emitted
+      .filter(([n]) => n === 'script-orchestrator/run-settled')
+      .map(([, p]) => p)
+      .find((p) => p.runId === queued.runId)
+    expect(canceledEvent).toMatchObject({ runId: queued.runId, status: 'canceled', startedAt: null })
+    // 清理：结束占槽 run
+    await ctx.subprocess.spawns[0].finish({ exitCode: 0, signal: null })
+    await ctx.runner.waitIdle()
+  })
+
+  it('running：terminate 后 done 以 resolve（Windows Job 语义）结算 canceled，不是 succeeded', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    expect(spawn.terminated).toBe(1) // 终止进程
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('canceled') // terminate 的 {exitCode:1} 不进判定、不结算 succeeded
+    expect(run.script.exitCode).toBeNull()
+    expect(run.matchedRule).toBeNull()
+    expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').map(([, p]) => p)[0]).toMatchObject({
+      runId: view.runId,
+      status: 'canceled',
+    })
+  })
+
+  it('running：terminate 后 done 以 reject 结算同样 canceled（不记 spawn_failed）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    spawn.handle.terminate = () => {
+      spawn.terminated += 1
+      spawn.fail(new Error('terminated by cancel'))
+    }
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('canceled')
+    expect(run.script.warnings).toBeUndefined() // 不是 spawn_failed
+  })
+
+  it('judging：判定照常完成（matchedRule 记录）、进入派发即全 skipped、终态 canceled', async () => {
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      orchestrationOver: judgeWithActions(
+        { rules: [{ when: { exitCode: 0 }, actions: ['emit-ok', 'emit-two'] }], fallback: [] },
+        { 'emit-ok': { kind: 'event', name: 'one' }, 'emit-two': { kind: 'event', name: 'two' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    // 脚本已退出、判定前抢先取消（judging 不响应取消：求值照常，派发面停止）
+    await vi.waitFor(() => {
+      const status = ctx.runner.liveView(view.runId)?.status
+      if (status !== 'judging' && status !== 'running') throw new Error('pre-judging')
+    })
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('canceled')
+    expect(run.matchedRule).toBe(0) // 判定照常
+    expect(run.actions.map((a) => a.status)).toEqual(['skipped', 'skipped'])
+    expect(ctx.emitted.some(([n]) => n === 'script-orchestrator/one')).toBe(false) // 未派发
+  })
+
+  it('dispatching：在途动作经 signal 中止、剩余 skipped、已执行保留（与 requestCancel 同路径）', async () => {
+    const registry = {
+      resolve: (name) =>
+        name === 'hang.act'
+          ? { name, run: (context) => new Promise((resolve, reject) => context.signal.addEventListener('abort', () => reject(new Error('aborted')))) }
+          : undefined,
+    }
+    const ctx = makeRunner({
+      autoSubprocess: false,
+      registry,
+      orchestrationOver: judgeWithActions(
+        { rules: [], fallback: ['emit-ok', 'hang', 'emit-late'] },
+        { 'emit-ok': { kind: 'event', name: 'first' }, hang: { kind: 'plugin', action: 'hang.act' }, 'emit-late': { kind: 'event', name: 'never' } },
+      ),
+    })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    await vi.waitFor(() => {
+      if (ctx.runner.liveView(view.runId)?.status !== 'dispatching') throw new Error('not dispatching')
+    })
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run.status).toBe('canceled')
+    expect(run.actions.map((a) => [a.name, a.status])).toEqual([
+      ['emit-ok', 'succeeded'],
+      ['hang', 'failed'],
+      ['emit-late', 'skipped'],
+    ])
+  })
+
+  it('终态或未知 run → false；已 canceled 后迟到自然结算 no-op（first-write-wins 不重发事件）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    await ctx.runner.waitIdle()
+    expect(ctx.storage.snapshot().runs[view.runId].status).toBe('canceled')
+    // 取消已生效：再次取消 false；终态后 false
+    expect(ctx.runner.cancelRun(view.runId)).toBe(false)
+    expect(ctx.runner.cancelRun('run-00000000')).toBe(false)
+    const before = ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').length
+    // 迟到的自然结算（模拟取消与自然结算的竞争路径）：first-write-wins no-op
+    const late = await ctx.runner.settleExternal(view.runId, {
+      kind: 'script',
+      script: ctx.storage.snapshot().runs[view.runId].script,
+      verdict: { matchedRule: null, usedFallback: false, actionKeys: [] },
+      actionResults: [],
+      dispatchCanceled: false,
+    })
+    expect(late).toBeNull()
+    expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/run-settled').length).toBe(before)
+    expect(ctx.storage.snapshot().runs[view.runId].status).toBe('canceled')
+  })
+})
+
+describe('卸载取消与删除中标记（契约 03 取消矩阵来源含插件卸载；票 29）', () => {
+  it('shutdown：在途 run 有界等待后取消并结算 canceled（不留继续派发动作的孤儿执行）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    await waitForSpawn(ctx)
+    await ctx.runner.shutdown()
+    await vi.waitFor(() => {
+      const run = ctx.storage.snapshot().runs[view.runId]
+      if (run?.status !== 'canceled') throw new Error('not canceled by shutdown')
+    })
+    expect(ctx.subprocess.spawns[0].terminated).toBeGreaterThanOrEqual(1)
+  })
+
+  it('markDeleting：删除中编排的 requestRun 一律不受理（无 run 记录，自动/手动同拒）', async () => {
+    const ctx = makeRunner()
+    ctx.runner.markDeleting?.('nightly', true)
+    const auto = await requestAuto(ctx.runner)
+    const manual = await ctx.runner.requestRun({ orchestrationId: 'nightly', trigger: 'manual', scheduledAtMs: NOW })
+    expect(auto).toBeNull()
+    expect(manual).toBeNull()
+    expect(ctx.storage.snapshot().runs).toEqual({}) // 不产生任何 run 记录（含 skip）
+    expect(ctx.subprocess.spawns).toHaveLength(0)
+    ctx.runner.markDeleting?.('nightly', false)
+    const again = await requestAuto(ctx.runner)
+    expect(again?.status).toMatch(/queued|running/)
     await ctx.runner.waitIdle()
   })
 })
