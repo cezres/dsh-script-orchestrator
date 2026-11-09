@@ -123,6 +123,7 @@ window.__ModuleLoader__.load({
 			const [state, setState] = useState({ phase: "loading" });
 			const [detailId, setDetailId] = useState(null);
 			const [reloadKey, setReloadKey] = useState(0);
+			const [actionError, setActionError] = useState(null);
 
 			async function refresh() {
 				setState({ phase: "loading" });
@@ -137,6 +138,25 @@ window.__ModuleLoader__.load({
 				} catch (e) {
 					// 传输层失败（HTTP 非 2xx / 网络断开）：以错误态呈现，可重试
 					setState({ phase: "error", code: "transport", message: String((e && e.message) || e) });
+				}
+			}
+
+			// 行内管理操作（契约 11：暂停/恢复/执行经 Connection 调用并立即回读；
+			// UI abort 只终止等待——run 端点受理即返回，不取消已受理操作）
+			async function runAction(id, action) {
+				setActionError(null);
+				let res;
+				try {
+					res = action === "run" ? await call("run", { id }) : await call("edit", { id, action });
+				} catch (e) {
+					setActionError({ code: "transport", message: String((e && e.message) || e) });
+					return;
+				}
+				if (res && res.ok) {
+					void refresh(); // 写后权威回读
+				} else {
+					const error = (res && res.error) || {};
+					setActionError({ code: error.code || "internal_error", message: error.message || "未知错误" });
 				}
 			}
 
@@ -170,7 +190,14 @@ window.__ModuleLoader__.load({
 				state.phase === "loading" ? h(LoadingView)
 				: state.phase === "error" ? h(ErrorView, { state, onRetry: () => void refresh() })
 				: state.data.items.length === 0 ? h(EmptyView, { startCreateSession })
-				: h(TableView, { items: state.data.items, onOpen: (id) => setDetailId(id) }),
+				: h("div", null,
+					actionError ? h("div", {
+						style: { ...C.row, ...C.card, borderColor: "#dc2626", color: "#dc2626", padding: "8px 12px", marginBottom: 8, fontSize: 12 },
+					},
+						h("b", null, "操作失败（", actionError.code, "）"),
+						h("span", { style: { marginLeft: 6 } }, actionError.message),
+						h("button", { style: { ...C.btn, marginLeft: "auto", padding: "2px 8px" }, onClick: () => setActionError(null) }, "关闭")) : null,
+					h(TableView, { items: state.data.items, onOpen: (id) => setDetailId(id), onAction: (id, action) => void runAction(id, action) })),
 				detailId ? h(DetailModal, { key: detailId + ":" + reloadKey, call, id: detailId, onClose: () => setDetailId(null) }) : null);
 		}
 
@@ -192,16 +219,25 @@ window.__ModuleLoader__.load({
 				h("button", { style: C.btn, onClick: onRetry }, "重试"));
 		}
 
-		function TableView({ items, onOpen }) {
+		function TableView({ items, onOpen, onAction }) {
 			const th = { textAlign: "left", ...C.muted, fontSize: 11, padding: "6px 8px", borderBottom: "1px solid #e4e4e7" };
 			const td = { padding: "6px 8px", borderBottom: "1px solid #f0f0f2", fontSize: 12 };
+			// 行内操作（契约 11）：active → 暂停+执行；paused → 恢复+执行；ended → 执行（删除属票 29）
+			const actionButton = (o, action, label, primary) => h("button", {
+				style: primary ? { ...C.btnPri, padding: "3px 8px", fontSize: 11 } : { ...C.btn, padding: "3px 8px", fontSize: 11 },
+				onClick: (e) => { e.stopPropagation(); onAction && onAction(o.id, action); },
+			}, label);
 			return h("table", { style: { width: "100%", borderCollapse: "collapse", background: "#fff", border: "1px solid #e4e4e7" } },
-				h("thead", null, h("tr", null, ["状态", "标题", "触发", "下次"].map((x) => h("th", { key: x, style: th }, x)))),
+				h("thead", null, h("tr", null, ["状态", "标题", "触发", "下次", "操作"].map((x) => h("th", { key: x, style: th }, x)))),
 				h("tbody", null, items.map((o) => h("tr", { key: o.id, style: { cursor: "pointer" }, onClick: () => onOpen(o.id) },
 					h("td", { style: td }, h(Chip, { s: o.status })),
 					h("td", { style: td }, h("b", null, o.title || o.id), h("div", { style: { ...C.muted, ...C.mono, fontSize: 10 } }, o.id)),
 					h("td", { style: td }, h(TriggerSummary, { t: o.trigger })),
-					h("td", { style: td }, fmtTime(o.nextOccurrence))))));
+					h("td", { style: td }, fmtTime(o.nextOccurrence)),
+					h("td", { style: { ...td, whiteSpace: "nowrap" }, onClick: (e) => e.stopPropagation() },
+						o.status === "active" ? actionButton(o, "pause", "暂停") : null,
+						o.status === "paused" ? actionButton(o, "resume", "恢复") : null,
+						actionButton(o, "run", "执行", true))))));
 		}
 
 		// ---------------- 居中模态：详情（view 回读） ----------------
