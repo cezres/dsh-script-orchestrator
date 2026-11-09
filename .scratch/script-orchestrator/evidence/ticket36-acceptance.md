@@ -52,7 +52,7 @@ pwsh -NoProfile -File scripts/verify-ticket24.ps1   # … 依次 24–36
 | 35 | verify-ticket35.ps1 | **PASS** | 11s | 两次冷启动：崩溃 run→interrupted、启动保留对账补裁、列表权威回读、执行引擎重建 |
 | 36 | verify-ticket36.ps1 | **PASS** | 49s | 交付面（engines/exports/deps/`--dump-config`/`__DSH_BOOT__`）、五工具 smoke（服务路径）、every 判定+三动作+四类事件+自定义事件、cron 自动触发、权威回读、delete 级联不发 changed |
 
-原始日志：`evidence/ticket36-verify-NN.log`（每脚本全量输出）、`evidence/ticket36-matrix.log`（汇总）。
+原始日志为本地运行产物（`evidence/ticket36-verify-NN.log` 每脚本全量输出、`evidence/ticket36-matrix.log` 汇总；`*.log` 被 `.gitignore` 排除、不入库，如需复核请按 §5 命令重跑）。
 
 ### 2.3 Windows W1/W2 复测
 
