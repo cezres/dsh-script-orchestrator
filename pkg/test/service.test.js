@@ -526,4 +526,55 @@ describe('create cron 校验（契约 02「cron 子集」「时区与夏令时�
     const listed = await service.create(cronInput({ id: 'listed', title: 'listed', trigger: { kind: 'cron', expression: '0,30 3 1-7/2 * *', timeZone: 'UTC' } }))
     expect(listed.trigger.expression).toBe('0,30 3 1-7/2 * *')
   })
+
+  it('创建 active cron：nextOccurrence = 严格晚于 createdAt 的下一匹配（独立手算）', async () => {
+    const { service } = makeService()
+    // NOW = 2026-09-21T14:13:20Z = 上海本地 22:13 → 下一个本地 03:00 是 09-22 03:00 = 09-21T19:00Z
+    const view = await service.create(cronInput())
+    expect(view.status).toBe('active')
+    expect(view.nextOccurrence).toBe('2026-09-21T19:00:00.000Z')
+  })
+
+  it('createdAt 恰为匹配时刻：nextOccurrence 严格大于（取次日同时刻）', async () => {
+    const { service } = makeService({ now: () => Date.parse('2026-09-21T19:00:00.000Z') }) // 上海本地 09-22 03:00
+    const view = await service.create(cronInput())
+    expect(view.nextOccurrence).toBe('2026-09-22T19:00:00.000Z') // 次日本地 03:00
+  })
+
+  it('enabled:false 的 cron 创建为 paused、nextOccurrence = null（仍持久化并发布 changed）', async () => {
+    const { service, emitted } = makeService()
+    const view = await service.create(cronInput({ enabled: false }))
+    expect(view.status).toBe('paused')
+    expect(view.nextOccurrence).toBeNull()
+    expect(emitted).toEqual([['script-orchestrator/changed', undefined]])
+  })
+
+  it('五年窗口内无解 → script_input_invalid（reason: no-occurrence）且失败不产生任何记录', async () => {
+    const { service, storage, emitted } = makeService()
+    // 2 月 30 日：库 400 年地平线内永无解
+    await expect(
+      service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 30 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'trigger.expression', reason: 'no-occurrence' },
+    })
+    // 2 月 29 日在 2097 年视角：下一个 2/29 是 2104（其间 2100 非闰年），距参考时刻超 5 年窗口
+    const future = makeService({ now: () => Date.parse('2097-03-01T00:00:00.000Z') })
+    await expect(
+      future.service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 29 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({ details: { field: 'trigger.expression', reason: 'no-occurrence' } })
+    // 同一 2/29 表达式在 2026 年视角有解（2028-02-29 在窗口内）：正常创建
+    const ok = await service.create(cronInput({ trigger: { kind: 'cron', expression: '0 3 29 2 *', timeZone: 'UTC' } }))
+    expect(ok.nextOccurrence).toBe('2028-02-29T03:00:00.000Z')
+    expect(storage.snapshot().orchestrations).toHaveProperty('log-rotate')
+    expect(emitted).toEqual([['script-orchestrator/changed', undefined]])
+  })
+
+  it('无解拒绝与 enabled 无关：paused 创建同样拒绝（配置永不有效，契约 02「不写入立即 ended 的编排」）', async () => {
+    const { service, storage } = makeService()
+    await expect(
+      service.create(cronInput({ enabled: false, trigger: { kind: 'cron', expression: '0 3 30 2 *', timeZone: 'UTC' } })),
+    ).rejects.toMatchObject({ details: { field: 'trigger.expression', reason: 'no-occurrence' } })
+    expect(storage.snapshot().orchestrations).toEqual({})
+  })
 })
