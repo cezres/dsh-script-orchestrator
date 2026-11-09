@@ -7,7 +7,7 @@
 import z from '@deepseek-ai/schemastery'
 
 export const Config = z.object({
-  // 每条编排保留最近 run 数（保留裁剪规则之一；全库 1000 上限为固定常量，见 lib/storage.js）
+  // 每条编排保留最近 run 数（保留裁剪规则之一；全库 1000 上限为固定常量，见 lib/retention.js）
   maxRunsPerOrchestration: z.number().step(1).min(1).max(10000).default(100),
   // 同时运行的 run 上限（契约 03「并发与单飞」：默认 2，超出排队）
   maxConcurrentRuns: z.number().step(1).min(1).max(64).default(2),
@@ -17,7 +17,7 @@ export const Config = z.object({
   maxOutputBytes: z.number().step(1).min(1).max(67108864).default(262144),
   // 每条输出流的溢写文件上限（字节；0 禁用溢写，仅内存尾部）
   maxSpillBytes: z.number().step(1).min(0).max(1073741824).default(8388608),
-  // cwd 允许根（空数组 = 不限制，插件首次激活记警告——警告属票 24 骨架遗留，当前仅文档声明）
+  // cwd 允许根（空数组 = 不限制；插件首次激活时记一条警告，见 lib/index.js 与契约 03）
   allowedRoots: z.array(z.string()).default([]),
   // cwd 解析的第二优先级（script.cwd → defaultCwd → Host 工作目录）；
   // default(undefined) = 可选键：未提供时从结果中省略（类型错仍拒绝）

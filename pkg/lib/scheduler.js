@@ -141,7 +141,7 @@ export function createScheduler({ storage, queue, runner, now, logger, emit, tim
   async function fireCron(record) {
     const orchestrationId = record.id
     const table = storage.table('orchestrations')
-    let outcome = null // { trigger: 'cron', scheduledAtMs } | null（no-op 不触发）
+    let outcome = null // { scheduledAtMs } | null（no-op / defer / ended 不触发）
     await queue.enqueue(async () => {
       const current = table.get(orchestrationId)
       if (
