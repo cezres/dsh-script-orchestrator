@@ -214,6 +214,22 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
+  it('allowedRoots 为空 → 首次激活记一条警告；非空不告警（契约 03「安全边界」）', async () => {
+    const empty = makeCtx()
+    const emptyIt = plugin(empty.ctx, { allowedRoots: [] })
+    const emptyStep = await emptyIt.next()
+    expect(emptyStep.done).toBe(false)
+    expect(empty.calls.logs.filter((m) => m.includes('allowedRoots 未配置'))).toHaveLength(1)
+    await emptyStep.value()
+
+    const configured = makeCtx()
+    const configuredIt = plugin(configured.ctx, { allowedRoots: ['D:\\work'] })
+    const configuredStep = await configuredIt.next()
+    expect(configuredStep.done).toBe(false)
+    expect(configured.calls.logs.filter((m) => m.includes('allowedRoots 未配置'))).toHaveLength(0)
+    await configuredStep.value()
+  })
+
   it('注册的工具 execute 连通真服务：script_create 经校验创建并持久化', async () => {
     const { ctx, calls } = makeCtx()
     const table = new Map()
@@ -562,7 +578,7 @@ describe('插件入口（lib/index.js）', () => {
       enabled: true,
       overlap: 'skip',
       trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
-      script: { command: 'node', args: ['-e', 'ok'], env: [], cwd: process.cwd() },
+      script: { command: 'node', args: ['-e', 'ok'], env: {}, cwd: process.cwd() },
       judge: { rules: [{ when: { exitCode: 0 }, actions: ['open-triage'] }], fallback: [] },
       actions: { 'open-triage': { kind: 'session', prompt: '退出码 {{exitCode}}，请排查。', preset: 'standard', model: { provider: 'p', model: 'm' } } },
       createdAt: dueIso,
@@ -623,7 +639,7 @@ describe('插件入口（lib/index.js）', () => {
       enabled: true,
       overlap: 'skip',
       trigger: { kind: 'every', everySeconds: 3600, mode: 'fixed-rate' },
-      script: { command: 'node', args: ['-e', 'ok'], env: [], cwd: process.cwd() },
+      script: { command: 'node', args: ['-e', 'ok'], env: {}, cwd: process.cwd() },
       judge: { rules: [{ when: { exitCode: 0 }, actions: ['summarize'] }], fallback: [] },
       actions: { summarize: { kind: 'session', mode: 'ephemeral', prompt: '整理退出码 {{exitCode}}。', idleDisposeSeconds: 0 } },
       createdAt: dueIso,

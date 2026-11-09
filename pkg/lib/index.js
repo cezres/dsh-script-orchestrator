@@ -33,6 +33,10 @@ export const inject = [
 
 export async function* apply(ctx, config) {
   const logger = ctx.logger('script-orchestrator')
+  // 契约 03「安全边界」：allowedRoots 为空 = 不限制，首次激活记一条警告（每次应用仅一条）
+  if ((config.allowedRoots ?? []).length === 0) {
+    logger.warn('script-orchestrator: allowedRoots 未配置，脚本与会话 cwd 不受路径根限制（契约 03）')
+  }
   const queue = new ServiceQueue()
   const emit = (name, payload) => ctx.emit(name, payload)
   // 动作注册表：service.listActions 快照与 runner 执行期逐动作实时查表同源

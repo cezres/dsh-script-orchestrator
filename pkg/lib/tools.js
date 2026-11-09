@@ -3,7 +3,7 @@
 // 语义以服务为准（06），工具不自带业务规则。原始 ctx.tools.register 注册（不用
 // defineTool 简写——其参数校验抛宿主 INVALID_ARGS，破坏单一错误面）；execute 返回
 // JSON 值，output.render 单块 JSON 文本。create 覆盖 every/cron（票 25/27）；
-// edit 的 update/pause/resume 与 run 的 wait 语义属票 28（delete 属票 29）。
+// edit 的 update/pause/resume/delete 与 run 的 wait 语义属票 28/29。
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { OrchestratorError } from './errors.js'
 
@@ -62,7 +62,8 @@ const abortError = () => {
 /**
  * abort 观察器（wait:false 返回后仍保持）：abort → service.cancelRun（按取消矩阵执行；
  * 取消不依赖等待者存在）→ service.waitForRun 等结算持久化（fire-and-forget，仅保证时序正确）。
- * 返回摘除函数。
+ * 受理与挂观察器之间存在窗口：若 signal 已中止（abort 事件早已派发，后注册的 listener
+ * 收不到），必须立即补一次取消而不是静默跳过。返回摘除函数。
  */
 function armRunAbortWatch(service, runId, signal) {
   if (!signal || typeof service?.cancelRun !== 'function') return () => {}
@@ -73,6 +74,10 @@ function armRunAbortWatch(service, runId, signal) {
       /* 取消尽力而为；run 可能已终态 */
     }
     Promise.resolve(service.waitForRun?.(runId)).catch(() => {})
+  }
+  if (signal.aborted) {
+    onAbort()
+    return () => {}
   }
   signal.addEventListener('abort', onAbort, { once: true })
   return () => signal.removeEventListener('abort', onAbort)
@@ -232,7 +237,7 @@ const editParameters = {
   required: ['id', 'action'],
   properties: {
     id: { type: 'string', description: '编排 id' },
-    action: { type: 'string', enum: ['update', 'pause', 'resume', 'delete'], description: 'update 需 patch；delete 属后续版本' },
+    action: { type: 'string', enum: ['update', 'pause', 'resume', 'delete'], description: "update 需 patch；delete 删除编排并级联删除其全部执行记录" },
     patch: { ...patchParameters, description: "仅 action:'update'：至少一个字段的局部更新" },
     expectedUpdatedAt: { oneOf: [stringSchema, { type: 'null' }], description: 'ISO 时间字符串或 null（乐观并发；null = 此前没有更新时间）' },
   },
@@ -344,7 +349,7 @@ const editOutputSchema = {
       properties: orchestrationViewProperties,
     },
     {
-      // delete → DeleteResult（票 29 交付；schema 面先行占位保持契约形状）
+      // delete → DeleteResult（票 29 交付；与服务契约同形）
       type: 'object',
       additionalProperties: false,
       required: ['id', 'removedRuns'],

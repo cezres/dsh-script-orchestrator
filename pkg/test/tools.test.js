@@ -460,4 +460,39 @@ describe('script_run · exec.signal 贯穿（契约 03「exec.signal 贯穿与�
     await new Promise((resolve) => setTimeout(resolve, 10))
     expect(service.calls.some(([op]) => op === 'cancelRun')).toBe(true) // 返回后取消照常发生
   })
+
+  it('wait:false + 受理期间信号已中止（竞态窗口）：观察器注册即补一次取消，不静默跳过', async () => {
+    const controller = new AbortController()
+    const { byName, service } = makeTools({
+      run: async () => {
+        // 受理返回前信号中止：abort 事件已派发，之后再注册的 listener 收不到
+        controller.abort()
+        return { ...RUN_VIEW, status: 'running', settledAt: null }
+      },
+    })
+    const result = await byName.script_run.execute({ id: 'log-rotate', wait: false }, { signal: controller.signal })
+    expect(result).toEqual({ runId: 'run-7f3c1a9e', status: 'running' })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(service.calls.filter(([op]) => op === 'cancelRun')).toEqual([['cancelRun', 'run-7f3c1a9e']])
+    expect(service.calls.some(([op]) => op === 'waitForRun')).toBe(true) // 仍等结算持久化（fire-and-forget）
+  })
+
+  it('wait:true + 受理期间信号已中止：取消并等结算后以 AbortError 静止（不返回 RunView）', async () => {
+    const controller = new AbortController()
+    const { byName, service } = makeTools({
+      run: async () => {
+        controller.abort()
+        return { ...RUN_VIEW, status: 'running', settledAt: null }
+      },
+      waitRun: async () => {
+        throw new Error('已中止的调用不应再进入 waitRun')
+      },
+    })
+    await expect(byName.script_run.execute({ id: 'log-rotate' }, { signal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(service.calls.some(([op]) => op === 'cancelRun')).toBe(true)
+    expect(service.calls.some(([op]) => op === 'waitForRun')).toBe(true)
+    expect(service.calls.some(([op]) => op === 'waitRun')).toBe(false)
+  })
 })
