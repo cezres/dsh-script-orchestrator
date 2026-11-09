@@ -430,6 +430,64 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     view.unmount()
   })
 
+  it('票 30 三段结果：判定段（命中规则/fallback/未命中）与动作段（名/类型/状态/error/warnings）', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView({
+              status: 'partial',
+              matchedRule: 0,
+              usedFallback: false,
+              actions: [
+                { name: 'emit-ok', kind: 'event', status: 'succeeded', warnings: ['unknown variable: {{nope}}'] },
+                { name: 'page', kind: 'plugin', status: 'failed', error: { code: 'unknown_action', message: '注册动作 ops.oncall 未注册' } },
+                { name: 'open-triage', kind: 'session', status: 'skipped' },
+              ],
+            }),
+            runView({
+              runId: 'run-00000009',
+              status: 'succeeded',
+              matchedRule: null,
+              usedFallback: true,
+              actions: [{ name: 'emit-bad', kind: 'event', status: 'succeeded' }],
+            }),
+            runView({
+              runId: 'run-0000000a',
+              status: 'succeeded',
+              matchedRule: null,
+              usedFallback: false,
+              actions: [],
+            }),
+          ],
+          availableActions: [],
+        },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    // 判定段
+    expect(modalText).toContain('判定')
+    expect(modalText).toContain('命中规则 0')
+    expect(modalText).toContain('fallback')
+    expect(modalText).toContain('未命中（零动作）')
+    // 动作段：名称、类型、状态、错误码、warnings
+    expect(modalText).toContain('emit-ok')
+    expect(modalText).toContain('page')
+    expect(modalText).toContain('open-triage')
+    expect(modalText).toContain('事件')
+    expect(modalText).toContain('注册动作')
+    expect(modalText).toContain('会话')
+    expect(modalText).toContain('unknown variable: {{nope}}')
+    expect(modalText).toContain('unknown_action')
+    expect(modalText).toContain('已跳过')
+    view.unmount()
+  })
+
   it('活动 run 轮询：模态打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
     vi.useFakeTimers()
     try {
