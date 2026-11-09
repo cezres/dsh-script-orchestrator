@@ -21,6 +21,7 @@ function stableStringify(value) {
 }
 
 const iso = (ms) => new Date(ms).toISOString()
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** 由标题生成 id 基名（01：创建时可省略 id，由标题生成并保证唯一）。 */
 function slugifyTitle(title) {
@@ -45,14 +46,15 @@ function slugifyTitle(title) {
  * @param {() => void} [deps.onMutation] 编排集合持久变更后的回调（调度器重算 timer）
  * @param {object} [deps.actionRegistry] 动作注册表（缺省自建；与 runner 共享同一实例时
  *   listActions 快照与执行期查表同源，契约 06 listActions/registerAction）
+ * @param {object} [deps.fs] { unlink }（delete 级联时对被删 run 的溢写文件 best-effort
+ *   清理；契约 03「输出收集」spill 注记。缺省不清理——票 34 深验收接管）
  */
-export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry }) {
+export function createManagementService({ storage, queue, config, now, emit, logger, runner, onMutation, actionRegistry, fs }) {
   const currentTime = now ?? (() => Date.now())
   const publish = emit ?? (() => {})
   const log = logger ?? console
   const registry = actionRegistry ?? createActionRegistry()
   const defaultTimeoutSeconds = config?.defaultTimeoutSeconds ?? 300
-  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
   // 发布端兜底（契约 06：listener 同步抛错只记内部日志，绝不影响主流程）
   function safeEmit(name, payload) {
@@ -181,11 +183,18 @@ export function createManagementService({ storage, queue, config, now, emit, log
     },
 
     /**
-     * 管理动作（契约 06/07 EditInput）：update / pause / resume（delete 属票 29）。
+     * 管理动作（契约 06/07 EditInput）：update / pause / resume / delete。
      * 一切在 FIFO 单槽内：CAS → 动作分派 → 持久写入 → changed（持久写入完成后）。
+     * delete（票 29）为两阶段：槽 1（CAS + 标记删除中 + 收集在途 run）→ 槽外按取消矩阵
+     * 取消并等各 run 结算 canceled（run-settled 照发、有界等待）→ 槽 2 先删编排后删全部
+     * runs（同批），返回 { id, removedRuns }，不为删除发 changed。
+     * signal 的 throwIfAborted 是 delete 的受理边界：受理后照常完成（契约 11 abort 只
+     * 终止等待不取消已受理操作）。
+     * @param {object} [options.deleteWaitMs] 取消等待上限注入（测试用；缺省按契约
+     *   「脚本 terminate 5s grace + 各动作自身 timeoutSeconds」推得）
      */
-    async edit(input, _actorSessionId, signal) {
-      return queue.enqueue(async () => {
+    async edit(input, _actorSessionId, signal, options = {}) {
+      const phase1 = await queue.enqueue(async () => {
         signal?.throwIfAborted()
         const { id, action, patch } = validateEditInput(input)
         const orchestrations = storage.table('orchestrations')
@@ -205,8 +214,13 @@ export function createManagementService({ storage, queue, config, now, emit, log
           }
         }
         if (action === 'delete') {
-          // 契约定义了 delete（取消级联删除），实现按票序属票 29：给出准确的暂不支持错误
-          throw inputInvalid('action', 'unsupported-part', 'delete 动作尚未实现（票 29 交付）')
+          // 阶段 1：标记删除中（阻断新 run 受理）+ 收集在途 run（槽外取消等待）
+          runner?.markDeleting?.(id, true)
+          const inflight = []
+          for (const [runId, run] of storage.table('runs').entries()) {
+            if (run?.orchestrationId === id && !TERMINAL_RUN_STATUSES.has(run.status)) inflight.push(runId)
+          }
+          return { __delete__: { id, inflight, waitBudgetMs: deleteWaitBudgetMs(current, options) } }
         }
         if (action === 'pause') {
           // 状态设置语义（契约 09）：仅从 active 生效；其余状态幂等 no-op（不改任何计时、不写库）
@@ -254,6 +268,50 @@ export function createManagementService({ storage, queue, config, now, emit, log
           notifyMutation,
         })
       })
+
+      if (phase1?.__delete__) {
+        const { id, inflight, waitBudgetMs } = phase1.__delete__
+        try {
+          // 阶段 1.5（槽外）：按取消矩阵取消在途 run（各自结算 canceled、run-settled 照发，
+          // 契约 06「删除的编排」），有界等待全部终态
+          for (const runId of inflight) {
+            try {
+              runner?.cancelRun?.(runId)
+            } catch (error) {
+              log.error?.(`script-orchestrator: 删除 ${id} 取消 run ${runId} 异常: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+          await waitForRunsSettled({ runner, inflight, waitBudgetMs, storage, log })
+          // 阶段 2（同槽）：先删编排后删全部 runs；不为删除发 changed（契约 06）
+          return await queue.enqueue(async () => {
+            const orchestration = storage.table('orchestrations').get(id)
+            if (orchestration === undefined) {
+              // 等待窗口内被并发删除：以 script_unknown 收口（幂等性未定义，按 id 不存在口径）
+              throw new OrchestratorError('script_unknown', `编排 '${id}' 不存在（可能已被并发删除）`, { id })
+            }
+            const runsTable = storage.table('runs')
+            const runIds = []
+            const spillPaths = []
+            for (const [runId, run] of runsTable.entries()) {
+              if (run?.orchestrationId === id) {
+                runIds.push(runId)
+                if (run.script?.stdoutSpillPath !== undefined) spillPaths.push(run.script.stdoutSpillPath)
+                if (run.script?.stderrSpillPath !== undefined) spillPaths.push(run.script.stderrSpillPath)
+              }
+            }
+            await storage.table('orchestrations').delete(id)
+            await deleteRunRecords(runsTable, runIds)
+            // 溢写文件 best-effort 清理（契约 03：裁剪/级联删除时；失败不影响删除）
+            await unlinkSpillsBestEffort(fs, spillPaths, log)
+            // 调度器重算（编排已消失；changed 不发——契约 06「不为删除另发事件」）
+            notifyMutation()
+            return { id, removedRuns: runIds.length }
+          })
+        } finally {
+          runner?.markDeleting?.(id, false)
+        }
+      }
+      return phase1
     },
 
     /**
@@ -304,6 +362,19 @@ export function createManagementService({ storage, queue, config, now, emit, log
      */
     registerAction(definition) {
       return registry.register(definition)
+    },
+
+    /**
+     * run 取消透传（票 29 工具 exec.signal 贯穿用）：按契约 03 取消矩阵执行，
+     * 语义与返回见 runner.cancelRun。
+     */
+    cancelRun(runId) {
+      return runner?.cancelRun?.(runId) ?? false
+    },
+
+    /** 单 run 终态等待透传（票 29 工具 abort 静止语义：结算持久化后才 reject）。 */
+    waitForRun(runId) {
+      return runner?.waitForRun?.(runId) ?? Promise.resolve(null)
     },
   }
 }
@@ -408,6 +479,55 @@ function hasUnsettledAutomaticRun(runs, id) {
 
 /** run 终态集合（与 runner/储层同口径）。 */
 const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'])
+
+/** delete 取消等待的有界预算（契约 09 决策 8：脚本 terminate 5s grace + 各动作自身 timeoutSeconds）。 */
+function deleteWaitBudgetMs(orchestration, options) {
+  if (typeof options.deleteWaitMs === 'number') return options.deleteWaitMs
+  let maxActionSeconds = 30
+  for (const definition of Object.values(orchestration.actions ?? {})) {
+    if (definition?.kind === 'plugin' && typeof definition.timeoutSeconds === 'number') {
+      maxActionSeconds = Math.max(maxActionSeconds, definition.timeoutSeconds)
+    }
+  }
+  return 5000 + maxActionSeconds * 1000 + 2000
+}
+
+/** 有界等待一组 run 全部终态；超时者记错误日志后放行（记录随后照删，迟到结算因记录不存在而 no-op）。 */
+async function waitForRunsSettled({ runner, inflight, waitBudgetMs, storage, log }) {
+  if (inflight.length === 0 || typeof runner?.waitForRun !== 'function') return
+  await Promise.all(
+    inflight.map(async (runId) => {
+      await Promise.race([runner.waitForRun(runId), delay(waitBudgetMs)])
+    }),
+  )
+  for (const runId of inflight) {
+    const run = storage.table('runs').get(runId)
+    if (run !== undefined && !TERMINAL_RUN_STATUSES.has(run.status)) {
+      log.error?.(
+        `script-orchestrator: 删除等待超时：run ${runId} 仍处于非终态 ${run.status}，按降级路径继续删除（迟到结算将为 no-op）`,
+      )
+    }
+  }
+}
+
+/** 删除全部 run 记录：优先域表 deleteMany（契约 08「级联删除」），fake 无该面时逐键删除。 */
+async function deleteRunRecords(runsTable, runIds) {
+  if (runIds.length === 0) return
+  if (typeof runsTable.deleteMany === 'function') return runsTable.deleteMany(runIds)
+  for (const runId of runIds) await runsTable.delete(runId)
+}
+
+/** 被删 run 的溢写文件 best-effort unlink（契约 03：级联删除时；失败只记日志）。 */
+async function unlinkSpillsBestEffort(fs, spillPaths, log) {
+  if (typeof fs?.unlink !== 'function' || spillPaths.length === 0) return
+  for (const spillPath of spillPaths) {
+    try {
+      await fs.unlink(spillPath)
+    } catch (error) {
+      log.warn?.(`script-orchestrator: 溢写文件清理失败（best-effort）: ${spillPath}（${error instanceof Error ? error.message : String(error)}）`)
+    }
+  }
+}
 
 /** EditInput 形状校验（契约 06）。 */
 function validateEditInput(input) {
