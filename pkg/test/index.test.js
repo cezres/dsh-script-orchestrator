@@ -223,6 +223,61 @@ describe('插件入口（lib/index.js）', () => {
     await first.value()
   })
 
+  it('调度接线（cron）：重启恢复的过期 cron 计划启动即合并补一次并推进到未来（票 27）', async () => {
+    const { ctx, calls } = makeCtx()
+    const tables = { orchestrations: new Map(), runs: new Map() }
+    // 预置停机前留下的过期 cron 计划：*/2 的最近匹配时刻（分钟边界，1 秒前）
+    const now = Date.now()
+    const boundary = now - (now % 120_000) - 1_000 // 最近一个偶数分钟边界再回退 1s
+    const dueIso = new Date(boundary).toISOString()
+    tables.orchestrations.set('cron-due', {
+      id: 'cron-due',
+      title: 'cron 到点即触发',
+      enabled: true,
+      overlap: 'skip',
+      trigger: { kind: 'cron', expression: '*/2 * * * *', timeZone: 'UTC' },
+      script: { command: 'node', args: ['-e', 'ok'], env: {} },
+      judge: { rules: [], fallback: [] },
+      actions: {},
+      createdAt: dueIso,
+      updatedAt: dueIso,
+      status: 'active',
+      nextOccurrence: dueIso,
+    })
+    ctx.storageDomain.open = async () => ({
+      name: 'script_orchestrator',
+      table: (name) => ({
+        entries: () => tables[name].entries(),
+        get: (key) => tables[name].get(key),
+        put: (key, value) => {
+          tables[name].set(key, value)
+          return Promise.resolve()
+        },
+        delete: (key) => {
+          tables[name].delete(key)
+          return Promise.resolve()
+        },
+      }),
+      close: () => Promise.resolve(),
+    })
+    const it = plugin(ctx, {})
+    const first = await it.next()
+    await vi.waitFor(() => expect(calls.spawns.length).toBeGreaterThanOrEqual(1))
+    expect(tables.runs.size).toBe(1) // 只补一次，不逐条重放
+    const [run] = [...tables.runs.values()]
+    expect(run.trigger).toBe('cron')
+    // scheduledAt = ≤now 的最近 */2 匹配边界（秒为 0、分钟偶数）
+    const schedMs = Date.parse(run.scheduledAt)
+    expect(schedMs % 60_000).toBe(0)
+    expect(new Date(schedMs).getUTCMinutes() % 2).toBe(0)
+    // nextOccurrence 推进到未来且在 */2 边界
+    const nextMs = Date.parse(tables.orchestrations.get('cron-due').nextOccurrence)
+    expect(nextMs).toBeGreaterThan(Date.now() - 1000)
+    expect(new Date(nextMs).getUTCMinutes() % 2).toBe(0)
+    calls.spawns.forEach((entry) => entry.finish({ exitCode: 0, signal: null }))
+    await first.value()
+  })
+
   it('票 30 接线：过期计划触发 → 判定命中 → event 动作发出自定义事件、plugin 查共享注册表（空表 → unknown_action）、run 按 partial 结算', async () => {
     const { ctx, calls } = makeCtx()
     const tables = { orchestrations: new Map(), runs: new Map() }
