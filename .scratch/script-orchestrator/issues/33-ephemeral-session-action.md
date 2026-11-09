@@ -4,7 +4,7 @@
 
 **Blocked by:** 32 — 通过 persistent session 接管失败排查
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] ephemeral 经直接铸造的 session id、当前模型选择、preset 解析/mount 和 `agents.create()` 创建自持 handle，投递路径与 persistent 共用。
 - [ ] `whenIdle()` 挂在 agent 上，收敛后才等待 `idleDisposeSeconds` 并 dispose；persistent 拒绝该字段，ephemeral 的零延迟与延迟回收均有测试。
