@@ -3,8 +3,8 @@
 // require("react") 取页面 seed 的 React；导出 apply（生成器，yield 注销器）+ inject。
 // 数据源：ctx.connection.rpc.call('/script-orchestrator', endpoint, payload)（契约
 // docs/temp/11-web-panel.md：零翻译 DTO；权威数据永远来自 list/view 回读，无事件推送）。
-// 创建/编辑主入口是对话式（契约 11 胜选 UX）：「新建」→ ctx.uiWorkspace.startSession
-// 注入引导 prompt，由模型经 script_create 工具完成配置；面板自身只做管理与排障
+// 创建/编辑主入口是对话式（契约 11 胜选 UX）：「新建/编辑」→ ctx.uiWorkspace.startSession
+// 注入引导 prompt，由模型经 script_create / script_edit 工具完成配置；面板自身只做管理与排障
 //（高密度表格 + 居中模态详情），不引入独立配置表单。
 window.__ModuleLoader__.load({
 	id: "@local/dsh-script-orchestrator",
@@ -35,6 +35,13 @@ window.__ModuleLoader__.load({
 			"4. 判定规则：按退出码/输出匹配动作键，未命中可走 fallback；\n" +
 			"5. 动作：事件（event）、注册动作（plugin）或开会话（session）。\n" +
 			"创建前可先用 script_list 查看现有编排避免重名。创建成功后把编排的 id、状态和下次触发时刻告诉我；如果参数不合法（script_input_invalid），按错误提示修正后重试。";
+
+		// 对话式编辑的引导 prompt（详情模态「编辑」按钮 → 注入新会话；与「新建」同一通道）
+		const EDIT_PROMPT = (id, title) =>
+			"请帮我修改「脚本编排」" + (title ? "「" + title + "」" : "") + "（id: " + id + "）。\n" +
+			"步骤：先用 script_view 查看当前配置（参数 { \"id\": \"" + id + "\" }），再按我的要求用 script_edit 修改" +
+			"（action: \"update\"，patch 只传要改的字段；也可用 action: \"pause\" / \"resume\" 管理状态）。" +
+			"修改前先向我确认要改什么；提交成功后把新的状态、触发配置与下次触发时刻告诉我。";
 
 		// ---------------- 样式（内联，沿用 proto/web-panel 变体 C 视觉） ----------------
 		const C = {
@@ -119,7 +126,7 @@ window.__ModuleLoader__.load({
 		}
 
 		// ---------------- 面板（数据经 Connection 桥，权威数据永远来自回读） ----------------
-		function Panel({ call, subscribeReset, startCreateSession }) {
+		function Panel({ call, subscribeReset, startCreateSession, startEditSession }) {
 			const [state, setState] = useState({ phase: "loading" });
 			const [detailId, setDetailId] = useState(null);
 			const [reloadKey, setReloadKey] = useState(0);
@@ -231,7 +238,7 @@ window.__ModuleLoader__.load({
 					onCancel: () => { if (!deleting) setDeleteTarget(null); },
 					onConfirm: () => void confirmDelete(deleteTarget.id),
 				}) : null,
-				detailId ? h(DetailModal, { key: detailId + ":" + reloadKey, call, id: detailId, onClose: () => setDetailId(null) }) : null);
+				detailId ? h(DetailModal, { key: detailId + ":" + reloadKey, call, id: detailId, startEditSession, onClose: () => setDetailId(null) }) : null);
 		}
 
 		function LoadingView() {
@@ -298,7 +305,7 @@ window.__ModuleLoader__.load({
 		}
 
 		// ---------------- 居中模态：详情（view 回读） ----------------
-		function DetailModal({ call, id, onClose }) {
+		function DetailModal({ call, id, startEditSession, onClose }) {
 			const [state, setState] = useState({ phase: "loading" });
 
 			// 完整溢写输出读取（票 34）：RunCard 的「全量」按钮 → spill 端点（排障读面）。
@@ -369,7 +376,14 @@ window.__ModuleLoader__.load({
 							h("b", { style: { fontSize: 15 } }, state.data.title || state.data.id),
 							h(Chip, { s: state.data.status }),
 							h("span", { style: { ...C.muted, ...C.mono, fontSize: 11 } }, state.data.id),
-							h("button", { style: { ...C.btn, marginLeft: "auto" }, onClick: onClose }, "关闭")),
+							// 对话式编辑（契约 11 胜选 UX）：与「新建」同一 uiWorkspace.startSession 通道，
+							// 面板自身不做配置表单；prompt 指引先 script_view 再 script_edit
+							h("button", {
+								style: { ...C.btn, marginLeft: "auto" },
+								title: "经引导会话由模型用 script_edit 修改（先 script_view 查看当前配置）；面板不提供表单",
+								onClick: () => startEditSession && startEditSession(state.data.id, state.data.title),
+							}, "编辑"),
+							h("button", { style: C.btn, onClick: onClose }, "关闭")),
 						section("触发配置",
 							h("div", { style: C.mono }, h(TriggerSummary, { t: state.data.trigger }))),
 						section("状态与下次触发",
@@ -487,6 +501,11 @@ window.__ModuleLoader__.load({
 				// 对话式创建（契约 11 胜选 UX）：开新会话注入引导 prompt（schedule 面板 onNewTask 同款通道）
 				startCreateSession: () => {
 					ctx.uiWorkspace.startSession(void 0, { prompt: CREATE_PROMPT, whenDraftExists: "append" });
+				},
+				// 对话式编辑（契约 11：新建/编辑均经 uiWorkspace.startSession）：
+				// prompt 含编排 id 与「先 script_view 再 script_edit」指引
+				startEditSession: (id, title) => {
+					ctx.uiWorkspace.startSession(void 0, { prompt: EDIT_PROMPT(id, title), whenDraftExists: "append" });
 				},
 			};
 

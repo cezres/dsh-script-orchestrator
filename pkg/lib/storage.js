@@ -1,19 +1,16 @@
-// 存储域：声明（契约 docs/temp/08-storage.md）+ 打开/关闭生命周期。
-// 打开后逐条「表键 = 记录内 id/runId」校验；启动维护（interrupted 标记、孤儿清理、
-// 保留对账）属票 26/35。
+// 存储域：声明（契约 docs/temp/08-storage.md）+ 打开/关闭与写入生命周期。
+// 打开后逐条「表键 = 记录内 id/runId」校验，随后执行启动维护三步（interrupted 标记、
+// 孤儿清理、保留对账；票 35）。
 // 记录 schema 用 zod（dsh-storage-domain 的 domainTable 约定 valueSchema.parse/raw
 // 归一化，schemastery 无 .parse 会把全部记录误判为坏记录）；插件静态 Config 仍用
 // schemastery（同步 Standard Schema），二者分工见 docs/temp/12-packaging.md。
-// 票 25 起编排记录按实际形状收紧（strict）；runs 表保持最小骨架，完整 run 形状
-// 随票 26 两写落地时收紧。
+// 编排记录（票 25 起）与 run 记录（票 26 起）均按实际形状收紧（strict）；写入前用
+// 对应 schema 显式 parse（契约 08「写入」，Domain 运行期不复验）。
 import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { ID_PATTERN } from './validation.js'
 import { OrchestratorError } from './errors.js'
 import { createRetentionPolicy } from './retention.js'
-
-// 全库 run 上限（契约 08「保留与裁剪」表：固定值，不是配置）
-export const MAX_TOTAL_RUNS = 1000
 
 const jsonValue = z.lazy(() =>
   z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(jsonValue), z.record(z.string(), jsonValue)]),
@@ -292,6 +289,31 @@ export async function openStorage({ openDomain, logger, emit, now, config, fs, o
     }
   }
 
+  /**
+   * 写入前显式 schema 校验（契约 08「写入」：写入前由插件用对应 schema 显式 `parse`，
+   * Domain 运行期不复验）。正常路径绝不应触发；失败是插件内部不变量被破坏，按
+   * `internal_error` 抛出并记 error 日志——**不**走 I/O 恢复（不是存储写入被拒）。
+   */
+  function assertRecordShape(name, key, value) {
+    const schema = domainSpec.tables[name]?.valueSchema
+    if (schema === undefined) {
+      throw new OrchestratorError('internal_error', `存储表 '${String(name)}' 未在域声明中定义`, { table: name })
+    }
+    try {
+      schema.parse(value)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      logger?.error?.(
+        `script-orchestrator: 存储写入前 schema 校验失败（表 '${name}'，键 '${String(key)}'）: ${reason}`,
+      )
+      throw new OrchestratorError(
+        'internal_error',
+        `存储写入前 schema 校验失败（表 '${name}'，键 '${String(key)}'）：${reason}`,
+        { table: name, key },
+      )
+    }
+  }
+
   /** 表门面：读写都作用于「当前 domain」（恢复重开后自动指向新域）。 */
   function table(name) {
     const facade = {
@@ -303,7 +325,12 @@ export async function openStorage({ openDomain, logger, emit, now, config, fs, o
         ensureAvailable()
         return domain.table(name).get(key)
       },
-      put: (key, value) => wrapWrite(() => domain.table(name).put(key, value))(key, value),
+      put: async (key, value) => {
+        // async 包装：恢复期/坏形状的失败以 Promise rejection 表达（与 domain 写语义一致）
+        ensureAvailable()
+        assertRecordShape(name, key, value)
+        return wrapWrite(() => domain.table(name).put(key, value))()
+      },
       delete: (key) => wrapWrite(() => domain.table(name).delete(key))(key),
     }
     // deleteMany 可选面：域表有则透传，无则逐键删除

@@ -277,12 +277,13 @@ try {
   $resumeActive = Invoke-Rpc 'edit' @{ id = 'v28-a'; action = 'resume' } 'rsm2'
   Check ($resumeActive.result.value.nextOccurrence -eq $resume.result.value.nextOccurrence) 'A：active 上 resume 幂等 no-op（不重锚）'
 
-  Step '阶段 7 · delete 准确暂不支持 + stderr 检查'
+  Step '阶段 7 · delete 已交付（票 29）：级联删除 + 记录不可见 + stderr 检查'
   $del = Invoke-Rpc 'edit' @{ id = 'v28-a'; action = 'delete' } 'del'
-  Check ($del.result.ok -eq $false -and $del.result.error.code -eq 'script_input_invalid' -and
-    $del.result.error.details.field -eq 'action' -and $del.result.error.details.reason -eq 'unsupported-part') 'delete → 准确暂不支持（票 29 交付）'
-  $stillThere = Invoke-Rpc 'view' @{ id = 'v28-a' } 'vA3'
-  Check ($stillThere.result.ok -eq $true) 'delete 拒绝后记录仍在'
+  Check ($del.result.ok -eq $true -and $del.result.value.id -eq 'v28-a' -and [int]$del.result.value.removedRuns -ge 1) "delete 级联删除 A 成功（removedRuns=$($del.result.value.removedRuns)）"
+  $goneView = Invoke-Rpc 'view' @{ id = 'v28-a' } 'vA3'
+  Check ($goneView.result.ok -eq $false -and $goneView.result.error.code -eq 'script_unknown') 'delete 后 view → script_unknown（记录不可见）'
+  $listAfterDel = Invoke-Rpc 'list' @{} 'listDel'
+  Check (@($listAfterDel.result.value.items | ForEach-Object { $_.id }) -notcontains 'v28-a') 'delete 后 list 不含已删编排'
 
   $bootErr = Get-Content $host1.Err -Raw -ErrorAction SilentlyContinue
   Check ($null -eq $bootErr -or $bootErr -notmatch 'script-orchestrator') 'stderr 无 script-orchestrator 错误'

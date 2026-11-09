@@ -277,6 +277,8 @@ export function createManagementService({ storage, queue, config, now, emit, log
           if (current.status !== 'active') return current
           const updated = {
             ...current,
+            // 契约 08：enabled 与 status 一致性由写入层保证（enabled:false 等价 paused）
+            enabled: false,
             status: 'paused',
             nextOccurrence: null,
             updatedAt: iso(currentTime()),
@@ -299,6 +301,8 @@ export function createManagementService({ storage, queue, config, now, emit, log
           const nextMs = waitingForOldRun ? null : nextOccurrence(current.trigger, resumedMs)
           const updated = {
             ...current,
+            // 契约 08：恢复即 enabled:true（paused 状态只与 enabled:false 对应）
+            enabled: true,
             status: nextMs === null && !waitingForOldRun ? 'ended' : 'active',
             nextOccurrence: nextMs === null ? null : iso(nextMs),
             updatedAt: iso(resumedMs),
@@ -498,6 +502,10 @@ async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMut
   }
   // 其余情形（非调度编辑且 enabled 未变/enabled:true 且原已 active）：状态与计划原样保留
 
+  // 契约 08：enabled 与 status 一致性由写入层保证（enabled:false 等价 paused）。
+  // paused 恒写 false；active 恒写 true；ended 保留用户意图（创建/重算无解时可能 enabled:true）。
+  const enabled = status === 'paused' ? false : status === 'active' ? true : normalized.enabled
+
   const updated = {
     ...current,
     title: normalized.title,
@@ -506,7 +514,7 @@ async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMut
     script: normalized.script,
     judge: normalized.judge,
     actions: normalized.actions,
-    enabled: normalized.enabled,
+    enabled,
     updatedAt,
     status,
     nextOccurrence: nextIso,
@@ -579,6 +587,21 @@ async function unlinkSpillsBestEffort(fs, spillPaths, log) {
   }
 }
 
+/** update 的 patch 允许键（契约 07：落库前校验；桥只做最小形状）。 */
+const UPDATE_PATCH_KEYS = new Set(['id', 'title', 'trigger', 'script', 'judge', 'actions', 'overlap', 'enabled'])
+
+/** patch 每个允许键的「明显形状」判定：null 与类型不符一律 format，不静默忽略。 */
+const UPDATE_PATCH_SHAPE = {
+  id: (value) => typeof value === 'string' && value.length > 0,
+  title: (value) => typeof value === 'string',
+  trigger: isPlainObject,
+  script: isPlainObject,
+  judge: isPlainObject,
+  actions: isPlainObject,
+  overlap: (value) => value === 'skip' || value === 'queue',
+  enabled: (value) => typeof value === 'boolean',
+}
+
 /** EditInput 形状校验（契约 06）。 */
 function validateEditInput(input) {
   if (!isPlainObject(input)) throw inputInvalid('input', 'format', 'edit 输入必须是对象')
@@ -602,6 +625,15 @@ function validateEditInput(input) {
     if (!isPlainObject(input.patch)) throw inputInvalid('patch', 'format', 'patch 必须是对象')
     if (Object.keys(input.patch).length === 0) {
       throw inputInvalid('patch', 'format', 'patch 至少包含一个字段')
+    }
+    for (const [key, value] of Object.entries(input.patch)) {
+      if (!UPDATE_PATCH_KEYS.has(key)) {
+        throw inputInvalid(`patch.${key}`, 'unexpected', `patch 不接受字段 '${key}'（只允许 ${[...UPDATE_PATCH_KEYS].join('/')}）`)
+      }
+      // 契约 07「落库前校验」：null/undefined 与类型明显不符不得静默忽略（旧实现会被 ?? 合并吞掉）
+      if (value === null || value === undefined || !UPDATE_PATCH_SHAPE[key](value)) {
+        throw inputInvalid(`patch.${key}`, 'format', `patch.${key} 的值形态不合法（不能为 null，且类型须与字段匹配）`)
+      }
     }
   } else if (action === 'update') {
     throw inputInvalid('patch', 'missing', "action:'update' 必须给出 patch")

@@ -152,6 +152,18 @@ const waitForSpawn = (ctx, index = 0) => vi.waitFor(() => {
   return ctx.subprocess.spawns[index]
 })
 
+/**
+ * 在 live 状态恰为 expected 的微任务边界内同步执行 fn（judging 是纯内存毫秒级、
+ * 仅跨一个微任务边界，定时器轮询捕捉不到；跨 await 返回必然错过该边界）。
+ */
+async function atLiveStatusMicrotask(runner, runId, expected, fn, limit = 1000) {
+  for (let i = 0; i < limit; i++) {
+    if (runner.liveView(runId)?.status === expected) return fn()
+    await Promise.resolve()
+  }
+  throw new Error(`live 状态未在微任务窗口内到达 '${expected}'（当前 '${runner.liveView(runId)?.status}'）`)
+}
+
 describe('正常执行路径（契约 03/09：两写、事件、零动作结算）', () => {
   it('空闲自动触发：写 1 queued → 领槽 running（run-started）→ 零动作 succeeded（写 2）', async () => {
     const ctx = makeRunner()
@@ -1132,7 +1144,7 @@ describe('cancelRun · 取消矩阵四阶段（契约 03：queued/running/judgin
     expect(run.script.warnings).toBeUndefined() // 不是 spawn_failed
   })
 
-  it('judging：判定照常完成（matchedRule 记录）、进入派发即全 skipped、终态 canceled', async () => {
+  it('judging：取消被忽略（返回 false、不置标志）、动作照常执行、终态按动作汇总', async () => {
     const ctx = makeRunner({
       autoSubprocess: false,
       orchestrationOver: judgeWithActions(
@@ -1143,18 +1155,37 @@ describe('cancelRun · 取消矩阵四阶段（契约 03：queued/running/judgin
     const view = await requestAuto(ctx.runner)
     const spawn = await waitForSpawn(ctx)
     await spawn.finish({ exitCode: 0, signal: null })
-    // 脚本已退出、判定前抢先取消（judging 不响应取消：求值照常，派发面停止）
-    await vi.waitFor(() => {
-      const status = ctx.runner.liveView(view.runId)?.status
-      if (status !== 'judging' && status !== 'running') throw new Error('pre-judging')
-    })
-    expect(ctx.runner.cancelRun(view.runId)).toBe(true)
+    // judging 是纯内存毫秒级：以微任务粒度捕捉该内存态（判定与派发之间的边界），
+    // 并在边界内同步发起取消（返回 false 才是「不响应」）
+    const canceled = await atLiveStatusMicrotask(ctx.runner, view.runId, 'judging', () =>
+      ctx.runner.cancelRun(view.runId),
+    )
+    expect(canceled).toBe(false)
     await ctx.runner.waitIdle()
     const run = ctx.storage.snapshot().runs[view.runId]
-    expect(run.status).toBe('canceled')
+    expect(run.status).toBe('succeeded') // 不出现「全 skipped + canceled」，按动作汇总
     expect(run.matchedRule).toBe(0) // 判定照常
-    expect(run.actions.map((a) => a.status)).toEqual(['skipped', 'skipped'])
-    expect(ctx.emitted.some(([n]) => n === 'script-orchestrator/one')).toBe(false) // 未派发
+    expect(run.actions.map((a) => [a.name, a.status])).toEqual([
+      ['emit-ok', 'succeeded'],
+      ['emit-two', 'succeeded'],
+    ])
+    expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/one')).toHaveLength(1)
+    expect(ctx.emitted.filter(([n]) => n === 'script-orchestrator/two')).toHaveLength(1)
+    expect(ctx.emitted.at(-1)[1]).toMatchObject({ runId: view.runId, status: 'succeeded' })
+  })
+
+  it('judging（零动作）：取消仍返回 false，run 自然结算 succeeded（不出现 canceled/skipped）', async () => {
+    const ctx = makeRunner({ autoSubprocess: false })
+    const view = await requestAuto(ctx.runner)
+    const spawn = await waitForSpawn(ctx)
+    await spawn.finish({ exitCode: 0, signal: null })
+    const canceled = await atLiveStatusMicrotask(ctx.runner, view.runId, 'judging', () =>
+      ctx.runner.cancelRun(view.runId),
+    )
+    expect(canceled).toBe(false)
+    await ctx.runner.waitIdle()
+    const run = ctx.storage.snapshot().runs[view.runId]
+    expect(run).toMatchObject({ status: 'succeeded', skipReason: null, actions: [] })
   })
 
   it('dispatching：在途动作经 signal 中止、剩余 skipped、已执行保留（与 requestCancel 同路径）', async () => {

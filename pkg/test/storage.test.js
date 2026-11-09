@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { domainSpec, openStorage } from '../lib/storage.js'
 import { createManagementService } from '../lib/service.js'
+import { createRunner } from '../lib/runner.js'
 import { ServiceQueue } from '../lib/fifo.js'
 
 function fakeDomain({ orchestrations = [], runs = [] } = {}) {
@@ -192,6 +193,94 @@ describe('openStorage（打开与键校验）', () => {
     const storage = await openStorage({ openDomain: async () => domain, logger: null })
     await storage.close()
     expect(domain.log.closed).toBe(1)
+  })
+})
+
+describe('写入前显式 schema 校验（契约 08「写入」：插件 parse、Domain 运行期不复验）', () => {
+  it('坏形状 → internal_error + error 日志；不落库、不触发关闭-重开（不是 I/O 失败）', async () => {
+    const domain = fakeDomain()
+    const logs = []
+    const storage = await openStorage({
+      openDomain: async () => domain,
+      logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) },
+    })
+    await expect(
+      storage.table('orchestrations').put('bad', { id: 'bad', title: '', status: 'active' }),
+    ).rejects.toMatchObject({ code: 'internal_error', details: { table: 'orchestrations', key: 'bad' } })
+    await expect(
+      storage.table('runs').put('run-bbbbbbbb', { runId: 'run-bbbbbbbb' }),
+    ).rejects.toMatchObject({ code: 'internal_error', details: { table: 'runs', key: 'run-bbbbbbbb' } })
+    expect(domain.snapshot()).toEqual({ orchestrations: {}, runs: {} }) // 一条都未落库
+    expect(domain.log.closed).toBe(0) // 不走 I/O 恢复（关闭-重开）
+    expect(storage.isRecovering()).toBe(false)
+    expect(logs.some((m) => m.includes('schema 校验失败') && m.includes('orchestrations'))).toBe(true)
+    expect(logs.some((m) => m.includes('schema 校验失败') && m.includes('runs'))).toBe(true)
+    await storage.close()
+  })
+
+  it('正常路径不误报：编排 active/paused/ended 写入与 run 两写都通过写入前 parse', async () => {
+    const domain = fakeDomain()
+    const storage = await openStorage({ openDomain: async () => domain, logger: { error: () => {}, warn: () => {} } })
+    const now = 1_790_000_000_000
+    const service = createManagementService({
+      storage,
+      queue: new ServiceQueue(),
+      config: { maxRunsPerOrchestration: 100 },
+      now: () => now,
+      emit: () => {},
+    })
+    const created = await service.create({
+      id: 'nightly-check',
+      title: 'log rotate',
+      trigger: { kind: 'every', everySeconds: 90, mode: 'fixed-rate' },
+      script: { command: 'pwsh', args: ['-File', 'r.ps1'], env: {}, timeoutSeconds: 120 },
+      judge: { rules: [{ when: { exitCode: { not: 0 } }, actions: ['emit-bad'] }] },
+      actions: { 'emit-bad': { kind: 'event', name: 'bad' } },
+    })
+    expect(created.status).toBe('active')
+    // 状态写入：paused（enabled:false）与 active（enabled:true）都须通过 parse
+    const paused = await service.edit({ id: 'nightly-check', action: 'pause' })
+    expect(paused).toMatchObject({ status: 'paused', enabled: false })
+    const resumed = await service.edit({ id: 'nightly-check', action: 'resume' })
+    expect(resumed.status).toBe('active')
+
+    // run 两写（queued 创建 + succeeded 结算）经同一写入门面
+    const runner = createRunner({
+      storage,
+      queue: new ServiceQueue(),
+      subprocess: {
+        spawn: () => ({
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          terminate: () => {},
+          waitForExit: () => Promise.resolve(true),
+          collected: {
+            stdout: { readFrom: () => ({ text: 'ok', lossy: false, nextOffset: 0 }) },
+            stderr: { readFrom: () => ({ text: '', lossy: false, nextOffset: 0 }) },
+          },
+        }),
+      },
+      config: {
+        maxConcurrentRuns: 2,
+        defaultTimeoutSeconds: 300,
+        maxOutputBytes: 262144,
+        maxSpillBytes: 0,
+        allowedRoots: [],
+        maxRunsPerOrchestration: 100,
+      },
+      emit: () => {},
+      now: () => now,
+      fs: { stat: async () => ({ isDirectory: () => true }) },
+      hostCwd: 'D:\\work',
+    })
+    const runView = await runner.requestRun({ orchestrationId: 'nightly-check', trigger: 'every', scheduledAtMs: now })
+    await runner.waitIdle()
+    expect(storage.table('runs').get(runView.runId)).toMatchObject({ status: 'succeeded' })
+
+    // ended 防御终态写入（运行期无解的落点形状）
+    await storage.table('orchestrations').put('nightly-check', { ...resumed, status: 'ended', nextOccurrence: null })
+    expect(storage.table('orchestrations').get('nightly-check').status).toBe('ended')
+    expect(domain.log.closed).toBe(0) // 全程未触发恢复
+    await storage.close()
   })
 })
 

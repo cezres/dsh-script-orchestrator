@@ -700,6 +700,40 @@ describe('edit · 形状校验、乐观并发与 update 基本路径（契约 06
     await expect(service.edit({ id: 'log-rotate', action: 'update', patch: {} })).rejects.toMatchObject({ details: { field: 'patch', reason: 'format' } })
   })
 
+  it('update 的 patch 显式校验（契约 07：落库前校验）：多余键 → patch.<key>/unexpected；null/类型不符 → patch.<key>/format；均不落库', async () => {
+    const { service, storage, emitted } = makeService()
+    await service.create(baseInput())
+    const before = storage.snapshot().orchestrations['log-rotate']
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: { bogus: 1 } })).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'patch.bogus', reason: 'unexpected' },
+    })
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: { title: null } })).rejects.toMatchObject({
+      details: { field: 'patch.title', reason: 'format' },
+    })
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: { enabled: 'yes' } })).rejects.toMatchObject({
+      details: { field: 'patch.enabled', reason: 'format' },
+    })
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: { script: [] } })).rejects.toMatchObject({
+      details: { field: 'patch.script', reason: 'format' },
+    })
+    // 被拒的 patch 一条都不落库、不发 changed（只有 create 那条）
+    expect(storage.snapshot().orchestrations['log-rotate']).toEqual(before)
+    expect(emitted).toHaveLength(1)
+    // 合法 patch 正常写入；patch.id 同值忽略、异值拒绝（既有语义保留）
+    const renamed = await service.edit({ id: 'log-rotate', action: 'update', patch: { title: '新标题' } })
+    expect(renamed.title).toBe('新标题')
+    const sameId = await service.edit({
+      id: 'log-rotate',
+      action: 'update',
+      patch: { id: 'log-rotate', title: '同名 id' },
+    })
+    expect(sameId.id).toBe('log-rotate')
+    await expect(
+      service.edit({ id: 'log-rotate', action: 'update', patch: { id: 'other-id' } }),
+    ).rejects.toMatchObject({ details: { field: 'patch.id', reason: 'unexpected' } })
+  })
+
   it('未知 id → script_unknown（各 action 一致）', async () => {
     const { service } = makeService()
     for (const action of ['update', 'pause', 'resume']) {
@@ -776,9 +810,11 @@ describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、�
   it('pause 仅从 active 生效：paused → paused 与 ended → pause 均幂等 no-op（不改记录、不发 changed、不改 updatedAt）', async () => {
     const world = await makePaused()
     const before = { ...world.storage.snapshot().orchestrations['log-rotate'] }
+    expect(before).toMatchObject({ status: 'paused', enabled: false })
     const view = await world.service.edit({ id: 'log-rotate', action: 'pause' })
     expect(view.status).toBe('paused')
     expect(view).toEqual(before)
+    expect(view.enabled).toBe(false) // 幂等 no-op 不改 enabled（重复 pause 不会把遗留 true 洗成 false）
     expect(world.storage.snapshot().orchestrations['log-rotate']).toEqual(before)
     expect(world.emitted).toEqual([['script-orchestrator/changed', undefined]]) // 仅 create 那条
     // ended 同样 no-op
@@ -788,16 +824,16 @@ describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、�
     expect(world.emitted).toHaveLength(1)
   })
 
-  it('pause 对 active 生效：nextOccurrence=null、paused、updatedAt 推进、发 changed', async () => {
+  it('pause 对 active 生效：enabled:false + paused、nextOccurrence=null、updatedAt 推进、发 changed', async () => {
     let t = NOW
     const { service, storage, emitted } = makeService({ now: () => t })
     await service.create(baseInput())
     t = NOW + 30_000
     const view = await service.edit({ id: 'log-rotate', action: 'pause' })
-    expect(view.status).toBe('paused')
+    expect(view).toMatchObject({ status: 'paused', enabled: false }) // 契约 08：enabled:false 等价 paused
     expect(view.nextOccurrence).toBeNull()
     expect(view.updatedAt).toBe(iso(NOW + 30_000))
-    expect(storage.snapshot().orchestrations['log-rotate'].status).toBe('paused')
+    expect(storage.snapshot().orchestrations['log-rotate']).toMatchObject({ status: 'paused', enabled: false })
     expect(emitted).toHaveLength(2)
   })
 
@@ -832,8 +868,10 @@ describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、�
     world.setTime(NOW + 600_000) // 暂停 10 分钟后恢复
     const view = await world.service.edit({ id: 'log-rotate', action: 'resume' })
     expect(view.status).toBe('active')
+    expect(view.enabled).toBe(true) // 契约 08：resume 即 enabled:true
     expect(view.nextOccurrence).toBe(iso(NOW + 600_000 + 300_000)) // resumedAt + everySeconds，不补暂停期
     expect(view.updatedAt).toBe(iso(NOW + 600_000))
+    expect(world.storage.snapshot().orchestrations['log-rotate']).toMatchObject({ status: 'active', enabled: true })
   })
 
   it('resume 恢复表：cron 取严格晚于 resumedAt 的下一匹配', async () => {
@@ -915,7 +953,29 @@ describe('edit · pause/resume 状态设置语义（契约 09 + 02「创建、�
     const view = await service.edit({ id: 'feb29', action: 'resume' })
     expect(view.status).toBe('ended') // 下一个 2/29 是 2104，距 resumedAt 超 5 年窗口
     expect(view.nextOccurrence).toBeNull()
+    expect(view.enabled).toBe(true) // resume 已受理（ended 是运行期无解的防御终态，非 paused）
     expect(storage.snapshot().orchestrations.feb29.status).toBe('ended')
+  })
+
+  it('update 写入的 enabled 与 status 一致：paused 恒 false（含遗留 enabled:true 的修复），active 恒 true', async () => {
+    let t = NOW
+    const { service, storage } = makeService({ now: () => t })
+    await service.create(baseInput())
+    // 模拟旧实现/手工落库的不一致记录：paused 但 enabled:true
+    storage.table('orchestrations').put('log-rotate', {
+      ...storage.snapshot().orchestrations['log-rotate'],
+      status: 'paused',
+      nextOccurrence: null,
+      enabled: true,
+    })
+    t = NOW + 10_000
+    const edited = await service.edit({ id: 'log-rotate', action: 'update', patch: { title: 'paused 仍暂停' } })
+    expect(edited).toMatchObject({ status: 'paused', enabled: false, nextOccurrence: null })
+    expect(storage.snapshot().orchestrations['log-rotate']).toMatchObject({ status: 'paused', enabled: false })
+    // 经 update 恢复：enabled:true + active
+    const resumed = await service.edit({ id: 'log-rotate', action: 'update', patch: { enabled: true } })
+    expect(resumed).toMatchObject({ status: 'active', enabled: true })
+    expect(storage.snapshot().orchestrations['log-rotate']).toMatchObject({ status: 'active', enabled: true })
   })
 })
 

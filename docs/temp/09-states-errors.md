@@ -78,7 +78,7 @@ queued ──领槽──▶ running ──退出──▶ judging ──命中�
 | `script_input_invalid` | 字段缺失、越界、多余字段、引用不存在 | 否 | `{ field, reason, part? }` |
 | `script_unknown` | 编排 id 不存在（或已删除） | 否 | `{ id }` |
 | `script_conflict` | 管理动作（`update`/`pause`/`resume`/`delete`）的 `expectedUpdatedAt` 与当前不一致 | 是（重读后重试） | `{ expected, actual }` |
-| `script_storage_unavailable` | 存储域打不开、写入被拒（含 I/O 结果未知后的关闭恢复期；处置流程见 [08-storage](08-storage.md)） | 条件性 | `{ cause }` |
+| `script_storage_unavailable` | 存储域打不开、写入被拒（含 I/O 结果未知后的关闭恢复期；处置流程见 [08-storage](08-storage.md)）；以及 run 完整溢写输出读取失败（`spill` 排障读面，v0.1r） | 条件性 | `{ cause }`（如 `recovering` / `unavailable` / `spill-unavailable` / `ENOENT`） |
 | `spawn_failed` | 脚本无法启动 | 否 | `{ command, cwd, cause }` |
 | `unknown_action` | `plugin` 动作的注册动作名未注册（或注册被摘除） | 否 | `{ action }` |
 | `action_error` | 动作实现抛错 | 否 | `{ name, message }` |

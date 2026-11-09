@@ -6,7 +6,7 @@
 // 不占 FIFO 槽、不落盘）→ 按契约 09 汇总定终态；action-settled 按动作执行序在写 2
 // 之后、run-settled 之前发布。
 // 票 29：cancelRun 落实完整取消矩阵（queued 直接 canceled / running terminate 后
-// canceled / judging 不响应·派发面停止 / dispatching 停止剩余派发），first-write-wins
+// canceled / judging 不响应·自然前进 / dispatching 停止剩余派发），first-write-wins
 // 终态唯一；shutdown（卸载=取消来源）将有界等待后未结算的 run 取消结算 canceled；
 // markDeleting 阻断删除中编排的新 run 受理（service.delete 两阶段协调）。
 // 服务 run / script_run 只经 requestRun 触发，不另造排队或结算逻辑（spec §2）。
@@ -320,17 +320,10 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       return null
     }
     active.set(runId, true)
-    // run 级取消标志（cancelRun 的矩阵作用面）；领槽瞬间已请求取消 → 不 spawn 直接结算
+    // run 级取消标志（cancelRun 的矩阵作用面）。领槽瞬间尚无外部调用可取消（同一次
+    // 同步代码内写入），故无需在此判定取消。
     const state = { cancelRequested: false }
     activeStates.set(runId, state)
-    if (state.cancelRequested) {
-      activeStates.delete(runId)
-      active.delete(runId)
-      await settle(runId, { kind: 'canceled', script: run.script })
-      wakeIdleWaiters()
-      pump()
-      return null
-    }
     const startedMs = currentTime()
     const startedAt = iso(startedMs)
     live.set(runId, { ...run, status: 'running', startedAt })
@@ -372,6 +365,9 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       matchedRule: verdict.matchedRule,
       usedFallback: verdict.usedFallback,
     })
+    // 让 judging 内存态跨一个微任务边界：判定本身是纯内存毫秒级，但取消入口
+    // （cancelRun 按 live status 判定「不响应」）与面板回读都以此状态为准
+    await Promise.resolve()
 
     let actionResults = []
     let dispatchCanceled = false
@@ -668,13 +664,17 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
   /**
    * run 取消（契约 03「取消与等待」取消矩阵；来源 = script_run abort / delete / 插件卸载）。
    * 按阶段执行：queued → 移出队列 + 结算槽直接写 canceled；running → 置标志 + terminate()
-   * → done settle 后结算 canceled；judging → 不响应（求值照常），标志在派发开始生效；
-   * dispatching → 标志 + 中止在途动作 signal，剩余动作 skipped、已执行结果保留。
-   * 终态或未知 run 返回 false（幂等，不重复发布事件）。
+   * → done settle 后结算 canceled；judging → 不响应（返回 false、不置标志、不中止判定，
+   * run 照常进入派发并按动作汇总结算）；dispatching → 标志 + 中止在途动作 signal，剩余
+   * 动作 skipped、已执行结果保留。终态或未知 run 返回 false（幂等，不重复发布事件）。
    */
   function cancelRunInternal(runId) {
     const persisted = storage.table('runs').get(runId)
     if (persisted === undefined || TERMINAL_STATUSES.has(persisted.status)) return false
+    // judging 不响应取消（契约 03 取消矩阵）：纯内存求值毫秒级、自然前进。此处必须
+    // 返回 false 且不置 cancelRequested——置位会让派发面把全部动作记 skipped 并结算
+    // canceled，与「judging 不响应」相悖。
+    if (live.get(runId)?.status === 'judging') return false
     const state = activeStates.get(runId)
     if (state !== undefined) {
       state.cancelRequested = true
@@ -776,13 +776,8 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       if (on) deletingOrchestrations.add(orchestrationId)
       else deletingOrchestrations.delete(orchestrationId)
     },
-    /** 活动视图合并入口（service.view 用）：返回内存态视图或 undefined。 */
-    liveView: (runId) => {
-      const overlay = live.get(runId)
-      if (overlay === undefined) return undefined
-      const persisted = storage.table('runs').get(runId)
-      return { ...persisted, ...overlay }
-    },
+    /** 活动视图合并入口（service.view 用）：返回内存态视图或 undefined（无内存态）。 */
+    liveView: (runId) => (live.get(runId) === undefined ? undefined : currentRun(runId)),
     /** 是否存在未终态 run（面板轮询提示等可用；限定编排可选）。 */
     hasInflight: (orchestrationId) => {
       for (const runId of [...active.keys(), ...pending]) {
