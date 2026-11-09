@@ -602,3 +602,81 @@ describe('create cron 校验（契约 02「cron 子集」「时区与夏令时�
     expect(storage.snapshot().orchestrations).toEqual({})
   })
 })
+
+describe('edit · 形状校验、乐观并发与 update 基本路径（契约 06/07；票 28）', () => {
+  it('形状校验：id/action 必填、action 枚举、多余字段、patch 仅 update、update 至少一个字段', async () => {
+    const { service } = makeService()
+    await service.create(baseInput())
+    await expect(service.edit({ action: 'pause' })).rejects.toMatchObject({ details: { field: 'id', reason: 'missing' } })
+    await expect(service.edit({ id: 'log-rotate' })).rejects.toMatchObject({ details: { field: 'action', reason: 'missing' } })
+    await expect(service.edit({ id: 'log-rotate', action: 'bogus' })).rejects.toMatchObject({ details: { field: 'action', reason: 'format' } })
+    await expect(service.edit({ id: 'log-rotate', action: 'pause', extra: 1 })).rejects.toMatchObject({ details: { field: 'extra', reason: 'unexpected' } })
+    await expect(service.edit({ id: 'log-rotate', action: 'pause', patch: { title: 'x' } })).rejects.toMatchObject({ details: { field: 'patch', reason: 'unexpected' } })
+    await expect(service.edit({ id: 'log-rotate', action: 'update' })).rejects.toMatchObject({ details: { field: 'patch', reason: 'missing' } })
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: {} })).rejects.toMatchObject({ details: { field: 'patch', reason: 'format' } })
+  })
+
+  it('未知 id → script_unknown（各 action 一致）', async () => {
+    const { service } = makeService()
+    for (const action of ['update', 'pause', 'resume']) {
+      await expect(service.edit({ id: 'nope', action, ...(action === 'update' ? { patch: { title: 'x' } } : {}) }))
+        .rejects.toMatchObject({ code: 'script_unknown', details: { id: 'nope' } })
+    }
+  })
+
+  it('delete action：准确暂不支持错误（票 29 交付），不触碰记录', async () => {
+    const { service, storage } = makeService()
+    await service.create(baseInput())
+    await expect(service.edit({ id: 'log-rotate', action: 'delete' })).rejects.toMatchObject({
+      code: 'script_input_invalid',
+      details: { field: 'action', reason: 'unsupported-part' },
+    })
+    expect(Object.keys(storage.snapshot().orchestrations)).toEqual(['log-rotate'])
+  })
+
+  it('expectedUpdatedAt 乐观并发：匹配通过、不匹配 script_conflict、null 对已有 updatedAt 恒冲突', async () => {
+    let t = NOW
+    const { service, storage, emitted } = makeService({ now: () => t })
+    const created = await service.create(baseInput())
+    await expect(
+      service.edit({ id: 'log-rotate', action: 'pause', expectedUpdatedAt: '2020-01-01T00:00:00.000Z' }),
+    ).rejects.toMatchObject({
+      code: 'script_conflict',
+      details: { expected: '2020-01-01T00:00:00.000Z', actual: created.updatedAt },
+    })
+    await expect(service.edit({ id: 'log-rotate', action: 'pause', expectedUpdatedAt: null })).rejects.toMatchObject({
+      code: 'script_conflict',
+    })
+    // 匹配则通过；冲突失败不改任何记录、不新增 changed（create 的那一条仍在）
+    expect(storage.snapshot().orchestrations['log-rotate'].status).toBe('active')
+    expect(emitted).toEqual([['script-orchestrator/changed', undefined]])
+    t = NOW + 60_000
+    const view = await service.edit({ id: 'log-rotate', action: 'pause', expectedUpdatedAt: created.updatedAt })
+    expect(view.status).toBe('paused')
+  })
+
+  it('update 非调度字段（title）：合并校验、写库、updatedAt 推进、发 changed；nextOccurrence 不重锚', async () => {
+    let t = NOW
+    const { service, storage, emitted } = makeService({ now: () => t })
+    const created = await service.create(baseInput())
+    t = NOW + 120_000
+    const view = await service.edit({ id: 'log-rotate', action: 'update', patch: { title: '  new title  ' } })
+    expect(view.title).toBe('new title') // 归一化与 create 同源
+    expect(view.updatedAt).toBe(iso(NOW + 120_000)) // 内容编辑推进 updatedAt（CAS 依据）
+    expect(view.nextOccurrence).toBe(created.nextOccurrence) // 非调度编辑不重锚
+    expect(view.trigger).toEqual(created.trigger)
+    expect(storage.snapshot().orchestrations['log-rotate']).toEqual(view)
+    expect(emitted.filter(([n]) => n === 'script-orchestrator/changed')).toHaveLength(2) // create + edit
+  })
+
+  it('update 非法 patch 字段值走 create 同源校验（title 空 → range；everySeconds 59 → too-frequent）', async () => {
+    const { service } = makeService()
+    await service.create(baseInput())
+    await expect(service.edit({ id: 'log-rotate', action: 'update', patch: { title: '   ' } })).rejects.toMatchObject({
+      details: { field: 'title', reason: 'range' },
+    })
+    await expect(
+      service.edit({ id: 'log-rotate', action: 'update', patch: { trigger: { kind: 'every', everySeconds: 59 } } }),
+    ).rejects.toMatchObject({ details: { field: 'trigger.everySeconds', reason: 'too-frequent' } })
+  })
+})

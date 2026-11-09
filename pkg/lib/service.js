@@ -4,10 +4,22 @@
 // 一切持久写入经服务层 FIFO 整槽（契约 08「写入」）；changed 在持久写入完成后发布（契约 06）。
 // 票 30：动作注册表可与 runner 共享同一实例（index.js 装配）——listActions 取快照、
 // runner 逐动作实时查表用同一张表；registerAction 的注册面属票 31。
-import { OrchestratorError, inputInvalid } from './errors.js'
+import { OrchestratorError, inputInvalid, isPlainObject } from './errors.js'
 import { validateOrchestrationInput } from './validation.js'
 import { nextOccurrence } from './triggers.js'
 import { createActionRegistry } from './actions.js'
+
+/** 键排序的稳定 JSON（调度字段变化的深比较；配置对象均为可序列化 JSON 值）。 */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+const iso = (ms) => new Date(ms).toISOString()
 
 /** 由标题生成 id 基名（01：创建时可省略 id，由标题生成并保证唯一）。 */
 function slugifyTitle(title) {
@@ -165,7 +177,192 @@ export function createManagementService({ storage, queue, config, now, emit, log
     listActions() {
       return registry.snapshot()
     },
+
+    /**
+     * 管理动作（契约 06/07 EditInput）：update / pause / resume（delete 属票 29）。
+     * 一切在 FIFO 单槽内：CAS → 动作分派 → 持久写入 → changed（持久写入完成后）。
+     */
+    async edit(input, _actorSessionId, signal) {
+      return queue.enqueue(async () => {
+        signal?.throwIfAborted()
+        const { id, action, patch } = validateEditInput(input)
+        const orchestrations = storage.table('orchestrations')
+        const current = orchestrations.get(id)
+        if (current === undefined) {
+          throw new OrchestratorError('script_unknown', `编排 '${id}' 不存在`, { id })
+        }
+        // 乐观并发（契约 06/09）：expectedUpdatedAt 对各 action 均可选；null = 此前没有
+        // 更新时间（本域记录恒有 updatedAt，故 null 恒冲突——防御面等价）；不匹配 → script_conflict
+        if ('expectedUpdatedAt' in input && input.expectedUpdatedAt !== undefined) {
+          const expected = input.expectedUpdatedAt
+          if (expected !== current.updatedAt) {
+            throw new OrchestratorError('script_conflict', `编排 '${id}' 已被其他修改（乐观并发冲突）`, {
+              expected: expected ?? null,
+              actual: current.updatedAt ?? null,
+            })
+          }
+        }
+        if (action === 'delete') {
+          // 契约定义了 delete（取消级联删除），实现按票序属票 29：给出准确的暂不支持错误
+          throw inputInvalid('action', 'unsupported-part', 'delete 动作尚未实现（票 29 交付）')
+        }
+        if (action === 'pause') {
+          // 状态设置语义（契约 09）：仅从 active 生效；其余状态幂等 no-op（不改任何计时、不写库）
+          if (current.status !== 'active') return current
+          const updated = {
+            ...current,
+            status: 'paused',
+            nextOccurrence: null,
+            updatedAt: iso(currentTime()),
+          }
+          await orchestrations.put(id, updated)
+          safeEmit('script-orchestrator/changed')
+          notifyMutation()
+          return updated
+        }
+        if (action === 'resume') {
+          // 状态设置语义（契约 09）：仅从 paused 生效；其余状态幂等 no-op。
+          // 恢复重锚（契约 02「恢复」表）随切片 2 落地，先返回当前视图占位。
+          return current
+        }
+        // action === 'update'
+        return applyUpdate({
+          storage,
+          current,
+          patch,
+          nowMs: currentTime(),
+          safeEmit,
+          notifyMutation,
+        })
+      })
+    },
   }
+}
+
+/**
+ * update 的合并校验与持久化（契约 02「编辑」+ 07）。非调度编辑不重锚；调度字段变化按
+ * 编辑表重建；enabled 走暂停/恢复规则；ended 可经重算触发复活为 active。
+ * @param {object} deps.storage openStorage() 的返回值（读写 orchestrations/runs 表）
+ */
+async function applyUpdate({ storage, current, patch, nowMs, safeEmit, notifyMutation }) {
+  if ('id' in patch && patch.id !== undefined && patch.id !== current.id) {
+    throw inputInvalid('patch.id', 'unexpected', `id 不可修改（当前 '${current.id}'）`)
+  }
+  // patch 与当前值合并成完整 OrchestrationInput 再走 create 同源校验（enabled/overlap
+  // 必须显式携带当前值：校验器的默认值会覆盖未给出的字段）
+  const merged = {
+    title: patch.title ?? current.title,
+    trigger: patch.trigger ?? current.trigger,
+    script: patch.script ?? current.script,
+    judge: patch.judge ?? current.judge,
+    actions: patch.actions ?? current.actions,
+    overlap: patch.overlap ?? current.overlap,
+    enabled: patch.enabled ?? current.enabled,
+  }
+  const normalized = validateOrchestrationInput(merged)
+  const schedulingChanged = stableStringify(normalized.trigger) !== stableStringify(current.trigger)
+  const enabledChanged = 'enabled' in patch && patch.enabled !== undefined && patch.enabled !== current.enabled
+
+  const updatedAt = iso(nowMs)
+  let status = current.status
+  let nextIso = current.nextOccurrence
+
+  if (enabledChanged && patch.enabled === false) {
+    // 修改 enabled 走暂停/恢复规则（契约 02「编辑」）：false = 暂停（任何原状态）
+    status = 'paused'
+    nextIso = null
+  } else if (schedulingChanged || (enabledChanged && patch.enabled === true && current.status !== 'active')) {
+    // 调度字段变化 → 编辑表重建；enabled:true 对非 active 编排 = 恢复语义（恢复表与编辑表
+    // 在「无未结算旧自动 run」时同一锚点 now）；ended 可经重算触发复活为 active（契约 07）
+    const hasUnsettledAutoRun = hasUnsettledAutomaticRun(storage.table('runs'), current.id)
+    if (hasUnsettledAutoRun && normalized.trigger.kind === 'every' && normalized.trigger.mode === 'fixed-delay') {
+      // fixed-delay 旧自动 run 未结算：保持 null，旧 run 结算后按新 everySeconds 推进（编辑代际）
+      status = 'active'
+      nextIso = null
+    } else {
+      const nextMs = nextOccurrence(normalized.trigger, nowMs)
+      if (nextMs === null) {
+        // 更新路径的五年无解拒绝（契约 02「cron 子集」；与 create 同一规则）
+        throw inputInvalid(
+          'trigger.expression',
+          'no-occurrence',
+          'cron 表达式在编辑时刻起的 5 年内没有任何有效计划时刻',
+        )
+      }
+      status = 'active'
+      nextIso = iso(nextMs)
+    }
+  }
+  // 其余情形（非调度编辑且 enabled 未变/enabled:true 且原已 active）：状态与计划原样保留
+
+  const updated = {
+    ...current,
+    title: normalized.title,
+    overlap: normalized.overlap,
+    trigger: normalized.trigger,
+    script: normalized.script,
+    judge: normalized.judge,
+    actions: normalized.actions,
+    enabled: normalized.enabled,
+    updatedAt,
+    status,
+    nextOccurrence: nextIso,
+  }
+  await storage.table('orchestrations').put(current.id, updated)
+  safeEmit('script-orchestrator/changed')
+  notifyMutation()
+  return updated
+}
+
+/** 是否存在未结算的旧自动 run（fixed-delay 等待判定；手动 run 不推进序列故不计）。 */
+function hasUnsettledAutomaticRun(runs, id) {
+  for (const [, run] of runs.entries()) {
+    if (run?.orchestrationId === id && run.trigger !== 'manual' && !TERMINAL_RUN_STATUSES.has(run?.status)) {
+      return true
+    }
+  }
+  return false
+}
+
+/** run 终态集合（与 runner/储层同口径）。 */
+const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'])
+
+/** EditInput 形状校验（契约 06）。 */
+function validateEditInput(input) {
+  if (!isPlainObject(input)) throw inputInvalid('input', 'format', 'edit 输入必须是对象')
+  const allowed = new Set(['id', 'action', 'patch', 'expectedUpdatedAt'])
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw inputInvalid(key, 'unexpected', `edit 不接受字段 '${key}'`)
+  }
+  if (!('id' in input)) throw inputInvalid('id', 'missing', 'edit 缺少必填字段 id')
+  if (typeof input.id !== 'string' || input.id.length === 0) {
+    throw inputInvalid('id', 'format', 'id 必须是非空字符串')
+  }
+  if (!('action' in input)) throw inputInvalid('action', 'missing', 'edit 缺少必填字段 action')
+  const action = input.action
+  if (!['update', 'pause', 'resume', 'delete'].includes(action)) {
+    throw inputInvalid('action', 'format', "action 必须是 'update' | 'pause' | 'resume' | 'delete'")
+  }
+  if ('patch' in input && input.patch !== undefined) {
+    if (action !== 'update') {
+      throw inputInvalid('patch', 'unexpected', `patch 仅 action:'update' 接受（当前 '${action}'）`)
+    }
+    if (!isPlainObject(input.patch)) throw inputInvalid('patch', 'format', 'patch 必须是对象')
+    if (Object.keys(input.patch).length === 0) {
+      throw inputInvalid('patch', 'format', 'patch 至少包含一个字段')
+    }
+  } else if (action === 'update') {
+    throw inputInvalid('patch', 'missing', "action:'update' 必须给出 patch")
+  }
+  if (
+    'expectedUpdatedAt' in input &&
+    input.expectedUpdatedAt !== undefined &&
+    input.expectedUpdatedAt !== null &&
+    typeof input.expectedUpdatedAt !== 'string'
+  ) {
+    throw inputInvalid('expectedUpdatedAt', 'format', 'expectedUpdatedAt 必须是 ISO 时间字符串或 null')
+  }
+  return { id: input.id, action, patch: input.patch }
 }
 
 function validateListQuery(query) {
