@@ -2,14 +2,13 @@
 
 ## 沟通语言
 
-与用户沟通一律用简体中文，提问、说明、总结都用中文；代码、命令、路径和报错原文照抄。
+与用户沟通用简体中文；代码、命令、路径和报错保留原文。
 
-## 契约文档
+## 按任务读取
 
-`docs/temp/` 是 v0.1 契约文档集，`docs/temp/README.md` 是索引兼术语表。实现或改契约前，先读索引再读相关契约；改契约的流程见 `docs/temp/10-decisions.md`。
+开始对应任务前，先读以下文档：
 
-## 何时读哪份文档
-
-- **建 spec、建/认领/解决 ticket、wayfinding** → `docs/agents/issue-tracker.md`；议题是 `.scratch/<feature>/` 下的 markdown。
-- **打 triage 标签、写 `Status:`** → `docs/agents/triage-labels.md`。
-- **命名领域概念、记录决定、写 ADR 或术语表** → `docs/agents/domain.md`。
+- **实现或修改契约** → `docs/temp/README.md`（v0.1 契约索引与术语），再按索引读相关契约；实现以契约为准。变更契约时，先按 `docs/temp/10-decisions.md` 的「契约变更流程」更新文档，再改实现。
+- **创建 spec、读取或处理 ticket、wayfinding** → `docs/agents/issue-tracker.md`（本地议题布局、认领与解决流程）。
+- **分诊（triage）** → `docs/agents/triage-labels.md`（分诊角色与标签映射）；ticket 的 `Status:` 与 wayfinding 状态按 `docs/agents/issue-tracker.md`。
+- **探索代码库、命名领域概念、记录决定、编写 ADR 或术语表** → `docs/agents/domain.md`（领域文档读取顺序、术语与决策的事实源）。

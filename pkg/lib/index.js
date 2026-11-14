@@ -1,4 +1,4 @@
-// @local/dsh-script-orchestrator · Host 半侧入口（契约 docs/temp/12-packaging.md）。
+// @echo/dsh-script-orchestrator · Host 半侧入口（契约 docs/temp/12-packaging.md）。
 // 单包双面：`.` 是本文件（Host 实现），`./client` 是预构建 Web client。
 // apply 为 async 生成器：异步初始化由 Fiber 跟踪（失败即 reject，不留半初始化服务
 // 或游离异步任务），yield 的注销器按「停生产者（调度器与工具/桥）→ runner 停机

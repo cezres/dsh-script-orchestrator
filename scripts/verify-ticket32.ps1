@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 $Node = 'C:\Users\cezre\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
 $Pnpm = 'C:\Users\cezre\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pnpm\bin\pnpm.mjs'
 $Dsh = 'C:\Users\cezre\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
-$PkgName = '@local/dsh-script-orchestrator'
+$PkgName = '@echo/dsh-script-orchestrator'
 
 $Sandbox = Join-Path $RepoRoot '.sandbox\s32'
 $SbxHome = Join-Path $Sandbox 'home'

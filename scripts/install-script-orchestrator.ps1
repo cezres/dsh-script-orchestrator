@@ -59,12 +59,12 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $packageDir = Join-Path $repoRoot 'pkg'
-$packageName = '@local/dsh-script-orchestrator'
+$packageName = '@echo/dsh-script-orchestrator'
 $profileDir = Join-Path (Join-Path $DshHome 'profiles') $Profile
 $manifestPath = Join-Path $profileDir 'package.json'
 $lockPath = Join-Path $profileDir 'pnpm-lock.yaml'
 $patchPath = Join-Path $profileDir 'cordis.patch.yml'
-$installedDir = Join-Path $profileDir 'node_modules\@local\dsh-script-orchestrator'
+$installedDir = Join-Path $profileDir 'node_modules\@echo\dsh-script-orchestrator'
 $desiredSpec = 'file:' + ($packageDir -replace '\\', '/')
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 # 影响运行时行为的文件（逐文件哈希比较；文档改动不要求重装）

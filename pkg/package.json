@@ -1,5 +1,5 @@
 {
-  "name": "@local/dsh-script-orchestrator",
+  "name": "@echo/dsh-script-orchestrator",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -14,7 +14,7 @@
     "cordis.patch.yml"
   ],
   "engines": {
-    "dsh": "0.2.2-rc.1"
+    "dsh": "0.2.2-rc.3"
   },
   "scripts": {
     "test": "vitest run"
@@ -33,13 +33,13 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-subprocess-local": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-subprocess-local": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
     "jsdom": "^28.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

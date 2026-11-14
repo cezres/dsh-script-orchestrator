@@ -129,7 +129,7 @@ function viewResult() {
 describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
   it('bundle id 为包名，导出 apply（生成器）+ inject（slots/connection/uiWorkspace）', async () => {
     const { id, exports } = await loadClientBundle()
-    expect(id).toBe('@local/dsh-script-orchestrator')
+    expect(id).toBe('@echo/dsh-script-orchestrator')
     expect(exports.inject).toEqual(['slots', 'connection', 'uiWorkspace'])
     const it = exports.apply({ effect: (fn) => fn(), on: () => () => {}, slots: { inject: () => () => {}, register: () => ({}) } })
     expect(typeof it.next).toBe('function')
@@ -149,6 +149,39 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     const props = main.definition.inject()
     expect(typeof props.call).toBe('function')
     expect(typeof props.subscribeReset).toBe('function')
+  })
+
+  it('sidebar 图标是尺寸自适应 SVG：跟随宿主 16/18 尺寸、继承 currentColor、无字形文本', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    const icon = registrations.find((r) => r.slot === 'sidebar.panellist').registration.component
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    try {
+      await act(async () => {
+        root.render(React.createElement(icon, { size: 16, active: false }))
+      })
+      const svg = container.querySelector('svg')
+      expect(svg).toBeTruthy()
+      expect(svg.getAttribute('width')).toBe('16')
+      expect(svg.getAttribute('height')).toBe('16')
+      expect(svg.getAttribute('viewBox')).toBe('0 0 20 20')
+      expect(svg.getAttribute('aria-hidden')).toBe('true')
+      expect(container.textContent).toBe('')
+      // 全部笔画走 currentColor，宿主明暗/选中态自动生效
+      expect([...svg.querySelectorAll('[stroke]')].every((el) => el.getAttribute('stroke') === 'currentColor')).toBe(true)
+      // 折叠 rail 传 18
+      await act(async () => {
+        root.render(React.createElement(icon, { size: 18, active: true }))
+      })
+      expect(container.querySelector('svg').getAttribute('width')).toBe('18')
+    } finally {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    }
   })
 
   it('面板三态：加载中 → 空列表（Host 权威数据）', async () => {

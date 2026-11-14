@@ -1,4 +1,4 @@
-// @local/dsh-script-orchestrator · Web client（简化档：手写 lazy-CJS，零构建步骤）。
+// @echo/dsh-script-orchestrator · Web client（简化档：手写 lazy-CJS，零构建步骤）。
 // 协议：window.__ModuleLoader__.load({ id, factory })，factory 内建 module/exports、
 // require("react") 取页面 seed 的 React；导出 apply（生成器，yield 注销器）+ inject。
 // 数据源：ctx.connection.rpc.call('/script-orchestrator', endpoint, payload)（契约
@@ -7,7 +7,7 @@
 // 注入引导 prompt，由模型经 script_create / script_edit 工具完成配置；面板自身只做管理与排障
 //（高密度表格 + 居中模态详情），不引入独立配置表单。
 window.__ModuleLoader__.load({
-	id: "@local/dsh-script-orchestrator",
+	id: "@echo/dsh-script-orchestrator",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
@@ -477,8 +477,33 @@ window.__ModuleLoader__.load({
 						spill.value.content || "（空输出）")));
 		}
 
-		function PanelIcon() {
-			return h("span", { style: { fontWeight: 700 } }, "编");
+		// 侧边栏面板图标：20×20 线稿，currentColor 继承宿主明暗主题与选中态；
+		// 宿主按「展开 16 / 收起 rail 18」传入 size，故按尺寸自适应而非固定字号。
+		// 造型 = 终端窗口 + `>_` 提示符：一眼表达「脚本执行」，与相邻的插件库/自动化任务区分。
+		function PanelIcon({ size = 18 } = {}) {
+			return h("svg", {
+				width: size,
+				height: size,
+				viewBox: "0 0 20 20",
+				fill: "none",
+				"aria-hidden": true,
+				focusable: "false",
+				style: { display: "block" },
+			},
+				h("rect", {
+					x: 1.9, y: 2.9, width: 16.2, height: 14.2, rx: 3.2,
+					stroke: "currentColor", strokeWidth: 1.7,
+				}),
+				h("path", {
+					d: "M5.9 7.4 L8.9 10 L5.9 12.6",
+					stroke: "currentColor", strokeWidth: 1.7,
+					strokeLinecap: "round", strokeLinejoin: "round",
+				}),
+				h("path", {
+					d: "M10.6 12.6 H14.1",
+					stroke: "currentColor", strokeWidth: 1.7,
+					strokeLinecap: "round",
+				}));
 		}
 
 		// ---------------- 插件面 ----------------
