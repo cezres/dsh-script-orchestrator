@@ -253,6 +253,19 @@ const runParameters = {
   },
 }
 
+// script_report（契约 07，v0.1y）：限制与脚本标记行一致（长度/条数由服务层兜底）
+const reportParameters = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['runId', 'summary'],
+  properties: {
+    runId: { type: 'string', description: '执行记录 id（session 动作首条消息 banner 的 JSON 块里有 runId）' },
+    summary: { type: 'string', description: '执行结果一句话（trim 后 1–300 字符，由服务校验）' },
+    level: { type: 'string', enum: ['info', 'warn', 'error'], description: "默认 'info'" },
+    fields: { type: 'object', description: '明细键值对 string→string（≤ 8 项，键值长度与值类型由服务校验）' },
+  },
+}
+
 // ---------------- output schema（oneOf：成功形状 + 每个契约错误形状，分支互斥） ----------------
 
 /** OrchestrationView 顶层不变量（深层配置对象不做形状重复，事实源在服务层）。 */
@@ -385,6 +398,7 @@ const runOutputSchema = {
         matchedRule: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
         usedFallback: { type: 'boolean' },
         actions: { type: 'array', items: { type: 'object' } },
+        result: { type: 'object', description: '脚本标记行 / 会话上报的结果（v0.1y；深层形状由服务层保证）' },
       },
     },
     {
@@ -400,8 +414,28 @@ const runOutputSchema = {
   ],
 }
 
+const reportOutputSchema = {
+  oneOf: [
+    {
+      // 成功 → { runId, orchestrationId, status, result }（result 深层形状由服务层事实源保证）
+      type: 'object',
+      additionalProperties: false,
+      required: ['runId', 'orchestrationId', 'status', 'result'],
+      properties: {
+        runId: stringSchema,
+        orchestrationId: stringSchema,
+        status: stringSchema,
+        result: { type: 'object' },
+      },
+    },
+    errorBranch('script_unknown'),
+    errorBranch('script_input_invalid'),
+    errorBranch('internal_error'),
+  ],
+}
+
 /**
- * 建五个工具定义（供 registerTools 与测试直接消费）。
+ * 建六个工具定义（供 registerTools 与测试直接消费）。
  * @param {object} deps
  * @param {object} deps.service 管理服务（ctx.scriptOrchestrator 实现面）
  * @param {object} [deps.logger] 内部日志
@@ -485,6 +519,22 @@ export function createToolDefinitions({ service, logger }) {
           }
           if (!signal) return await service.waitRun(accepted.runId, args.id)
           return await waitRunWithAbortWatch(service, accepted.runId, args.id, signal)
+        },
+      }),
+    },
+    {
+      name: 'script_report',
+      description:
+        '把执行结果上报回脚本编排的执行记录（供编排详情优先展示）。脚本调起的会话在完成工作后调用：runId 取 session 动作首条消息 banner JSON 块中的 runId；summary 一句话结论（1–300 字符）；level 可选 info/warn/error（默认 info）；fields 可选明细键值对（≤ 8 项）。每条执行记录最多 10 条上报。返回 { runId, orchestrationId, status, result }。',
+      parameters: reportParameters,
+      output: { schema: reportOutputSchema, render },
+      execute: wrapExecute({
+        name: 'script_report',
+        parameters: reportParameters,
+        logger,
+        invoke: (args, exec) => {
+          const actorSessionId = typeof exec?.agent?.session === 'string' ? exec.agent.session : undefined
+          return service.reportRunResult(args, actorSessionId)
         },
       }),
     },

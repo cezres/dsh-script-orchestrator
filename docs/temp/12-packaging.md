@@ -18,7 +18,7 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib", "cordis.patch.yml"],
+  "files": ["lib", "skills", "cordis.patch.yml"],
   "engines": { "dsh": "0.2.2-rc.3" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
@@ -30,7 +30,7 @@
 - `.` 是 Host 入口：具名 `Config` 对象插件（同步 Standard Schema）+ 生成器 `apply`（`yield` 注销器）；`inject` 按实际消费的宿主服务申报（subprocess、storageDomain、tools、events 等，实现期定全量）；所有异步清理走 Fiber/Effect 生命周期跟踪，不遗留游离任务。
 - `./client` 是预构建 client factory（简化档手写 lazy-CJS，零构建步骤；面板蓝图见 [11-web-panel](11-web-panel.md) 与 16 号原型）。
 - `engines.dsh` **精确锁**当前验证过的宿主版本（v0.1t 起为 `0.2.2-rc.3`，此前为 `0.2.2-rc.1`）：基线只有这一个验证过的版本，写范围（`^`/`>=`）等于承诺未验证的兼容性；宿主 engines 不匹配拒装正是期望行为。宿主小版本升级时先核对 `docs/upgrade-guide` 是否触及本插件消费的公开面，再把精确锁挪到新版本并重装。
-- `files: ['lib', 'cordis.patch.yml']`：交付物 = 预构建 JS（简化档源码即产物）；构建方式不进契约，需要 JSX/chunks 时再攻 tsdown 常规档，届时只改构建脚本不动包形状。
+- `files: ['lib', 'skills', 'cordis.patch.yml']`：交付物 = 预构建 JS（简化档源码即产物）+ 内置 SKILL 文本。Host 明确依赖 `skills` 服务，通过 `skills.register` 注册并在卸载时注销；缺失技能资源必须在初始化阶段明确失败。打包验收覆盖资源可读与注册生命周期。构建方式不进契约，需要 JSX/chunks 时再采用常规构建。
 
 ## 依赖纪律
 
@@ -48,7 +48,8 @@
 | `link:` | 日常开发（源编辑 + HMR 直达、免重装） | 符号链接指向工作区；须自行保证产物最新 |
 
 - 两形态切换需清 `node_modules`（`CI=true` + `--no-frozen-lockfile`）。
-- **一律隔离 `DSH_HOME` + 独立 profile 名（`desktop` 被宿主独占）+ 无头 `dsh web --no-open` 验证**；绝不修改真实 `~/.dsh`。
+- 开发与破坏性安装/卸载验收默认隔离 `DSH_HOME` + 独立 profile；不要为验证当前 GUI 启动替代服务器。未经授权不得修改当前 profile。
+- v0.1u：用户明确授权验收通过后更新当前 profile 时，先 `plugin_manager` 列出精确包标识，再用其正式安装入口更新；不手工修改真实 profile 文件。升级可能重载插件、影响在途 run，执行前说明影响；需要重启时先告知用户。不把安装授权扩展为试运行或启用编排授权。
 
 ## 验收清单
 

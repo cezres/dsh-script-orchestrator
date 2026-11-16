@@ -13,6 +13,7 @@
 import { evaluateJudge } from './judge.js'
 import { dispatchActions, aggregateRunStatus } from './actions.js'
 import { isWithin, tailText } from './execution-utils.js'
+import { parseScriptResult } from './result-marker.js'
 
 export const TERMINAL_STATUSES = new Set(['succeeded', 'partial', 'failed', 'skipped', 'canceled', 'interrupted'])
 /** 正常退出后存活后代的有界等待上限（契约 03 常量，不进配置）。 */
@@ -52,9 +53,25 @@ function emptyScript(command, over = {}) {
 /**
  * run-settled 载荷（契约 06 RunSettled）：发布前构造全新对象；超 64 KiB 时对
  * stdoutTail/stderrTail 依次减半保留末尾（按 code point 切割，不产生半个代理对）。
- * 脚本阶段 warnings 不进事件载荷（契约 03/06）。
+ * 脚本阶段 warnings 不进事件载荷（契约 03/06）。result 只带结算时刻的脚本侧
+ * 结果（summary/level/fields，v0.1y）；reports 与其后的追加不进事件（view 为准）。
  */
+function scriptResultEventPayload(result) {
+  if (result?.summary === undefined) {
+    return undefined
+  }
+  const payload = { summary: result.summary }
+  if (result.level !== undefined) {
+    payload.level = result.level
+  }
+  if (result.fields !== undefined) {
+    payload.fields = result.fields
+  }
+  return payload
+}
+
 export function buildSettledPayload(run) {
+  const resultPayload = scriptResultEventPayload(run.result)
   const payload = {
     runId: run.runId,
     orchestrationId: run.orchestrationId,
@@ -77,6 +94,7 @@ export function buildSettledPayload(run) {
     matchedRule: run.matchedRule ?? null,
     usedFallback: run.usedFallback === true,
     actions: (run.actions ?? []).map((action) => ({ name: action.name, kind: action.kind, status: action.status })),
+    ...(resultPayload !== undefined ? { result: resultPayload } : {}),
   }
   const size = () => Buffer.byteLength(JSON.stringify(payload), 'utf8')
   for (const field of ['stdoutTail', 'stderrTail']) {
@@ -561,6 +579,12 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
       }
       warnings.push('descendants-terminated')
     }
+    // 结果上报标记行（契约 03「结果上报」，v0.1y）：解析源与 stdoutTail 同源；
+    // 非法标记只记 warnings 不影响 run 状态；合法结果随结算写落库。
+    const marker = parseScriptResult(stdout.text ?? '')
+    if (marker.invalidMarker) {
+      warnings.push('result-marker-invalid')
+    }
     const scriptResult = {
       command: script.command,
       exitCode: facts.exitCode ?? null,
@@ -584,6 +608,7 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
         stdoutTruncated: stdout.lossy === true,
         stderrTruncated: stderr.lossy === true,
       },
+      ...(marker.present && marker.result !== null ? { result: marker.result } : {}),
     }
   }
 
@@ -614,6 +639,15 @@ export function createRunner({ storage, queue, subprocess, config, emit, now, lo
         run.usedFallback = outcome.verdict.usedFallback
         run.actions = outcome.actionResults
         run.status = outcome.dispatchCanceled ? 'canceled' : aggregateRunStatus(outcome.actionResults)
+      }
+
+      // 结果上报（v0.1y）：脚本标记行结果 merge 进 run.result；在途期间经
+      // reportRunResult 写入的 reports 保序保留（契约 08「结果上报写」）。
+      if (outcome.kind === 'script' && (persisted.result !== undefined || outcome.result !== undefined)) {
+        run.result = { ...(persisted.result ?? {}), ...(outcome.result ?? {}) }
+        if (persisted.result?.reports !== undefined) {
+          run.result.reports = persisted.result.reports
+        }
       }
 
       await storage.table('runs').put(runId, structuredCloneSafe(run))

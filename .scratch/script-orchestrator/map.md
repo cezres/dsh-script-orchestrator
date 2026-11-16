@@ -42,6 +42,7 @@ Labels: wayfinder:map
 - [设计 Web 管理面板交互原型](issues/12-web-panel-prototype.md)：胜选 = 高密度表格（C）+ 居中模态详情 + **对话式创建/编辑**（`uiWorkspace.startSession` + 引导 prompt，模型经 `script_*` 工具配置；面板只管管理与排障，首版无独立表单）；macOS 提示不进面板。契约 v0.1o；原型留 proto/web-panel 分支。
 - [最小宿主集成实验（会话创建到回收闭环）](issues/23-session-integration-prototype.md)：两条创建路径全链实证；UserMessage 内联构造定案（import 不可行，#6 结案）；`whenIdle` 挂 agent；已 dispose 会话再投递实证抛错；**`flush===true` 收窄为投递管线接受**（死路由场景日志仅 header，不证明消息落盘）——契约 v0.1p 修订。原型留 proto/session-integration 分支。
 - [确认实施模块与验收方案](issues/13-implementation-spec.md)：spec.md 落盘并完成复审；七模块、八步实施与三层矩阵不变，补齐执行生命周期、安全边界、工具/面板 abort 及关键动作事件验收；事实源陈旧表述按 v0.1q 修正。待验证 #4 声明性结案（编号 #1–#7 全清），**Destination 维持达成**，前沿清零、雾区已空。
+- [优化详情页执行记录展示](issues/37-run-history-display.md)：恒定 `view runs:50` 取回 + 纯本地默认 3 条折叠/展开、≥50 条如实标注；run 卡片直观化（状态彩色徽章、相对时间、人性化耗时、非零退出码错误色、runId 尾 4 位、stderr 直展）。契约 v0.1x。
 
 ## Not yet specified
 

@@ -119,6 +119,27 @@ const runActionSchema = z
   })
   .strict()
 
+// 结果上报（契约 01「result」/03「结果上报」，v0.1y）：可选字段，缺省即未上报。
+// 长度/条数上限由写入层（validateResultShape / reportRunResult）保证，schema 只约束形状。
+const runReportSchema = z
+  .object({
+    at: z.string(),
+    sessionId: z.string().optional(),
+    summary: z.string().min(1),
+    level: z.enum(['info', 'warn', 'error']).optional(),
+    fields: z.record(z.string(), z.string()).optional(),
+  })
+  .strict()
+
+const runResultSchema = z
+  .object({
+    summary: z.string().min(1).optional(),
+    level: z.enum(['info', 'warn', 'error']).optional(),
+    fields: z.record(z.string(), z.string()).optional(),
+    reports: z.array(runReportSchema).optional(),
+  })
+  .strict()
+
 const runSchema = z
   .object({
     runId: z.string().regex(/^run-[0-9a-f]{8}$/),
@@ -144,6 +165,7 @@ const runSchema = z
     matchedRule: z.number().int().nullable(),
     usedFallback: z.boolean(),
     actions: z.array(runActionSchema),
+    result: runResultSchema.optional(),
   })
   .strict()
 

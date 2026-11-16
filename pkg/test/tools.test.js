@@ -92,7 +92,14 @@ const baseInput = () => ({
 describe('createToolDefinitions（契约 docs/temp/07-tools.md 适配层约定）', () => {
   it('产出 script_create / script_list / script_view / script_edit / script_run 五个定义', () => {
     const { definitions } = makeTools()
-    expect(definitions.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view', 'script_edit', 'script_run'])
+    expect(definitions.map((d) => d.name)).toEqual([
+      'script_create',
+      'script_list',
+      'script_view',
+      'script_edit',
+      'script_run',
+      'script_report',
+    ])
     for (const definition of definitions) {
       expect(typeof definition.description).toBe('string')
       expect(definition.description.length).toBeGreaterThan(10)

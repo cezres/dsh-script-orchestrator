@@ -1,6 +1,6 @@
 # 07 · 工具契约（模型侧）
 
-五个工具，前缀 `script_`，与既有 `schedule_*`（prompt 投递）互不重叠。全部返回单块 JSON 文本；失败返回 `{ "code", "message", "details"? }`。
+六个工具，前缀 `script_`，与既有 `schedule_*`（prompt 投递）互不重叠。全部返回单块 JSON 文本；失败返回 `{ "code", "message", "details"? }`。
 
 ## 分层总则
 
@@ -18,6 +18,7 @@
 | `script_list` | 分页列出 | `script_input_invalid` |
 | `script_view` | 单条详情 + 最近执行 | `script_unknown` |
 | `script_run` | 立即执行一次 | `script_unknown`、`script_conflict` |
+| `script_report` | 会话向执行记录上报结果（v0.1y） | `script_unknown`、`script_input_invalid` |
 | `script_edit` | 更新 / 暂停 / 恢复 / 删除 | `script_unknown`、`script_conflict`、`script_input_invalid` |
 
 ## script_create
@@ -66,6 +67,19 @@
 
 不改变下次自动触发时刻，`trigger = "manual"`；`fixed-delay` 只由自动 run 的终态推进。
 
+## script_report
+
+脚本调起的 AI 会话用它把**执行结果**写回 run 记录（v0.1y）；编排详情的执行记录会优先展示这些信息。参数：
+
+```jsonc
+{ "runId": "run-7f3c1a9e", "summary": "已归档 12 个文件到 3 个目录", "level": "info", "fields": { "文档": "8", "图片": "4" } }
+```
+
+- `runId` 从 session 动作首条消息 banner 的 JSON 块读取（`framing: "banner"` 时）；`summary` 必填（trim 后 1–300 code point）；`level` 可选（`'info' | 'warn' | 'error'`，默认 `'info'`）；`fields` 可选（≤ 8 项 string→string，键 1–40、值 1–100 code point）。限制与脚本标记行一致（见 [03-execution](03-execution.md)「结果上报」）。
+- run 任意状态（含在途）可上报；每 run 上限 **10 条**，超出返回 `script_input_invalid`（`details: { field: "report", reason: "limit" }`）——后续结果放进最终答复即可。`runId` 不存在（含已被裁剪删除）→ `script_unknown`。
+- `sessionId` 自动取调用会话（`exec.agent?.session`），无需也不接受传入。
+- 成功返回 `{ "runId", "orchestrationId", "status", "result" }`（`result` 为该 run 当前完整结果对象，含脚本侧标记行与全部 `reports`）。写入走服务 FIFO，落库后发 `script-orchestrator/changed`。
+
 ## script_edit
 
 参数：
@@ -98,9 +112,9 @@
 
 ## 适配层约定（实现者）
 
-- **严格参数校验**：五工具均以原始 `ctx.tools.register` 注册，`parameters` 为严格 JSON Schema（根 `additionalProperties: false`），在 `execute` 内用 `validateJsonSchemaValue` 自行校验并全部映射为 `script_input_invalid` JSON：多余字段 `reason: "unexpected"`、缺失 `missing`、越界 `range`、类型/语法 `format`，均带准确 `field`。不使用 `defineTool` 简写（其 schema 违规会抛宿主 `INVALID_ARGS`，破坏单一错误面）。
+- **严格参数校验**：六工具均以原始 `ctx.tools.register` 注册，`parameters` 为严格 JSON Schema（根 `additionalProperties: false`），在 `execute` 内用 `validateJsonSchemaValue` 自行校验并全部映射为 `script_input_invalid` JSON：多余字段 `reason: "unexpected"`、缺失 `missing`、越界 `range`、类型/语法 `format`，均带准确 `field`。不使用 `defineTool` 简写（其 schema 违规会抛宿主 `INVALID_ARGS`，破坏单一错误面）。服务层语义兜底（长度、条数上限等宿主 schema 子集表达不了的约束）同样映射 `script_input_invalid`（`reason: "format" | "limit"`）。
 - **统一 render**：`execute` 返回 JSON **值**（不是字符串）；`output.render` 一律返回单块 `JSON.stringify(value)` 文本。
-- **output schema**：用 `oneOf` 联合「成功形状 + 每个契约错误形状」，各分支以 `required` + `const code` + `additionalProperties: false` 保持互斥。
+- **output schema**：用 `oneOf` 联合「成功形状 + 每个契约错误形状」，各分支以 `required` + `const code` + `additionalProperties: false` 保持互斥。RunView 成功分支顶层字段逐一枚举且 `additionalProperties: false`：01-domain-model 给 RunView **新增可选字段**（如 `result`）时必须同步补进该枚举，否则宿主输出校验直接拒绝工具返回。
 - **错误分层**：已知业务失败返回 `{ "code", "message", "details"? }` 值；未分类异常映射 `internal_error` 值并记内部日志；实现自身的 output schema 写错让宿主 `ToolOutputError` 暴露，不吞成业务结果。
 - **abort**：不定义 `script_aborted`；宿主以 `ABORTED` / `ABORTED_BEFORE_DISPATCH` 规范结果取代成功值，`exec.signal` 贯穿到执行层（详见 [03-execution](03-execution.md)）。
 

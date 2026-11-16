@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   本插件是单包双面（Host + Web client）、简化档零构建：`pkg/lib/` 与
-  `pkg/cordis.patch.yml` 即交付物，无需 `pnpm build`。脚本流程：
+  `pkg/skills/` 与 `pkg/cordis.patch.yml` 即交付物，无需 `pnpm build`。脚本流程：
 
     1. 预检仓库包（pkg/package.json、lib/index.js、lib/client.js、cordis.patch.yml）；
     2. 解析本机 DSH 自带的 node/pnpm（DSH_HOME\dsh-runtimes，缺失时回退 PATH）；
@@ -68,13 +68,14 @@ $installedDir = Join-Path $profileDir 'node_modules\@echo\dsh-script-orchestrato
 $desiredSpec = 'file:' + ($packageDir -replace '\\', '/')
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 # 影响运行时行为的文件（逐文件哈希比较；文档改动不要求重装）
-$runtimeFileList = @('cordis.patch.yml', 'package.json')
+$runtimeFileList = @('cordis.patch.yml', 'package.json', 'skills\script-orchestrator\SKILL.md')
 # 简化档零构建：这些文件必须存在（pkg/lib 即产物）
 $requiredArtifacts = @(
   'package.json',
   'cordis.patch.yml',
   'lib\index.js',
-  'lib\client.js'
+  'lib\client.js',
+  'skills\script-orchestrator\SKILL.md'
 )
 
 function Write-Step([string]$Message) {

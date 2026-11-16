@@ -15,6 +15,7 @@ import { registerTools } from './tools.js'
 import { createActionRegistry } from './actions.js'
 import { createEphemeralRegistry } from './ephemeral-lifecycle.js'
 import { createRetentionPolicy } from './retention.js'
+import { loadSkill } from './skills.js'
 import { promises as nodeFs } from 'node:fs'
 
 export const name = 'script-orchestrator'
@@ -24,6 +25,7 @@ export const inject = [
   'connection',
   'webServer',
   'tools',
+  'skills',
   'subprocess',
   'sessionController',
   'sessions',
@@ -32,6 +34,7 @@ export const inject = [
 ]
 
 export async function* apply(ctx, config) {
+  const skill = await loadSkill()
   const logger = ctx.logger('script-orchestrator')
   // 契约 03「安全边界」：allowedRoots 为空 = 不限制，首次激活记一条警告（每次应用仅一条）
   if ((config.allowedRoots ?? []).length === 0) {
@@ -116,6 +119,18 @@ export async function* apply(ctx, config) {
   })
   // 工具：profile 根作用域各注册一次（契约 07；票 25 交付 create/list/view）
   const disposeTools = registerTools({ tools: ctx.tools, service, logger })
+  let disposeSkill
+  try {
+    disposeSkill = ctx.skills.register(skill)
+  } catch (error) {
+    // 注册发生在 storage 打开之后、scheduler 启动之前；失败时主动撤销已建资源。
+    disposeTools()
+    await runner.shutdown()
+    await ephemeralRegistry.disposeAll()
+    await queue.close()
+    await storage.close()
+    throw error
+  }
   // 桥挂载为独立 channel 的 prefix 路由（rpc.handle 在 0.2.2-rc.1 对第三方不可用，
   // 见 lib/bridge.js mountBridge 注释；浏览器侧契约面不变）
   const disposeBridge = mountBridge({
@@ -133,6 +148,7 @@ export async function* apply(ctx, config) {
     // owner-fiber teardown 兜底之下显式收口，保证顺序可测），最后排干队列、关域
     //（契约 08「关闭」）
     scheduler.stop()
+    disposeSkill()
     disposeTools()
     disposeBridge()
     await runner.shutdown()

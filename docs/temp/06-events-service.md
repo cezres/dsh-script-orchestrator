@@ -9,7 +9,7 @@
 | `script-orchestrator/run-started` | run 领取到执行槽、脚本即将启动 | `{ runId, orchestrationId, trigger, scheduledAt, startedAt }` |
 | `script-orchestrator/run-settled` | run 进入任一终态（含 `interrupted`） | 见下方 `RunSettled` |
 | `script-orchestrator/action-settled` | 单个动作结算 | `{ runId, orchestrationId, name, kind, status, error? }` |
-| `script-orchestrator/changed` | 编排集合发生持久变更（增删改、暂停恢复） | 无载荷 |
+| `script-orchestrator/changed` | 编排或执行记录发生持久变更（编排增删改、暂停恢复；执行记录的结果上报写入，v0.1y） | 无载荷 |
 
 `RunSettled`：
 
@@ -24,6 +24,7 @@
 | `matchedRule` | number \| null | 命中下标 |
 | `usedFallback` | boolean | 是否走 fallback |
 | `actions` | array | `{ name, kind, status }[]`，不含错误细节（细节在 `view` 里） |
+| `result` | object \| 缺省 | 结算时刻的脚本侧结果上报 `{ summary, level?, fields? }`（v0.1y）；`reports` 与 `run-settled` 之后追加的更新不进事件，以 `view()` 为准 |
 
 ### 分发与异常隔离
 
@@ -73,9 +74,18 @@ interface ScriptOrchestratorService {
   view(id: string, options?: { runs?: number }): Promise<OrchestrationView & { runs: RunView[] }>
   edit(input: EditInput, actorSessionId?: SessionId, signal?: AbortSignal): Promise<OrchestrationView | DeleteResult>
   run(id: string, signal?: AbortSignal): Promise<RunView>
+  reportRunResult(input: ReportInput, actorSessionId?: SessionId): Promise<ReportResult>   // v0.1y
   listActions(): Array<{ name: string; description?: string }>
   registerAction(definition: OrchestratorAction): () => void
 }
+
+interface ReportInput {                                              // 限制同脚本标记行（03「结果上报」）
+  runId: string
+  summary: string                                                   // trim 后 1–300 code point
+  level?: 'info' | 'warn' | 'error'
+  fields?: Record<string, string>                                   // ≤ 8 项，键 1–40、值 1–100 code point
+}
+interface ReportResult { runId: string; orchestrationId: string; status: RunStatus; result: RunResult }
 
 interface ListQuery { active?: boolean; limit?: number; offset?: number }   // limit 1–500，默认 100；active: true → status === 'active'，false → paused/ended，省略 → 全部
 interface ListResult { items: OrchestrationView[]; total: number; nextOffset: number | null }  // nextOffset = offset + items.length，取尽为 null
@@ -95,6 +105,7 @@ interface DeleteResult { id: string; removedRuns: number }   // removedRuns 含�
 | `view` | 单条详情 + 最近 `runs`（默认 5，最多 50）条执行记录 |
 | `edit` | 四种管理动作（与 `script_edit` 同一契约，见 [07-tools](07-tools.md)）：`update` 更新字段，仅调度字段修改时按 [02-triggers](02-triggers.md) 重建下次触发，非调度编辑不改变它，不限编排状态；`pause`/`resume` 按状态设置语义（幂等 no-op 规则见 [09](09-states-errors.md)）；`delete` 取消未终态 run 后同批删除全部记录 |
 | `run` | 立即执行一次：`trigger = 'manual'`，不改变下次自动触发；`paused`/`ended` 编排均允许，拒绝仅 id 不存在；共用排队体系但不被 `overlap: 'skip'` 淘汰（见 [03-execution](03-execution.md)）；`signal` abort 转为该 run 的取消请求，等结算 `canceled` 持久化后才静止 |
+| `reportRunResult` | 向执行记录追加会话侧结果上报（v0.1y）：`runId` 不存在或已被裁剪删除 → `script_unknown`；内容越限 → `script_input_invalid`（`reason: format`）；每 run 上限 **10 条**，超出 → `script_input_invalid`（`reason: limit`）。run 任意状态（含在途）可上报；写入仅 merge `run.result.reports`（追加 `{ at, sessionId?, summary, level?, fields? }`，`sessionId` 取 `actorSessionId`），不动其余字段；结算时保留已写入的 reports。写入走服务 FIFO 单槽，落库后发 `changed`；返回 `{ runId, orchestrationId, status, result }`。脚本侧标记行结果见 [03-execution](03-execution.md) |
 | `listActions` | 返回当前注册动作表快照 `{ name, description? }[]`（按 `name` 排序）；仅供展示与拼写核对，执行期逐动作查表语义不变 |
 | `registerAction` | 注册一个可被 `plugin` 动作调用的具名动作；返回 disposer |
 

@@ -79,7 +79,22 @@ const out = handle.collected.stdout?.readFrom(0)
 - 字节截断若切断多字节字符，解码产生的 U+FFFD 替换字符如实保留并计入 2048。
 - **`truncated` 的判定就是 `lossy`（按流）**：溢写文件存在不改变 `truncated: true`——全量可用性由 spill 字段另行表达。
 - 溢写配置：插件配置 `maxSpillBytes`，默认 **8388608（8 MiB）/流**，stdout 与 stderr 各自独立；`0` 禁用溢写。溢写文件由子进程服务落在系统 temp，插件在**裁剪 run 或级联删除 run 时 best-effort `unlink`**；不做启动扫描，崩溃残留交给 OS temp 清理；UI 读取 spill 失败时显示「文件已不存在」。
-- `run.script.warnings?: string[]`（沿用 actions 的 warnings 纪律：确定性文案、保最近 20 条）：脚本阶段非致命事实排障信息（目前仅 `descendants-terminated`）；**只进 run 记录与 UI，不进判定谓词、不进事件载荷**。
+- `run.script.warnings?: string[]`（沿用 actions 的 warnings 纪律：确定性文案、保最近 20 条）：脚本阶段非致命事实排障信息（`descendants-terminated`、`result-marker-invalid`）；**只进 run 记录与 UI，不进判定谓词、不进事件载荷**。
+
+## 结果上报（标记行，v0.1y）
+
+脚本可以用一行标记向执行记录回报**人类可读的执行结果**，UI 在 run 卡片中优先展示：
+
+```
+##SCRIPT-RESULT## {"summary":"清理了 3 个重复文件","level":"info","fields":{"扫描":"42","回收":"3"}}
+```
+
+- **格式**：单个 stdout 行 = 前缀 `##SCRIPT-RESULT## `（含尾随空格）+ 单行 JSON 对象。字段：`summary`（必填，trim 后 1–300 个 code point）；`level`（可选，`'info' | 'warn' | 'error'`，缺省 `'info'`）；`fields`（可选，≤ 8 项 string→string，键 1–40、值 1–100 个 code point）。
+- **解析**：结算时从 stdout **收集文本**（`readFrom(0).text`，与 `stdoutTail` 同源）逐行扫描；多条标记行时取**最后一条可解析且合法**的；标记行在输出中的位置不限（建议靠近末尾）。stderr 不参与。
+- **失败即忽略**：标记行非法 JSON、非对象、`summary` 缺失/空/超长、`level` 非法、`fields` 超限——该行忽略并在 `run.script.warnings` 追加一条 `result-marker-invalid`，**不影响 run 状态、判定与动作**；同一次输出里此前的合法标记行仍有效（取末条合法者的语义）。
+- **溢写边界**：解析只看内存收集文本；输出超出 `maxOutputBytes` 且标记行只剩在溢写文件中时解析不到，视为未上报（spill 排障读面仍可看全量）。
+- **落库**：合法解析写入 `run.result` 的 `summary`/`level`/`fields`（见 [01-domain-model](01-domain-model.md)）；会话侧可经 `script_report` 工具继续追加 `reports`（见 [07-tools](07-tools.md)）；两者合并不互相覆盖。
+- 判定谓词、模板变量与事件 `script` 块**不包含**标记行的任何特殊处理——标记行只是 stdout 文本的一部分。
 
 ## 并发与单飞
 

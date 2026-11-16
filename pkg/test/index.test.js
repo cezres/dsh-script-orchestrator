@@ -8,6 +8,7 @@ function makeCtx({ domain } = {}) {
     provided: [],
     routes: [],
     tools: [],
+    skills: [],
     closeOrder: [],
     logs: [],
     emitted: [],
@@ -139,6 +140,12 @@ function makeCtx({ domain } = {}) {
         return () => calls.closeOrder.push('bridge')
       },
     },
+    skills: {
+      register: (definition) => {
+        calls.skills.push(definition)
+        return () => calls.closeOrder.push(`skill:${definition.name}`)
+      },
+    },
     tools: {
       register: (definition) => {
         calls.tools.push(definition)
@@ -182,7 +189,7 @@ describe('插件入口（lib/index.js）', () => {
     expect(typeof plugin).toBe('function')
     expect(Config).toBe(RawConfig)
     expect([...inject]).toEqual([
-      'storageDomain', 'connection', 'webServer', 'tools', 'subprocess',
+      'storageDomain', 'connection', 'webServer', 'tools', 'skills', 'subprocess',
       'sessionController', 'sessions', 'agents', 'agentDefaultModel',
     ])
     expect(name).toBe('script-orchestrator')
@@ -198,7 +205,17 @@ describe('插件入口（lib/index.js）', () => {
     expect(calls.routes).toHaveLength(1)
     expect(calls.routes[0].kind).toBe('prefix')
     expect(calls.routes[0].path).toBe('/script-orchestrator')
-    expect(calls.tools.map((d) => d.name)).toEqual(['script_create', 'script_list', 'script_view', 'script_edit', 'script_run'])
+    expect(calls.tools.map((d) => d.name)).toEqual([
+      'script_create',
+      'script_list',
+      'script_view',
+      'script_edit',
+      'script_run',
+      'script_report',
+    ])
+    expect(calls.skills).toHaveLength(1)
+    expect(calls.skills[0]).toMatchObject({ name: 'script-orchestrator', source: 'bundled', invocation: { userInvocable: true, modelInvocable: true } })
+    expect(calls.skills[0].content).toContain('script_conflict')
     const service = calls.provided[0][1]
     await expect(service.list()).resolves.toEqual({ items: [], total: 0, nextOffset: null })
     const rpc = await callRoute(
@@ -697,6 +714,8 @@ describe('插件入口（lib/index.js）', () => {
     const first = await it.next()
     await first.value()
     expect(calls.closeOrder).toEqual([
+      'skill:script-orchestrator',
+      'tool:script_report',
       'tool:script_run',
       'tool:script_edit',
       'tool:script_view',
@@ -704,6 +723,18 @@ describe('插件入口（lib/index.js）', () => {
       'tool:script_create',
       'bridge',
       'domain',
+    ])
+  })
+
+  it('技能注册失败：撤销已注册工具并关闭存储，不提供服务或挂桥', async () => {
+    const { ctx, calls } = makeCtx()
+    ctx.skills.register = () => { throw new Error('skill registration failed') }
+    await expect(plugin(ctx, {}).next()).rejects.toThrow('skill registration failed')
+    expect(calls.provided).toEqual([])
+    expect(calls.routes).toEqual([])
+    expect(calls.closeOrder).toEqual([
+      'tool:script_report', 'tool:script_run', 'tool:script_edit', 'tool:script_view',
+      'tool:script_list', 'tool:script_create', 'domain',
     ])
   })
 
@@ -728,7 +759,7 @@ describe('插件入口（lib/index.js）', () => {
     // 存储域关闭是最后一步（排干队列与 runner 停机在它之前；域名 close 由 fake 记录）
     expect(calls.closeOrder[calls.closeOrder.length - 1]).toBe('domain')
     expect(calls.closeOrder.filter((entry) => entry === 'bridge')).toHaveLength(1)
-    expect(calls.closeOrder.filter((entry) => entry.startsWith('tool:'))).toHaveLength(5)
+    expect(calls.closeOrder.filter((entry) => entry.startsWith('tool:'))).toHaveLength(6)
     const domainIndex = calls.closeOrder.indexOf('domain')
     expect(calls.closeOrder.indexOf('bridge')).toBeLessThan(domainIndex)
     for (const entry of calls.closeOrder.filter((item) => item.startsWith('tool:'))) {

@@ -9,6 +9,7 @@ import { OrchestratorError, inputInvalid, isPlainObject } from './errors.js'
 import { validateOrchestrationInput } from './validation.js'
 import { nextOccurrence } from './triggers.js'
 import { createActionRegistry } from './actions.js'
+import { validateResultShape, RESULT_LIMITS } from './result-marker.js'
 
 /** 键排序的稳定 JSON（调度字段变化的深比较；配置对象均为可序列化 JSON 值）。 */
 function stableStringify(value) {
@@ -180,6 +181,52 @@ export function createManagementService({ storage, queue, config, now, emit, log
     /** 注册动作表快照，按 name 排序（契约 06）。 */
     listActions() {
       return registry.snapshot()
+    },
+
+    /**
+     * 会话侧结果上报（契约 06 reportRunResult，v0.1y）：向 run.result.reports 追加
+     * 一条 { at, sessionId?, summary, level?, fields? }。run 任意状态（含在途）可上报；
+     * 写入走 FIFO 单槽，仅 merge result 字段（契约 08「结果上报写」），落库后发 changed。
+     * runId 不存在（含已被裁剪删除）→ script_unknown；形状越限 → script_input_invalid
+     *（reason format）；每 run 上限 10 条 → script_input_invalid（reason limit）。
+     * @param {{ runId: string, summary: string, level?: 'info'|'warn'|'error', fields?: Record<string,string> }} input
+     * @param {string} [actorSessionId] 上报会话 id（记入 reports[].sessionId）
+     * @returns {Promise<{ runId: string, orchestrationId: string, status: string, result: object }>}
+     */
+    async reportRunResult(input, actorSessionId) {
+      const payload = isPlainObject(input) ? input : {}
+      if (typeof payload.runId !== 'string' || payload.runId.length === 0) {
+        throw inputInvalid('runId', 'missing', 'reportRunResult 需要非空的 runId')
+      }
+      const shape = validateResultShape(payload)
+      if (!shape.ok) {
+        throw inputInvalid(shape.field, shape.reason, `结果上报的 ${shape.field} 不合法（限制见契约 03「结果上报」）`)
+      }
+      return await queue.enqueue(async () => {
+        const run = storage.table('runs').get(payload.runId)
+        if (run === undefined) {
+          throw new OrchestratorError('script_unknown', `run '${payload.runId}' 不存在或已删除`, { id: payload.runId })
+        }
+        const reports = run.result?.reports ?? []
+        if (reports.length >= RESULT_LIMITS.reportsPerRun) {
+          throw inputInvalid('report', 'limit', `每条执行记录最多 ${RESULT_LIMITS.reportsPerRun} 条结果上报，后续结果请放进会话最终答复`)
+        }
+        const report = {
+          at: iso(currentTime()),
+          ...(typeof actorSessionId === 'string' && actorSessionId.length > 0 ? { sessionId: actorSessionId } : {}),
+          ...shape.value,
+        }
+        const nextResult = { ...(run.result ?? {}), reports: [...reports, report] }
+        await storage.table('runs').put(payload.runId, { ...run, result: nextResult })
+        safeEmit('script-orchestrator/changed')
+        const overlay = runner?.liveView?.(payload.runId)
+        return {
+          runId: run.runId,
+          orchestrationId: run.orchestrationId,
+          status: overlay?.status ?? run.status,
+          result: nextResult,
+        }
+      })
     },
 
     /**

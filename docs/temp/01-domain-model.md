@@ -87,6 +87,7 @@ run.matchedRule                          // 命中的规则下标，未命中为
 | `matchedRule` | number \| null | 命中规则下标；`fallback` 命中为 `null` 且 `usedFallback: true` |
 | `usedFallback` | boolean | 是否走了 fallback |
 | `actions` | array | 每项 `{ name, kind, status, error?, warnings?, sessionId? }`；`warnings` 为字符串数组（模板警告 + `report()` 进展，保留最近 20 条）；`sessionId` 仅 `session` 动作有——成功与 `delivery_failed` 均记（供人工接管与追溯） |
+| `result` | object \| 缺省 | 执行结果上报（v0.1y，见 [03-execution](03-execution.md)「结果上报」）：`{ summary?, level?, fields?, reports? }`。`summary`（≤ 300 code points）/`level`（`'info' \| 'warn' \| 'error'`）/`fields`（≤ 8 项 string→string）来自脚本 stdout 标记行；`reports` 为会话经 `script_report` 追加的上报数组，每项 `{ at, sessionId?, summary, level?, fields? }`，每 run 最多 10 条。整个字段可缺省（未上报） |
 
 `stdoutTail` / `stderrTail` 各最多 **2048 个 code point**（超出取解码后文本末尾并置 `truncated: true`），`stdoutSpillPath` / `stderrSpillPath` 指向子进程服务给出的完整输出溢写文件（若有；超 cap 撤回则缺省），`warnings` 为脚本阶段非致命事实（见 [03-execution](03-execution.md)）。`script.truncated` 表示 stdout 或 stderr 任一在收集阶段被截断（判定即 `lossy`，溢写存在不改变它）。
 

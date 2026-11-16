@@ -27,7 +27,7 @@
 
 ### 执行记录
 
-`run` 全部字段。`run.actions[].error` 只存 `{ code, message }`，不存堆栈；`stdoutTail` / `stderrTail` 已在入表前截到 2048 字符；`run.actions[].warnings` 为字符串数组，入表前已裁到最近 20 条。
+`run` 全部字段。`run.actions[].error` 只存 `{ code, message }`，不存堆栈；`stdoutTail` / `stderrTail` 已在入表前截到 2048 字符；`run.actions[].warnings` 为字符串数组，入表前已裁到最近 20 条。`run.result`（v0.1y，可选）：`summary` / `fields` 各自的上限在写入层校验（见 [01-domain-model](01-domain-model.md)），`reports` 由服务层保证 ≤ 10 条——存储 schema 只约束形状，不重复计数。
 
 ## 保留与裁剪
 
@@ -47,6 +47,7 @@
 - **查询**：全部在内存完成（列表、过滤、分页），不触达后端。
 - **写入**：复合操作（`create`/`edit`/`delete`、run 开始/结算、级联、裁剪）整体作为**服务层 FIFO** 的一个槽位入队，槽内「枚举 → 判断 → 多次 Domain 调用」不与其他操作交错；单槽失败不毒化队列。写入前由插件用对应 schema 显式 `parse`（Domain 运行期不复验）。
 - **正常路径**：run 只写两次（开始、结算），中途状态（`running`/`judging`/`dispatching`）为内存态不落盘；恢复、对账、裁剪的维护写**不计入**「只写两次」。
+- **结果上报写**（v0.1y）：`reportRunResult` 在 run 结算**之后**追加第三类写——同 FIFO 单槽内重读 run 记录、仅 merge `result`（脚本侧标记行在结算写内落库；会话侧 `reports` 追加），其余字段原样写回；每条上报一次写，不与结算写合并。在途 run 上的上报与结算写按 FIFO 全序串行，结算时保留已写入的 `reports`。
 - **级联删除**：同一服务槽位内先删编排记录、再 `deleteMany` 其全部 run；无跨表事务，崩溃残留由启动孤儿清理收尾。delete 成功返回即两步均完成。
 - **关闭**：先停生产者（调度器与工具入口拒绝新操作）→ 排干服务层队列 → `domain.close()`（幂等；排干已入链写入后拒绝读写）。
 

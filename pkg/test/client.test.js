@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { act } from 'react'
@@ -87,13 +87,28 @@ async function renderPanel(props) {
     clickInRow: async (needle, label) => {
       const row = [...container.querySelectorAll('tr')].find((tr) => tr.textContent.includes(needle))
       expect(row, `row containing '${needle}'`).toBeTruthy()
-      const button = [...row.querySelectorAll('button')].find((b) => b.textContent === label)
-      expect(button, `button '${label}' in row '${needle}'`).toBeTruthy()
+      let button = [...row.querySelectorAll('button')].find((b) => b.textContent === label)
+      if (!button) {
+        if (row.getAttribute('data-selected') !== 'true') {
+          await act(async () => row.dispatchEvent(new window.MouseEvent('click', { bubbles: true })))
+        }
+        const detail = container.querySelector('aside[aria-label="编排详情"]')
+        button = [...(detail?.querySelectorAll('button') || [])].find((b) => b.textContent === label)
+      }
+      expect(button, `button '${label}' for orchestration '${needle}'`).toBeTruthy()
       await act(async () => {
         button.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
       })
     },
-    modal: () => container.querySelector('div[style*="position: fixed"]'),
+    modal: () => container.querySelector('div[style*="position: fixed"]') || container.querySelector('aside[aria-label="编排详情"]'),
+    detail: () => container.querySelector('aside[aria-label="编排详情"]'),
+    workspace: () => container.querySelector('.so-workspace'),
+    row: (needle) => [...container.querySelectorAll('tbody tr')].find((tr) => tr.textContent.includes(needle)),
+    closeDetail: async () => {
+      const close = container.querySelector('aside[aria-label="编排详情"] button[aria-label="关闭详情"]')
+      expect(close, 'button 关闭详情').toBeTruthy()
+      await act(async () => close.click())
+    },
     unmount: () => {
       act(() => root.unmount())
       container.remove()
@@ -122,8 +137,8 @@ function listResult(items = [ORCH]) {
   return { ok: true, value: { items, total: items.length, nextOffset: null } }
 }
 
-function viewResult() {
-  return { ok: true, value: { ...ORCH, runs: [], availableActions: [] } }
+function viewResult(orchestration = ORCH) {
+  return { ok: true, value: { ...orchestration, runs: [], availableActions: [] } }
 }
 
 describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
@@ -265,13 +280,7 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     const [sessionId, options] = sessions[0]
     expect(sessionId).toBeUndefined()
     expect(options.whenDraftExists).toBe('append')
-    expect(options.prompt).toContain('script_create')
-    expect(options.prompt).toContain('every')
-    // 票 27：引导 prompt 覆盖 cron（五位表达式、显式时区、每日/每周预设生成 cron、周日为 0）
-    expect(options.prompt).toContain('cron')
-    expect(options.prompt).toContain('时区')
-    expect(options.prompt).toContain('0 3 * * *')
-    expect(options.prompt).toContain('周日')
+    expect(options.prompt).toBe('/script-orchestrator\n创建脚本编排：\n请在此描述需求：')
   })
 
   it('startEditSession 绑定：经 ctx.uiWorkspace.startSession 注入编辑 prompt（含编排 id、script_view 先看、script_edit 修改）', async () => {
@@ -292,9 +301,24 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     expect(sessionId).toBeUndefined()
     expect(options.whenDraftExists).toBe('append')
     expect(options.prompt).toContain('log-rotate')
-    expect(options.prompt).toContain('script_view')
-    expect(options.prompt).toContain('script_edit')
-    expect(options.prompt).toContain('当前配置')
+    expect(options.prompt).toBe('/script-orchestrator\n修改脚本编排 log-rotate：\n请在此描述需求：')
+  })
+
+  it('openSession 绑定：经 ctx.uiWorkspace.openSession 跳转（纯导航，透传 sessionId）', async () => {
+    const { exports } = await loadClientBundle()
+    const opened = []
+    const { registrations } = mountRegistrations(exports, {
+      uiWorkspace: {
+        openSession: (...args) => {
+          opened.push(args)
+        },
+      },
+    })
+    const props = panelEntry(registrations).definition.inject()
+    expect(typeof props.openSession).toBe('function')
+    props.openSession('session-xyz')
+    expect(opened).toHaveLength(1)
+    expect(opened[0]).toEqual(['session-xyz'])
   })
 
   it('面板渲染列表项：every 触发摘要、状态、下次时刻', async () => {
@@ -313,7 +337,7 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     view.unmount()
   })
 
-  it('点击行 → 居中模态经 view 回读详情：触发配置、状态与下次时刻、空执行记录、空注册动作；可关闭', async () => {
+  it('点击行 → 右侧详情经 view 回读：触发配置、状态与下次时刻、空执行记录、空注册动作；关闭恢复完整列表', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -326,11 +350,14 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     const view = await renderPanel({ call, subscribeReset: () => () => {} })
     expect(calls).toEqual([['list', {}]])
     await view.clickRow('log rotate')
-    expect(calls[1]).toEqual(['view', { id: 'log-rotate' }])
-    const modal = view.modal()
+    expect(calls[1]).toEqual(['view', { id: 'log-rotate', runs: 50 }])
+    const modal = view.detail()
     expect(modal).toBeTruthy()
-    expect(modal.getAttribute('style')).toContain('position: fixed')
-    expect(modal.getAttribute('style')).toContain('center')
+    expect(modal.getAttribute('role')).not.toBe('dialog')
+    expect(modal.getAttribute('aria-modal')).not.toBe('true')
+    expect(view.workspace().classList.contains('so-workspace-split')).toBe(true)
+    expect(view.row('log rotate')).toBeTruthy()
+    expect(view.row('log rotate').getAttribute('data-selected')).toBe('true')
     const modalText = modal.textContent
     expect(modalText).toContain('触发配置')
     expect(modalText).toContain('every 5 分钟')
@@ -340,15 +367,147 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     expect(modalText).toContain('执行记录（0）')
     expect(modalText).toContain('还没有执行记录（创建不会立即执行脚本）')
     expect(modalText).toContain('暂无注册动作')
-    await act(async () => {
-      const close = [...modal.querySelectorAll('button')].find((b) => b.textContent === '关闭')
-      close.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
-    })
-    expect(view.modal()).toBeFalsy()
+    await view.closeDetail()
+    expect(view.detail()).toBeFalsy()
+    expect(view.workspace().classList.contains('so-workspace-split')).toBe(false)
+    expect(view.row('log rotate').getAttribute('data-selected')).not.toBe('true')
     view.unmount()
   })
 
-  it('详情模态「编辑」按钮：点击 → startEditSession（id/title），不关闭模态、不额外回读（既有按钮与轮询不受影响）', async () => {
+  it('双编排直接切换：列表保持可操作，选中态与标题按钮 aria-expanded 跟随详情', async () => {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    const second = { ...ORCH, id: 'nightly-check', title: '夜间巡检', script: { command: 'node' } }
+    const calls = []
+    const call = (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      return Promise.resolve(endpoint === 'list' ? listResult([ORCH, second]) : viewResult(payload.id === ORCH.id ? ORCH : second))
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    try {
+      expect(view.detail()).toBeFalsy()
+      const titleButton = (title) => [...view.row(title).querySelectorAll('button')].find((button) => button.textContent === title)
+      const firstButton = titleButton(ORCH.title)
+      expect(firstButton).toBeTruthy()
+      expect(firstButton.getAttribute('aria-expanded')).toBe('false')
+      firstButton.focus()
+      expect(document.activeElement).toBe(firstButton)
+      // jsdom 不模拟 Enter/Space 的浏览器默认 click；验证原生键盘按钮的激活路径。
+      expect(firstButton.tagName).toBe('BUTTON')
+      expect(firstButton.disabled).toBe(false)
+      await act(async () => firstButton.click())
+      expect(firstButton.getAttribute('aria-expanded')).toBe('true')
+      expect(view.detail().textContent).toContain(ORCH.id)
+      await view.clickInRow(second.title, second.title)
+      expect(view.detail().textContent).toContain(second.title)
+      expect(view.detail().textContent).toContain(second.id)
+      expect(view.detail().textContent).not.toContain(ORCH.id)
+      expect(view.row(ORCH.title).getAttribute('data-selected')).not.toBe('true')
+      expect(view.row(second.title).getAttribute('data-selected')).toBe('true')
+      expect(titleButton(ORCH.title).getAttribute('aria-expanded')).toBe('false')
+      expect(titleButton(second.title).getAttribute('aria-expanded')).toBe('true')
+      expect(calls.filter(([endpoint]) => endpoint === 'view')).toEqual([
+        ['view', { id: ORCH.id, runs: 50 }], ['view', { id: second.id, runs: 50 }],
+      ])
+      const selectedTitle = titleButton(second.title)
+      const closeButton = view.detail().querySelector('button[aria-label="关闭详情"]')
+      closeButton.focus()
+      expect(document.activeElement).toBe(closeButton)
+      await view.closeDetail()
+      expect(document.activeElement).toBe(selectedTitle)
+      expect(titleButton(second.title).getAttribute('aria-expanded')).toBe('false')
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('顶部刷新同步回读左右两列，保留选中编排并显示最新权威详情', async () => {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    const calls = []
+    let current = ORCH
+    const call = async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return listResult([current])
+      if (endpoint === 'view') return viewResult(current)
+      throw new Error(`unexpected endpoint ${endpoint}`)
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    try {
+      await view.clickRow(ORCH.title)
+      current = { ...ORCH, title: '刷新后的权威编排', trigger: { kind: 'every', everySeconds: 600, mode: 'fixed-delay' } }
+      const before = calls.length
+      await view.click('刷新')
+      const reads = calls.slice(before)
+      expect(reads.filter(([endpoint]) => endpoint === 'list')).toEqual([['list', {}]])
+      expect(reads.filter(([endpoint]) => endpoint === 'view')).toEqual([['view', { id: ORCH.id, runs: 50 }]])
+      expect(view.row(current.title).textContent).toContain('every 10 分钟')
+      expect(view.row(current.title).getAttribute('data-selected')).toBe('true')
+      expect(view.detail().textContent).toContain(current.title)
+      expect(view.detail().textContent).toContain('every 10 分钟')
+      expect(view.workspace().classList.contains('so-workspace-split')).toBe(true)
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it.each(['loading', 'failed'])('详情 %s 时仍可关闭，不遮挡列表且晚到结果不重新打开详情', async (phase) => {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    let resolveDetail
+    const pending = new Promise((resolve) => { resolveDetail = resolve })
+    const call = (endpoint) => endpoint === 'list' ? Promise.resolve(listResult()) : pending
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    try {
+      await view.clickRow(ORCH.title)
+      expect(view.detail()).toBeTruthy()
+      expect(view.detail().textContent).toContain('加载详情')
+      if (phase === 'failed') {
+        await act(async () => resolveDetail({ ok: false, error: { code: 'offline', message: '详情暂不可用' } }))
+        expect(view.detail().textContent).toContain('详情暂不可用')
+      }
+      expect(view.row(ORCH.title)).toBeTruthy()
+      await view.closeDetail()
+      expect(view.detail()).toBeFalsy()
+      expect(view.workspace().classList.contains('so-workspace-split')).toBe(false)
+      await act(async () => resolveDetail(viewResult()))
+      expect(view.detail()).toBeFalsy()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('旧编排详情请求晚到不覆盖当前编排，切换加载时不保留旧详情内容', async () => {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    const second = { ...ORCH, id: 'second', title: 'second orchestration', script: { command: 'node' } }
+    const resolves = new Map()
+    const call = (endpoint, payload) => endpoint === 'list'
+      ? Promise.resolve(listResult([ORCH, second]))
+      : new Promise((resolve) => resolves.set(payload.id, resolve))
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    try {
+      await view.clickRow(ORCH.title)
+      await view.clickRow(second.title)
+      expect(view.detail().textContent).toContain('加载详情')
+      await act(async () => resolves.get(second.id)(viewResult(second)))
+      expect(view.detail().textContent).toContain(second.title)
+      expect(view.detail().textContent).toContain(second.id)
+      await act(async () => resolves.get(ORCH.id)(viewResult()))
+      expect(view.detail().textContent).toContain(second.title)
+      expect(view.detail().textContent).not.toContain(ORCH.id)
+      expect(view.row(second.title).getAttribute('data-selected')).toBe('true')
+      await view.clickRow(ORCH.title)
+      expect(view.detail().textContent).toContain('加载详情')
+      expect(view.detail().textContent).not.toContain(second.id)
+      await act(async () => resolves.get(ORCH.id)(viewResult()))
+      expect(view.detail().textContent).toContain(ORCH.id)
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('详情面板「在新会话修改」按钮：点击 → startEditSession（id），不关闭详情、不额外回读（既有按钮与轮询不受影响）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -365,15 +524,15 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     })
     await view.clickRow('log rotate')
     const modal = view.modal()
-    const edit = [...modal.querySelectorAll('button')].find((b) => b.textContent === '编辑')
+    const edit = [...modal.querySelectorAll('button')].find((b) => b.textContent === '在新会话修改')
     expect(edit, "button '编辑'").toBeTruthy()
     expect([...modal.querySelectorAll('button')].some((b) => b.textContent === '关闭')).toBe(true)
     const viewCallsBefore = calls.filter(([endpoint]) => endpoint === 'view').length
     await act(async () => {
       edit.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
     })
-    expect(started).toEqual([['log-rotate', 'log rotate']])
-    expect(view.modal()).toBeTruthy() // 编辑入口不改面板状态（不关闭模态）
+    expect(started).toEqual([['log-rotate', undefined]])
+    expect(view.modal()).toBeTruthy() // 编辑入口不改面板状态（不关闭详情）
     expect(calls.filter(([endpoint]) => endpoint === 'view')).toHaveLength(viewCallsBefore) // 不额外回读
     view.unmount()
   })
@@ -415,7 +574,7 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     view.unmount()
   })
 
-  it('connection/reset 时已打开的详情模态重新回读 view（详情与列表同为权威回读）', async () => {
+  it('connection/reset 时已打开的详情面板重新回读 view（详情与列表同为权威回读）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -442,7 +601,7 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
     view.unmount()
   })
 
-  it('cron 编排：列表与详情模态显示表达式、时区与下次时刻；每日预设回显语义摘要（契约 02「每日/每周面板预设」）', async () => {
+  it('cron 编排：列表与详情面板显示表达式、时区与下次时刻；每日预设回显语义摘要（契约 02「每日/每周面板预设」）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -494,7 +653,7 @@ describe('Web client（lib/client.js，简化档 lazy-CJS）', () => {
   })
 })
 
-describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「刷新策略」3：可见且有活动 run 时每 5 秒 view）', () => {
+describe('详情面板的脚本阶段结果与活动 run 轮询（契约 11「刷新策略」3：可见且有活动 run 时每 5 秒 view）', () => {
   const runView = (over = {}) => ({
     runId: 'run-7f3c1a9e',
     orchestrationId: 'log-rotate',
@@ -569,15 +728,97 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     const view = await mountPanel(call)
     await view.clickRow('log rotate')
     const modalText = view.modal().textContent
-    expect(modalText).toContain('run-7f3c1a9e')
+    // runId 缩写为尾 4 位（v0.1x），完整 id 在 title
+    expect(modalText).toContain('…1a9e')
+    expect(view.modal().querySelector('[title="run-7f3c1a9e"]')).toBeTruthy()
     expect(modalText).toContain('退出码 0')
-    expect(modalText).toContain('2200ms')
+    expect(modalText).toContain('耗时 2.2 秒')
     expect(modalText).toContain('deploy ok')
     expect(modalText).toContain('跳过（重叠）')
     expect(modalText).toContain('已超时')
     expect(modalText).toContain('已截断')
     expect(modalText).toContain('descendants-terminated')
     expect(modalText).toContain('partial output…')
+    // stderr 尾部直展（v0.1x），不再只能进 spill 模态
+    expect(modalText).toContain('stderr 尾部')
+    expect(modalText).toContain('boom')
+    view.unmount()
+  })
+
+  // v0.1x：执行记录默认折叠 3 条 + 展开/收起 + 服务上限标注 + 相对时间
+  it('v0.1x 折叠：5 条 run 默认只渲染最近 3 条，「展开全部执行记录」→ 5 条，可收起', async () => {
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: { ...ORCH, runs: [5, 4, 3, 2, 1].map((n) => runView({ runId: 'run-0000000' + n })), availableActions: [] },
+      })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    // 每张 run 卡片恰有一个 title=完整 runId 的元素（v0.1x runId 缩写为尾 4 位）
+    const cardCount = () => view.modal().querySelectorAll('[title^="run-"]').length
+    expect(cardCount()).toBe(3)
+    expect(view.text()).toContain('展开全部执行记录')
+    await view.click('展开全部执行记录')
+    expect(cardCount()).toBe(5)
+    expect(view.text()).toContain('收起，仅显示最近 3 条')
+    await view.click('收起，仅显示最近 3 条')
+    expect(cardCount()).toBe(3)
+    view.unmount()
+  })
+
+  it('v0.1x：取回数达服务上限 50 时如实标注；不超过 3 条时不出现展开按钮与标注', async () => {
+    const many = Array.from({ length: 50 }, (_, i) => runView({ runId: 'run-' + String(i).padStart(8, '0') }))
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({ ok: true, value: { ...ORCH, runs: many, availableActions: [] } })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    expect(view.text()).toContain('执行记录（50）')
+    expect(view.text()).toContain('已达服务上限：最多显示最近 50 条执行记录')
+    view.unmount()
+
+    const few = await mountPanel((endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({ ok: true, value: { ...ORCH, runs: [runView()], availableActions: [] } })
+    })
+    await few.clickRow('log rotate')
+    expect(few.text()).not.toContain('展开全部执行记录')
+    expect(few.text()).not.toContain('已达服务上限')
+    few.unmount()
+  })
+
+  it('v0.1x 直观化：未结算标「开始于」+ 相对时间，未开始标「计划于」', async () => {
+    const running = runView({
+      runId: 'run-running01',
+      status: 'running',
+      scheduledAt: new Date(Date.now() - 65e3).toISOString(),
+      startedAt: new Date(Date.now() - 60e3).toISOString(),
+      settledAt: null,
+    })
+    const queued = runView({
+      runId: 'run-queued001',
+      status: 'queued',
+      startedAt: null,
+      settledAt: null,
+      scheduledAt: new Date(Date.now() + 60e3).toISOString(),
+    })
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({ ok: true, value: { ...ORCH, runs: [running, queued], availableActions: [] } })
+    }
+    const view = await mountPanel(call)
+    await view.clickRow('log rotate')
+    const modalText = view.modal().textContent
+    expect(modalText).toContain('执行中')
+    expect(modalText).toContain('排队中')
+    expect(modalText).toContain('开始于 1 分钟前')
+    expect(modalText).toContain('计划于')
+    // 相对时间的绝对时刻在 title（排障可核对）；与 client.js fmtTime 同规则
+    const absTitle = (iso) => iso.replace('T', ' ').replace(/(\.\d+|Z).*$/, '')
+    expect(view.modal().querySelector(`[title="${absTitle(running.startedAt)}"]`)).toBeTruthy()
     view.unmount()
   })
 
@@ -621,11 +862,11 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     const view = await mountPanel(call)
     await view.clickRow('log rotate')
     const modalText = view.modal().textContent
-    // 判定段
+    // 判定段（matchedRule 零下标按 N+1 展示，与详情「规则 N」编号对齐）
     expect(modalText).toContain('判定')
-    expect(modalText).toContain('命中规则 0')
-    expect(modalText).toContain('fallback')
-    expect(modalText).toContain('未命中（零动作）')
+    expect(modalText).toContain('命中规则 1')
+    expect(modalText).toContain('命中兜底')
+    expect(modalText).toContain('未命中（不执行动作）')
     // 动作段：名称、类型、状态、错误码、warnings
     expect(modalText).toContain('emit-ok')
     expect(modalText).toContain('page')
@@ -714,7 +955,66 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     view.unmount()
   })
 
-  it('活动 run 轮询：模态打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
+  // v0.1ab 会话引用可跳转：动作行派发会话与结果块 reports 上报会话都是链接按钮
+  it('v0.1ab 会话引用跳转：动作行与 reports 的 sessionId 点击经 openSession 跳转；未提供 openSession 时降级纯文本', async () => {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const call = (endpoint) => {
+      if (endpoint === 'list') return Promise.resolve(listResult())
+      return Promise.resolve({
+        ok: true,
+        value: {
+          ...ORCH,
+          runs: [
+            runView({
+              actions: [{ name: 'open-triage', kind: 'session', status: 'succeeded', sessionId: 'session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee' }],
+              result: {
+                summary: '归档完成',
+                level: 'info',
+                reports: [
+                  { sessionId: 'session-9f21e1aa-1111-2222-3333-444455556666', at: '2026-11-09T00:05:03.000Z', summary: '已归档 3 个文件', fields: { files: '3' } },
+                ],
+              },
+            }),
+          ],
+          availableActions: [],
+        },
+      })
+    }
+    const opened = []
+    const view = await renderPanel({ call, subscribeReset: () => () => {}, openSession: (id) => opened.push(id) })
+    await view.clickRow('log rotate')
+    const linkButtons = [...view.modal().querySelectorAll('button')].filter((b) => (b.title || '').includes('跳转到该会话'))
+    expect(linkButtons).toHaveLength(2)
+    // 动作行：完整 id 在 title，正文含「（可接管）」
+    const actionBtn = linkButtons.find((b) => b.title.startsWith('session-05ddf0dc'))
+    expect(actionBtn).toBeTruthy()
+    expect(actionBtn.textContent).toContain('session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee')
+    expect(actionBtn.textContent).toContain('（可接管）')
+    await act(async () => {
+      actionBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(opened).toEqual(['session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee'])
+    // reports：正文为尾 8 位缩写，点击同样收到完整 id
+    const reportBtn = linkButtons.find((b) => b.title.startsWith('session-9f21e1aa'))
+    expect(reportBtn.textContent).toContain('…55556666')
+    await act(async () => {
+      reportBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    })
+    expect(opened).toEqual(['session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee', 'session-9f21e1aa-1111-2222-3333-444455556666'])
+    view.unmount()
+
+    // 降级：宿主未提供 openSession → 无跳转按钮，sessionId 以纯文本展示
+    const plain = await renderPanel({ call, subscribeReset: () => () => {} })
+    await plain.clickRow('log rotate')
+    expect(plain.modal().querySelectorAll('button[title*="跳转到该会话"]').length).toBe(0)
+    expect(plain.modal().textContent).toContain('session-05ddf0dc-0794-4eac-bdb7-3148cfda1cee')
+    expect(plain.modal().textContent).toContain('…55556666')
+    plain.unmount()
+  })
+
+  it('活动 run 轮询：详情打开且有非终态 run → 每 5 秒 view(id)；全部终态后停止', async () => {
     vi.useFakeTimers()
     try {
       const calls = []
@@ -765,7 +1065,7 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
     }
   })
 
-  it('停止条件：面板不可见不轮询；模态关闭后停止', async () => {
+  it('停止条件：面板不可见不轮询；详情关闭后停止', async () => {
     vi.useFakeTimers()
     try {
       const calls = []
@@ -797,11 +1097,9 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
         await vi.advanceTimersByTimeAsync(5000)
       })
       expect(calls.filter((e) => e === 'view')).toHaveLength(2)
-      // 关闭模态 → 停止（先 flush 卸载，再推进时间）
-      await act(async () => {
-        const close = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '关闭')
-        close.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
-      })
+      // 关闭详情 → 停止（先 flush 卸载，再推进时间）
+      await view.closeDetail()
+      expect(view.detail()).toBeFalsy()
       await act(async () => {
         await vi.advanceTimersByTimeAsync(15000)
       })
@@ -814,7 +1112,7 @@ describe('详情模态的脚本阶段结果与活动 run 轮询（契约 11「�
   })
 })
 
-describe('行内管理操作（契约 11「面板自身承载管理与排障：行内操作」；票 28）', () => {
+describe('详情管理操作（契约 11「面板自身承载管理与排障：详情管理操作」；票 28）', () => {
   const pausedOrch = { ...ORCH, id: 'paused-o', title: 'paused orchestration', status: 'paused', nextOccurrence: null }
   const endedOrch = { ...ORCH, id: 'ended-o', title: 'ended orchestration', status: 'ended', nextOccurrence: null }
 
@@ -824,25 +1122,31 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
       if (endpoint === 'list') {
         return { ok: true, value: { items: listItems, total: listItems.length, nextOffset: null } }
       }
+      if (endpoint === 'view') return viewResult(listItems.find((item) => item.id === payload.id))
       if (endpoint === 'edit') return { ok: true, value: { ...ORCH } }
       if (endpoint === 'run') return { ok: true, value: { runId: 'run-abcd1234', status: 'queued' } }
       throw new Error(`unexpected endpoint ${endpoint}`)
     }
   }
 
-  it('按状态渲染行内操作：active → 暂停+执行+删除；paused → 恢复+执行+删除；ended → 执行+删除（删除全状态，票 29）', async () => {
+  it('按状态渲染详情管理操作：active → 暂停+执行+删除；paused → 恢复+执行+删除；ended → 执行+删除（删除全状态，票 29）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
     const items = [ORCH, pausedOrch, endedOrch]
     const view = await renderPanel({ call: actionsCall([], items), subscribeReset: () => () => {} })
-    await view.clickInRow('log rotate', '暂停')
-    const activeRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('log rotate'))
-    expect([...activeRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['暂停', '执行', '删除'])
-    const pausedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('paused orchestration'))
-    expect([...pausedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['恢复', '执行', '删除'])
-    const endedRow = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('ended orchestration'))
-    expect([...endedRow.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['执行', '删除'])
+    expect([...document.querySelectorAll('thead th')].map((cell) => cell.textContent)).toEqual(['状态', '标题', '触发', '下次'])
+    for (const item of items) {
+      const row = view.row(item.title)
+      expect(row.querySelectorAll('td')).toHaveLength(4)
+      expect([...row.querySelectorAll('button')].map((button) => button.textContent)).toEqual([item.title])
+      await view.clickRow(item.title)
+      const labels = [...view.detail().querySelectorAll('button')].map((button) => button.textContent)
+      expect(labels).toContain('执行')
+      expect(labels).toContain('删除')
+      expect(labels.includes('暂停')).toBe(item.status === 'active')
+      expect(labels.includes('恢复')).toBe(item.status === 'paused')
+    }
     view.unmount()
   })
 
@@ -855,10 +1159,13 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
     await view.clickInRow('log rotate', '暂停')
     expect(calls).toEqual([
       ['list', {}],
+      ['view', { id: 'log-rotate', runs: 50 }],
       ['edit', { id: 'log-rotate', action: 'pause' }],
       ['list', {}],
+      ['view', { id: 'log-rotate', runs: 50 }],
     ])
-    expect(view.modal()).toBeFalsy() // 行内操作不打开模态
+    expect(view.detail()).toBeTruthy() // 操作在详情中执行，完成后保持详情
+    expect(document.querySelector('div[style*="position: fixed"]')).toBeFalsy()
     view.unmount()
   })
 
@@ -869,11 +1176,50 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
     const calls = []
     const view = await renderPanel({ call: actionsCall(calls, [pausedOrch]), subscribeReset: () => () => {} })
     await view.clickInRow('paused orchestration', '恢复')
-    expect(calls[1]).toEqual(['edit', { id: 'paused-o', action: 'resume' }])
+    expect(calls.filter(([endpoint]) => endpoint === 'edit')).toEqual([['edit', { id: 'paused-o', action: 'resume' }]])
     await view.clickInRow('paused orchestration', '执行')
-    expect(calls[3]).toEqual(['run', { id: 'paused-o' }])
-    expect(calls[4]).toEqual(['list', {}])
+    expect(calls.filter(([endpoint]) => endpoint === 'run')).toEqual([['run', { id: 'paused-o' }]])
+    expect(calls.filter(([endpoint]) => endpoint === 'list')).toHaveLength(3)
+    expect(calls.filter(([endpoint]) => endpoint === 'view')).toHaveLength(3)
     view.unmount()
+  })
+
+  it.each(['暂停', '执行'])('详情打开后详情管理%s成功立即回读 list/view，保持选中且展示权威详情', async (label) => {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    const calls = []
+    let current = ORCH
+    const call = async (endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (endpoint === 'list') return listResult([current])
+      if (endpoint === 'view') return viewResult(current)
+      if (endpoint === 'edit') {
+        current = { ...ORCH, title: '暂停后权威标题', status: 'paused', nextOccurrence: null }
+        return { ok: true, value: current }
+      }
+      if (endpoint === 'run') {
+        current = { ...ORCH, title: '执行后权威标题' }
+        return { ok: true, value: { runId: 'run-abcd1234', status: 'queued' } }
+      }
+      throw new Error(`unexpected endpoint ${endpoint}`)
+    }
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    try {
+      await view.clickRow(ORCH.title)
+      const before = calls.length
+      await view.clickInRow(ORCH.title, label)
+      const writes = calls.slice(before)
+      expect(writes[0]).toEqual(label === '暂停'
+        ? ['edit', { id: ORCH.id, action: 'pause' }]
+        : ['run', { id: ORCH.id }])
+      expect(writes.filter(([endpoint]) => endpoint === 'list')).toEqual([['list', {}]])
+      expect(writes.filter(([endpoint]) => endpoint === 'view')).toEqual([['view', { id: ORCH.id, runs: 50 }]])
+      expect(view.detail().textContent).toContain(current.title)
+      expect(view.workspace().classList.contains('so-workspace-split')).toBe(true)
+      expect(view.row(current.title).getAttribute('data-selected')).toBe('true')
+    } finally {
+      view.unmount()
+    }
   })
 
   it('操作失败显示契约错误（如 script_conflict），可继续重试其他操作', async () => {
@@ -886,21 +1232,30 @@ describe('行内管理操作（契约 11「面板自身承载管理与排障：�
       if (endpoint === 'edit') {
         return { ok: false, error: { code: 'script_conflict', message: '已被其他修改', details: { expected: 'a', actual: 'b' } } }
       }
+      if (endpoint === 'view') return viewResult()
       return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
     }
     const view = await renderPanel({ call, subscribeReset: () => () => {} })
     await view.clickInRow('log rotate', '暂停')
-    expect(view.text()).toContain('script_conflict')
-    expect(view.text()).toContain('已被其他修改')
+    const alert = view.detail().querySelector('[role="alert"]')
+    expect(alert).toBeTruthy()
+    expect(alert.textContent).toContain('script_conflict')
+    expect(alert.textContent).toContain('已被其他修改')
+    const dismiss = [...alert.querySelectorAll('button')].find((button) => button.textContent === '关闭提示')
+    expect(dismiss).toBeTruthy()
+    await act(async () => dismiss.click())
+    expect(view.detail().querySelector('[role="alert"]')).toBeFalsy()
+    expect(view.detail()).toBeTruthy()
     view.unmount()
   })
 })
 
-describe('删除编排 · 二次确认与级联提示（契约 11「行内操作 + 删除二次确认」；票 29）', () => {
+describe('删除编排 · 二次确认与级联提示（契约 11「详情管理操作 + 删除二次确认」；票 29）', () => {
   function deleteCall(calls, { editResult } = {}) {
     return async (endpoint, payload) => {
       calls.push([endpoint, payload])
       if (endpoint === 'list') return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+      if (endpoint === 'view') return viewResult()
       if (endpoint === 'edit') {
         return editResult ?? { ok: true, value: { id: payload.id, removedRuns: 0 } }
       }
@@ -908,7 +1263,7 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     }
   }
 
-  it('每行都有「删除」按钮（全状态）；点击后居中确认模态：标题、级联取消与不可恢复提示，未发任何 edit', async () => {
+  it('详情提供「删除」按钮（全状态）；点击后居中确认模态：标题、级联取消与不可恢复提示，未发任何 edit', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -922,7 +1277,7 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     expect(text).toContain('log rotate')
     expect(text).toContain('取消在途 run')
     expect(text).toContain('不可恢复')
-    expect(calls).toEqual([['list', {}]]) // 确认前不发 edit
+    expect(calls).toEqual([['list', {}], ['view', { id: ORCH.id, runs: 50 }]]) // 确认前只读，不发 edit
     view.unmount()
   })
 
@@ -939,6 +1294,7 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     })
     expect(calls).toEqual([
       ['list', {}],
+      ['view', { id: 'log-rotate', runs: 50 }],
       ['edit', { id: 'log-rotate', action: 'delete' }],
       ['list', {}],
     ])
@@ -957,8 +1313,9 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
       const cancel = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '取消')
       cancel.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
     })
-    expect(calls).toEqual([['list', {}]])
-    expect(view.modal()).toBeFalsy()
+    expect(calls).toEqual([['list', {}], ['view', { id: ORCH.id, runs: 50 }]])
+    expect(document.querySelector('div[style*="position: fixed"]')).toBeFalsy()
+    expect(view.detail()).toBeTruthy()
     view.unmount()
   })
 
@@ -971,6 +1328,7 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     const call = async (endpoint, payload) => {
       calls.push([endpoint, payload])
       if (endpoint === 'list') return { ok: true, value: { items: [ORCH], total: 1, nextOffset: null } }
+      if (endpoint === 'view') return viewResult()
       if (endpoint === 'edit') {
         return new Promise((resolve) => { resolveEdit = resolve })
       }
@@ -990,12 +1348,13 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     await act(async () => {
       resolveEdit({ ok: false, error: { code: 'script_conflict', message: '已被其他修改' } })
     })
-    expect(view.modal()).toBeFalsy() // 确认模态关闭
-    expect(view.text()).toContain('script_conflict') // 错误条呈现
+    expect(document.querySelector('div[style*="position: fixed"]')).toBeFalsy() // 确认关闭，详情保留
+    expect(view.detail()).toBeTruthy()
+    expect(view.detail().querySelector('[role="alert"]').textContent).toContain('script_conflict') // 详情就近呈现错误
     view.unmount()
   })
 
-  it('删除成功后若详情模态正开着该编排则一并关闭（记录已不存在）', async () => {
+  it('删除成功后若详情面板正开着该编排则一并关闭（记录已不存在）', async () => {
     const { exports } = await loadClientBundle()
     const { registrations } = mountRegistrations(exports)
     panelComponent = panelEntry(registrations).component
@@ -1009,7 +1368,7 @@ describe('删除编排 · 二次确认与级联提示（契约 11「行内操作
     }
     const view = await renderPanel({ call, subscribeReset: () => () => {} })
     await view.clickRow('log rotate')
-    expect(view.modal()).toBeTruthy() // 详情模态开着
+    expect(view.modal()).toBeTruthy() // 详情面板开着
     await view.clickInRow('log rotate', '删除')
     await act(async () => {
       const confirm = [...view.modal().querySelectorAll('button')].find((b) => b.textContent === '确认删除')
@@ -1089,8 +1448,12 @@ describe('完整溢写输出读取（票 34：spill 端点；文件不存在排�
     expect(view.text()).toContain('无法读取完整输出')
     expect(view.text()).toContain('script_storage_unavailable')
     expect(view.text()).toContain('溢写文件已不存在或不可读（ENOENT）')
-    await view.click('关闭')
+    await act(async () => {
+      const close = [...view.modal().querySelectorAll('button')].find((button) => button.textContent === '关闭')
+      close.click()
+    })
     expect(view.text()).not.toContain('无法读取完整输出')
+    expect(view.detail()).toBeTruthy()
     view.unmount()
   })
 
@@ -1112,6 +1475,377 @@ describe('完整溢写输出读取（票 34：spill 端点；文件不存在排�
     const view = await renderPanel({ call: callWithoutSpill })
     await view.clickRow('log rotate')
     expect(view.text()).not.toContain('stdout 全量')
+    view.unmount()
+  })
+})
+
+
+describe('手动编辑', () => {
+  let cleanup
+  afterEach(() => { cleanup?.(); cleanup = null; vi.restoreAllMocks() })
+  async function setup(result = { ok: true, value: {} }, orchestration = ORCH, override = null) {
+    const { exports } = await loadClientBundle()
+    panelComponent = panelEntry(mountRegistrations(exports).registrations).component
+    const calls = []
+    const call = vi.fn((endpoint, payload) => {
+      calls.push([endpoint, payload])
+      if (override) { const response = override(endpoint, payload, calls); if (response !== undefined) return response }
+      if (endpoint === 'list') return Promise.resolve(listResult([orchestration]))
+      if (endpoint === 'view') return Promise.resolve({ ok: true, value: { ...orchestration, runs: [], availableActions: [] } })
+      if (endpoint === 'edit') return Promise.resolve(result)
+      throw Error(endpoint)
+    })
+    const view = await renderPanel({ call, subscribeReset: () => () => {} })
+    const unmount = view.unmount
+    cleanup = () => { if (cleanup) { cleanup = null; unmount() } }
+    view.unmount = () => cleanup?.()
+    await view.clickRow(orchestration.title)
+    ;[...document.querySelectorAll('button')].find(b => b.textContent === '手动修改').focus()
+    await view.click('手动修改')
+    const dialog = document.querySelector('[role="dialog"]')
+    const field = (label) => [...dialog.querySelectorAll('label')].find(x => x.textContent.startsWith(label)).querySelector('input,select,textarea')
+    const set = async (label, value) => {
+      const el = field(label)
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value)
+      await act(async () => el.dispatchEvent(new Event(el.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true })))
+    }
+    return { view, dialog, field, set, calls }
+  }
+  it('只提交改动与版本，保存后回读且不执行', async () => {
+    const x = await setup()
+    await x.set('标题', '新标题')
+    await x.view.click('检查变更')
+    expect(x.dialog.textContent).toContain('title')
+    expect(x.dialog.textContent).toContain('影响后续自动执行')
+    await x.view.click('确认保存')
+    expect(x.calls.filter(c => c[0] === 'edit')).toEqual([['edit', { id:'log-rotate', action:'update', patch:{title:'新标题'}, expectedUpdatedAt:ORCH.updatedAt }]])
+    expect(x.calls.filter(c => c[0] === 'view')).toHaveLength(2)
+    expect(x.calls.filter(c => c[0] === 'list')).toHaveLength(2)
+    expect(x.calls.some(c => c[0] === 'run')).toBe(false)
+    x.view.unmount()
+  })
+  it('修改脚本保留 env 和 stdin；冲突保留草稿', async () => {
+    const original = { ...ORCH, script: { command:'pwsh', env:{ SECRET:'value' }, stdin:{text:'hello'} } }
+    const x = await setup({ok:false,error:{code:'script_conflict',message:'冲突'}}, original)
+    await x.set('命令', 'node')
+    await x.view.click('检查变更')
+    expect(x.dialog.querySelector('[role=status]').textContent).not.toContain('value')
+    x.dialog.querySelector('button:last-child').focus()
+    await x.view.click('确认保存')
+    expect(x.dialog.contains(document.activeElement)).toBe(true)
+    expect(x.calls.find(c => c[0] === 'edit')[1].patch).toEqual({ script: { command:'node', env:{SECRET:'value'}, stdin:{text:'hello'} } })
+    expect(x.dialog.textContent).toContain('script_conflict')
+    expect(x.field('命令').value).toBe('node')
+    expect(x.calls.filter(c => c[0] === 'edit')).toHaveLength(1)
+    x.view.unmount()
+  })
+  it('传输异常保留草稿，回读前不得再次写入', async () => {
+    const x = await setup(undefined, ORCH, endpoint => endpoint === 'edit' ? Promise.reject(new Error('断线')) : undefined)
+    await x.set('标题', '未保存草稿')
+    await x.view.click('检查变更')
+    await x.view.click('确认保存')
+    expect(x.dialog.textContent).toContain('保存结果未知')
+    expect(x.field('标题').value).toBe('未保存草稿')
+    await x.view.click('检查变更')
+    expect(x.dialog.textContent).toContain('请先加载新版本')
+    expect(x.calls.filter(c => c[0] === 'edit')).toHaveLength(1)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await x.view.click('加载新版本')
+    expect(x.field('标题').value).toBe(ORCH.title)
+    await x.set('标题', '重新确认')
+    await x.view.click('检查变更')
+    expect(x.dialog.textContent).toContain('变更摘要')
+    await x.view.click('确认保存')
+    expect(x.calls.filter(c => c[0] === 'edit')).toHaveLength(2)
+  })
+  it('暂停编排启用时摘要提示按计划自动执行，不试运行', async () => {
+    const x = await setup(undefined, { ...ORCH, enabled:false, status:'paused' })
+    await x.set('启用状态', 'true')
+    await x.view.click('检查变更')
+    expect(x.dialog.querySelector('[role=status]').textContent).toContain('按计划自动执行')
+    expect(x.dialog.textContent).toContain('保存不会试运行')
+    await x.view.click('确认保存')
+    expect(x.calls.find(c => c[0] === 'edit')[1].patch).toEqual({enabled:true})
+    expect(x.calls.some(c => c[0] === 'run')).toBe(false)
+  })
+  it('every 改为 cron 只提交触发配置，保留脚本及状态', async () => {
+    const x = await setup()
+    await x.set('触发方式', 'cron')
+    await x.set('Cron 表达式', '0 3 * * *')
+    await x.set('IANA 时区', 'Asia/Shanghai')
+    await x.view.click('检查变更')
+    await x.view.click('确认保存')
+    expect(x.calls.find(c => c[0] === 'edit')[1].patch).toEqual({ trigger: { kind: 'cron', expression: '0 3 * * *', timeZone: 'Asia/Shanghai' } })
+    x.view.unmount()
+  })
+  it('仅调整高级 JSON 键序或空白不构成变更', async () => {
+    const original = { ...ORCH, script: { command:'pwsh', env:{A:'1', B:'2'}, stdin:{text:'hello'} } }
+    const x = await setup(undefined, original)
+    await x.set('脚本高级字段 JSON', '{"stdin":{"text":"hello"},"env":{"B":"2","A":"1"}}')
+    await x.view.click('检查变更')
+    const text = x.dialog.textContent
+    const confirm = vi.spyOn(window, 'confirm')
+    await x.view.click('取消')
+    expect(confirm).not.toHaveBeenCalled()
+    expect(document.querySelector('[role=dialog]')).toBeFalsy()
+    const wrote = x.calls.some(c => c[0] === 'edit')
+    x.view.unmount()
+    expect(text).toContain('没有变更')
+    expect(wrote).toBe(false)
+  })
+  it('保存未结算时双击只提交一次', async () => {
+    let resolveEdit
+    const pending = new Promise(resolve => { resolveEdit = resolve })
+    const x = await setup(undefined, ORCH, endpoint => endpoint === 'edit' ? pending : undefined)
+    await x.set('标题', '新标题')
+    await x.view.click('检查变更')
+    const button = [...x.dialog.querySelectorAll('button')].find(b => b.textContent === '确认保存')
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(x.calls.filter(c => c[0] === 'edit')).toHaveLength(1)
+    expect(button.disabled).toBe(true)
+    expect(x.dialog.contains(document.activeElement)).toBe(true)
+    await act(async () => document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Tab', bubbles:true, cancelable:true})))
+    expect(x.dialog.contains(document.activeElement)).toBe(true)
+    await act(async () => document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Tab', shiftKey:true, bubbles:true, cancelable:true})))
+    expect(x.dialog.contains(document.activeElement)).toBe(true)
+    await act(async () => resolveEdit({ok: true, value: {}}))
+    x.view.unmount()
+  })
+  it('检查变更后保留模态焦点并可 Escape 关闭', async () => {
+    const x = await setup()
+    await x.set('标题', '修改')
+    const check = [...x.dialog.querySelectorAll('button')].find(b => b.textContent === '检查变更')
+    check.focus()
+    await x.view.click('检查变更')
+    expect(x.dialog.contains(document.activeElement)).toBe(true)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await act(async () => document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', bubbles:true, cancelable:true})))
+    expect(confirm).toHaveBeenCalled()
+    expect(document.querySelector('[role=dialog]')).toBeFalsy()
+    expect(document.activeElement.textContent).toBe('手动修改')
+  })
+  it('Tab 在对话框内循环并在关闭时恢复焦点', async () => {
+    const x = await setup()
+    const nodes = [...x.dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])')]
+    nodes.at(-1).focus()
+    await act(async () => nodes.at(-1).dispatchEvent(new KeyboardEvent('keydown', {key:'Tab', bubbles:true, cancelable:true})))
+    expect(document.activeElement).toBe(nodes[0])
+    await act(async () => nodes[0].dispatchEvent(new KeyboardEvent('keydown', {key:'Tab', shiftKey:true, bubbles:true, cancelable:true})))
+    expect(document.activeElement).toBe(nodes.at(-1))
+    await x.view.click('取消')
+    expect(document.activeElement.textContent).toBe('手动修改')
+    x.view.unmount()
+  })
+  it('加载新版本期间禁止重复回读及编辑', async () => {
+    let resolveView
+    const pending = new Promise(resolve => { resolveView = resolve })
+    const x = await setup(undefined, ORCH, (endpoint, _payload, calls) => endpoint === 'view' && calls.filter(c => c[0] === 'view').length > 1 ? pending : undefined)
+    const reload = [...x.dialog.querySelectorAll('button')].find(b => b.textContent === '加载新版本')
+    await act(async () => {
+      reload.dispatchEvent(new MouseEvent('click', {bubbles:true}))
+      reload.dispatchEvent(new MouseEvent('click', {bubbles:true}))
+    })
+    expect(x.calls.filter(c => c[0] === 'view')).toHaveLength(2)
+    expect(x.field('标题').disabled).toBe(true)
+    await act(async () => resolveView({ok:true,value:{...ORCH,runs:[],availableActions:[]}}))
+    expect(x.field('标题').disabled).toBe(false)
+    x.view.unmount()
+  })
+  it('保存成功但 view 回读失败时提示回读失败而不是写入失败', async () => {
+    const x = await setup(undefined, ORCH, (endpoint, _payload, calls) => endpoint === 'view' && calls.filter(c => c[0] === 'view').length > 1 ? Promise.resolve({ok:false,error:{code:'offline',message:'读失败'}}) : undefined)
+    await x.set('标题', '新标题')
+    await x.view.click('检查变更')
+    await x.view.click('确认保存')
+    expect(x.view.text()).toContain('详情回读失败')
+    expect(x.view.text()).toContain('保存已成功')
+    expect(x.view.text()).not.toContain('保存失败')
+    expect(x.calls.filter(c => c[0] === 'edit')).toHaveLength(1)
+    x.view.unmount()
+  })
+  it('无变更和无效 JSON 不提交；Escape 脏草稿需确认并恢复焦点', async () => {
+    const x = await setup()
+    await x.view.click('检查变更')
+    expect(x.dialog.textContent).toContain('没有变更')
+    await x.set('判定 JSON', '{')
+    await x.view.click('检查变更')
+    expect(x.dialog.textContent).toContain('JSON 格式错误')
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+    await act(async () => x.dialog.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })))
+    expect(document.querySelector('[role=dialog]')).toBeTruthy()
+    await act(async () => x.dialog.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })))
+    expect(document.querySelector('[role=dialog]')).toBeFalsy()
+    expect(document.activeElement.textContent).toBe('手动修改')
+    expect(x.calls.some(c => c[0] === 'edit')).toBe(false)
+    confirm.mockRestore(); x.view.unmount()
+  })
+})
+
+describe('完成后行为展示与结果块（v0.1y 起；v0.1aa 去键化：契约 11「完成后行为展示」+「结果块优先展示」）', () => {
+  const judgedOrch = {
+    ...ORCH,
+    judge: {
+      rules: [
+        { when: { exitCode: 0 }, actions: ['notify'] },
+        { when: { any: [{ timedOut: true }, { stdout: { contains: 'ERROR' } }] }, actions: [] },
+        { when: { all: [{ exitCode: { not: 0 } }, { durationMs: { min: 5000 } }] }, actions: ['notify', 'cleanup'] },
+      ],
+      fallback: ['archive'],
+    },
+    actions: {
+      notify: { kind: 'event', name: 'done' },
+      cleanup: { kind: 'plugin', action: 'fs.cleanup' },
+      archive: { kind: 'session', mode: 'ephemeral', title: '待整理归档', prompt: '把 {{stdoutTail}} 归档到目标目录\n后续说明' },
+    },
+  }
+
+  async function mountDetail(makeView) {
+    const { exports } = await loadClientBundle()
+    const { registrations } = mountRegistrations(exports)
+    panelComponent = panelEntry(registrations).component
+    const view = await renderPanel({ call: (endpoint) => endpoint === 'list' ? Promise.resolve(listResult()) : Promise.resolve(makeView()), subscribeReset: () => () => {} })
+    await view.clickRow('log rotate')
+    return view
+  }
+
+  it('「脚本完成后」区把 judge/actions 翻译成简体中文明话（v0.1aa 去键化）：规则行 + 动作描述行', async () => {
+    const view = await mountDetail(() => viewResult(judgedOrch))
+    const text = view.detail().textContent
+    expect(text).toContain('脚本完成后')
+    expect(text).toContain('规则 1：当 退出码 = 0')
+    expect(text).toContain('规则 2：当 （任一）已超时 或 stdout 包含“ERROR” → 不执行动作')
+    expect(text).toContain('规则 3：当 （全部）退出码 ≠ 0 且 耗时 介于 5000–∞ms')
+    expect(text).toContain('兜底（无规则命中）')
+    // 动作以缩进描述行出现
+    expect(text).toContain('→ 发出事件 done')
+    expect(text).toContain('→ 调用注册动作 fs.cleanup（当前未注册）')
+    expect(text).toContain('→ 开启一次性会话「待整理归档」')
+    expect(text).toContain('prompt：「把 {{stdoutTail}} 归档到目标目录…」')
+    // 动作键不再出现；「动作说明」区块移除
+    expect(text).not.toContain('notify')
+    expect(text).not.toContain('→ cleanup')
+    expect(text).not.toContain('、cleanup')
+    expect(text).not.toContain('archive')
+    expect(text).not.toContain('动作说明')
+    expect(text).not.toContain('（ephemeral）')
+    view.unmount()
+  })
+
+  it('v0.1aa：引用未定义动作键 → 错误色「未知动作」（唯一显示键的场景）；已定义未引用的动作弱化列出', async () => {
+    const view = await mountDetail(() => viewResult({
+      ...ORCH,
+      judge: { rules: [{ when: { exitCode: 1 }, actions: ['ghost'] }], fallback: ['orphan-2'] },
+      actions: { orphan1: { kind: 'session', mode: 'persistent', title: '备用会话' } },
+    }))
+    const text = view.detail().textContent
+    expect(text).toContain('未知动作「ghost」（actions 里没有定义）')
+    expect(text).toContain('未知动作「orphan-2」（actions 里没有定义）')
+    expect(text).toContain('已定义但未引用：开启持久会话「备用会话」')
+    expect(text).not.toContain('orphan1')
+    view.unmount()
+  })
+
+  it('零规则且无 fallback：显示「脚本完成后不执行任何动作」，不出现规则与兜底行', async () => {
+    const view = await mountDetail(() => viewResult({ ...ORCH, judge: { rules: [] } }))
+    const text = view.detail().textContent
+    expect(text).toContain('脚本完成后不执行任何动作')
+    expect(text).not.toContain('规则 1')
+    expect(text).not.toContain('兜底')
+    view.unmount()
+  })
+
+  it('空 when 显示「无条件（总是命中）」', async () => {
+    const view = await mountDetail(() => viewResult({ ...ORCH, judge: { rules: [{ when: {}, actions: ['a'] }], fallback: [] }, actions: { a: { kind: 'event', name: 'x' } } }))
+    const text = view.detail().textContent
+    expect(text).toContain('规则 1：当 无条件（总是命中）')
+    expect(text).toContain('→ 发出事件 x')
+    expect(text).toContain('兜底（无规则命中） → 不执行动作')
+    view.unmount()
+  })
+
+  it('run 卡结果块：标记行结果（summary/level/fields）+ 会话上报（时间、sessionId 尾 8 位、fields）优先于原始输出', async () => {
+    const run = {
+      runId: 'run-7f3c1a9e',
+      orchestrationId: 'log-rotate',
+      trigger: 'manual',
+      scheduledAt: '2026-11-16T00:00:00.000Z',
+      startedAt: '2026-11-16T00:00:00.100Z',
+      settledAt: '2026-11-16T00:00:02.000Z',
+      status: 'succeeded',
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 1900, stdoutTail: '##SCRIPT-RESULT## {\"summary\":\"x\"}\n原始输出行', stderrTail: '', truncated: false },
+      matchedRule: 0,
+      usedFallback: false,
+      actions: [],
+      result: {
+        summary: '扫描 120 个文件：3 组重复，回收 5 个',
+        level: 'info',
+        fields: { 扫描: '120', 回收: '5' },
+        reports: [
+          { at: '2026-11-16T00:01:00.000Z', sessionId: 'session-12345678-abcd', summary: '归档完成：8 个目录', level: 'warn', fields: { 目录: '8' } },
+        ],
+      },
+    }
+    const view = await mountDetail(() => ({ ok: true, value: { ...ORCH, runs: [run], availableActions: [] } }))
+    const card = view.detail().querySelector('div[style*="border: 1px solid"]')
+    expect(card).toBeTruthy()
+    const text = card.textContent
+    expect(text).toContain('结果：')
+    expect(text).toContain('扫描 120 个文件：3 组重复，回收 5 个')
+    expect(text).toContain('扫描：')
+    expect(text).toContain('120')
+    expect(text).toContain('会话上报')
+    expect(text).toContain('…678-abcd')
+    expect(text).toContain('归档完成：8 个目录')
+    expect(text).toContain('目录：')
+    // 结果块在原始输出（stdout 尾部）之前
+    expect(text.indexOf('扫描 120 个文件')).toBeLessThan(text.indexOf('原始输出行'))
+    view.unmount()
+  })
+
+  it('无 result 的 run 卡不渲染结果块', async () => {
+    const run = {
+      runId: 'run-7f3c1a9e',
+      orchestrationId: 'log-rotate',
+      trigger: 'manual',
+      scheduledAt: '2026-11-16T00:00:00.000Z',
+      startedAt: '2026-11-16T00:00:00.100Z',
+      settledAt: '2026-11-16T00:00:02.000Z',
+      status: 'succeeded',
+      skipReason: null,
+      script: { command: 'pwsh', exitCode: 0, signal: null, timedOut: false, durationMs: 1900, stdoutTail: 'done', stderrTail: '', truncated: false },
+      matchedRule: null,
+      usedFallback: false,
+      actions: [],
+    }
+    const view = await mountDetail(() => ({ ok: true, value: { ...ORCH, runs: [run], availableActions: [] } }))
+    const card = view.detail().querySelector('div[style*="border: 1px solid"]')
+    expect(card.textContent).not.toContain('结果：')
+    view.unmount()
+  })
+
+  // v0.1z：session 动作 prompt 预览点击展开完整 prompt，再点收起（契约 11「prompt 预览可展开」）
+  it('session 动作 prompt 预览：点击展开完整 prompt（aria-expanded 联动），再点收起', async () => {
+    const view = await mountDetail(() => viewResult(judgedOrch))
+    const findToggle = () => [...view.detail().querySelectorAll('button[aria-expanded]')].find((b) => b.textContent.includes('prompt：'))
+    let toggle = findToggle()
+    expect(toggle, 'prompt 展开开关').toBeTruthy()
+    // 折叠态：只见首行预览，完整 prompt 的后续行不可见
+    expect(view.detail().textContent).toContain('prompt：「把 {{stdoutTail}} 归档到目标目录…」')
+    expect(view.detail().textContent).not.toContain('后续说明')
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    await act(async () => { toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true })) })
+    toggle = findToggle()
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    // 展开态：完整 prompt 原文（含后续行与原始换行）出现在 pre 块中
+    const pre = view.detail().querySelector('pre')
+    expect(pre).toBeTruthy()
+    expect(pre.textContent).toBe(judgedOrch.actions.archive.prompt)
+    await act(async () => { toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true })) })
+    expect(view.detail().textContent).not.toContain('后续说明')
     view.unmount()
   })
 })
